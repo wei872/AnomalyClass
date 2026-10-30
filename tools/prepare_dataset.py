@@ -37,6 +37,26 @@ from fabric_ncd.data.yolo import list_images, load_dataset_spec, read_yolo_label
 from fabric_ncd.utils import ensure_dir, get_logger  # noqa: E402
 
 
+def _dataset_base(spec) -> Path:
+    """由实际存在的 split 目录反推数据集根目录.
+
+    只看 ``spec.root`` 是不够的: 在 Windows 上写 ``--root /data/fabric`` 时, 这个
+    字符串是"当前盘符相对路径"(实际是 C:\\data\\fabric), 而数据可能在 D: 盘.
+    真实图像目录反而是 ``D:/.../source5_augmenteds/images/train``. 若直接拿
+    ``spec.root`` 拼输出目录, 掩码就会写到并不存在的地方.
+    """
+    dirs = [p for p in list(spec.splits.values()) + list(spec.normal_splits.values()) if p is not None]
+    existing = [Path(os.path.abspath(str(p))) for p in dirs if Path(p).exists()]
+    if not existing:
+        raise FileNotFoundError(
+            "没有任何 split 目录存在, 无法确定数据集根目录. "
+            "请用 --root 指向真实的数据集目录 (Windows 上要写完整盘符, 如 D:/data/fabric)."
+        )
+    base = Path(os.path.commonpath([str(p) for p in existing]))
+    if base.name.lower() in ("images", "labels", "normal"):
+        base = base.parent
+    return base
+
 def _parse_mask_size(value):
     if value is None:
         return "auto"
@@ -79,7 +99,16 @@ def main() -> int:
         cfg.setdefault("data", {})["root"] = args.root
     spec = load_dataset_spec(cfg)
 
+    if args.root and not Path(args.root).exists():
+        logger.warning(
+            "--root %s 不存在. Windows 下要写完整盘符 (如 D:/data/fabric); "
+            "只写 /data/fabric 会被当成当前盘符下的相对路径, 很容易写错地方.",
+            args.root,
+        )
     logger.info("数据集根目录: %s", spec.root)
+    for split, path in list(spec.splits.items()) + list(spec.normal_splits.items()):
+        if path is not None:
+            logger.info("  %-12s %s%s", split, path, "" if Path(path).exists() else "   <-- 不存在")
     logger.info("类别数: %d", spec.nc)
     if spec.root and str(spec.root).lower().startswith("d:"):
         logger.warning("仍是 Windows 路径, 请用 --root 指向本机数据目录")
@@ -152,7 +181,14 @@ def main() -> int:
     if args.export_masks:
         if not spec.root:
             raise ValueError("导出掩码需要知道数据集根目录, 请指定 --root")
-        out_root = Path(args.mask_out or Path(spec.root) / "cloth_masks")
+        if args.mask_out:
+            out_root = Path(os.path.abspath(str(args.mask_out)))
+        else:
+            out_root = _dataset_base(spec) / "cloth_masks"
+            if spec.root and not Path(spec.root).exists():
+                logger.warning("data.root (%s) 不存在, 掩码改为写到图像实际所在的数据集根: %s",
+                               spec.root, out_root)
+        logger.info("掩码输出目录: %s", out_root)
         workers = args.workers or min(8, os.cpu_count() or 1)
         mask_size = _parse_mask_size(args.mask_size)
         for split in ("train", "val"):

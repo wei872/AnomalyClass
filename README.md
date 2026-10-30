@@ -158,6 +158,9 @@ DATASET_ROOT/
 你的 yaml 里目前是 Windows 绝对路径（`D:/tyhn/...`），两种方式二选一：
 
 ```bash
+# Windows 注意: --root 要写完整盘符 (D:/data/fabric)，只写 /data/fabric 会变成
+# "当前盘符下的相对路径"，掩码会写到别的盘去 (工具现在会告警并自动改写到图像实际目录)
+
 # 可选：预计算布面掩码（多进程 + 按经纬周期自动降采样，550 张约 1–2 分钟）
 python tools/prepare_dataset.py --root /data/fabric --export-masks --workers 8
 # 支持断点续跑（已存在的掩码自动跳过）与试跑：--limit 20 --mask-size 1024
