@@ -112,11 +112,11 @@ def main() -> int:
                         break
 
         hw = resolved_hw
-        analyzer = RegionAnalyzer(
-            names=None,
-            use_cloth=bool(cfg_s.get("eval", {}).get("cloth_gate", True)),
-            threshold=None,
-        )
+        from fabric_ncd.engine import analyzer_kwargs
+
+        analyzer = RegionAnalyzer(names=None, threshold=None, **{
+            k: v for k, v in analyzer_kwargs(cfg_s).items() if k != "threshold"
+        })
         started = time.time()
         metrics = evaluate(
             model, val_loader, cfg_s, device, criterion=None,

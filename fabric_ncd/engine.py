@@ -98,6 +98,26 @@ def _reshuffled(cfg: Dict[str, Any], loader) -> Optional[Any]:
     return None
 
 
+def analyzer_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """``RegionAnalyzer`` 的参数统一从 ``eval`` 段取.
+
+    以前 peak_ratio / bbox_refine_ratio / topk_ratio / open_radius 四项只写在配置里、
+    代码从不读取 (恰好等于 RegionAnalyzer 的默认值, 所以改配置也没反应).
+    """
+    ev = cfg.get("eval", {}) or {}
+    return {
+        "use_cloth": bool(ev.get("cloth_gate", True)),
+        "threshold": ev.get("threshold"),
+        "sigma": float(ev.get("threshold_sigma", 3.0)),
+        "min_area_ratio": float(ev.get("min_area_ratio", 1e-4)),
+        "merge_strategy": str(ev.get("merge_strategy", "area_weighted")),
+        "open_radius": int(ev.get("open_radius", 0)),
+        "peak_ratio": float(ev.get("peak_ratio", 0.35)),
+        "bbox_refine_ratio": float(ev.get("bbox_refine_ratio", 0.7)),
+        "topk_ratio": float(ev.get("topk_ratio", 0.01)),
+    }
+
+
 def _source_of(path: str, depth: int = 1) -> str:
     """文件名前缀 = 布料批次号 (DA9670287_... -> DA9670287)."""
     parts = [p for p in Path(str(path)).stem.split("_") if p]
@@ -141,14 +161,7 @@ def evaluate(
 ) -> Dict[str, Any]:
     model.eval()
     names = _class_names(cfg)
-    analyzer = analyzer or RegionAnalyzer(
-        names=names,
-        use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
-        threshold=cfg.get("eval", {}).get("threshold"),
-        sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),
-        min_area_ratio=float(cfg.get("eval", {}).get("min_area_ratio", 4e-4)),
-        merge_strategy=str(cfg.get("eval", {}).get("merge_strategy", "area_weighted")),
-    )
+    analyzer = analyzer or RegionAnalyzer(names=names, **analyzer_kwargs(cfg))
     # 未显式指定阈值时优先使用正常集校准出的绝对阈值
     if analyzer.threshold is None and calibration:
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
@@ -316,14 +329,7 @@ def evaluate_tiled(
     spec = load_dataset_spec(cfg)
     names = list(spec.names) if spec.names else _class_names(cfg)
     eval_cfg = cfg.get("eval", {})
-    analyzer = analyzer or RegionAnalyzer(
-        names=names,
-        use_cloth=bool(eval_cfg.get("cloth_gate", True)),
-        threshold=eval_cfg.get("threshold"),
-        sigma=float(eval_cfg.get("threshold_sigma", 3.0)),
-        min_area_ratio=float(eval_cfg.get("min_area_ratio", 4e-4)),
-        merge_strategy=str(eval_cfg.get("merge_strategy", "area_weighted")),
-    )
+    analyzer = analyzer or RegionAnalyzer(names=names, **analyzer_kwargs(cfg))
     if analyzer.threshold is None and calibration:
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
 
@@ -549,16 +555,8 @@ class Trainer:
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
         self.ema = ModelEMA(self.model, float(self.train_cfg.get("ema", 0.999))) if self.train_cfg.get("ema", 0.999) > 0 else None
-        self.analyzer = RegionAnalyzer(
-            names=_class_names(cfg),
-            # 必须把 eval.cloth_gate 传下去: 漏掉这一项时 RegionAnalyzer 默认 True,
-            # 配置里的 cloth_gate: false 会被静默忽略, 区域提取仍然被布面掩码裁一刀.
-            use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
-            threshold=cfg.get("eval", {}).get("threshold"),
-            sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),
-            min_area_ratio=float(cfg.get("eval", {}).get("min_area_ratio", 4e-4)),
-            merge_strategy=str(cfg.get("eval", {}).get("merge_strategy", "area_weighted")),
-        )
+        # 参数全部来自 eval 段 (含 cloth_gate: 漏传时配置会被静默忽略)
+        self.analyzer = RegionAnalyzer(names=_class_names(cfg), **analyzer_kwargs(cfg))
 
         self.start_epoch = 0
         self.calibration: Dict[str, float] = {}
@@ -702,10 +700,7 @@ class Trainer:
                 started = time.time()
                 metrics = evaluate(
                     model, val_loader, cfg_s, self.device, criterion=None,
-                    analyzer=RegionAnalyzer(
-                        names=None, threshold=None,
-                        use_cloth=bool(cfg_s.get("eval", {}).get("cloth_gate", True)),
-                    ),
+                    analyzer=RegionAnalyzer(names=None, **analyzer_kwargs(cfg_s)),
                     max_samples=max_samples or None,
                 )
                 elapsed = time.time() - started
@@ -810,6 +805,8 @@ class Trainer:
                     dist = F.interpolate(dist.float(), size=(h, w), mode="bilinear", align_corners=False)
                 dist_np = dist.squeeze(1).float().cpu().numpy()
             for i in range(learned.shape[0]):
+                if not keep[i].any():  # 这张图没有可信的布面像素, 不能当"正常"用
+                    continue
                 step = max(1, learned[i].size // 20000)
                 learned_parts.append(learned[i].ravel()[::step])
                 dist_parts.append(dist_np[i].ravel()[::step])
@@ -997,10 +994,12 @@ class Trainer:
                 score = self._composite_score(metrics)
                 metrics = {k: v for k, v in metrics.items() if k != "predictions"}
                 self.logger.info(
-                    "Epoch %03d | loss %.4f | pixelAUROC %.4f PRO %.4f imgAUROC %.4f mAP50 %.4f acc %.4f | score %.4f | %s",
+                    "Epoch %03d | loss %.4f | pixelAUROC %.4f (同图 %.4f) PRO %.4f imgAUROC %.4f "
+                    "mAP50 %.4f acc %.4f | score %.4f | %s",
                     epoch + 1,
                     train_logs.get("loss_total", 0.0),
                     metrics.get("pixel_auroc", float("nan")),
+                    metrics.get("pixel_auroc_in_image", float("nan")),
                     metrics.get("pro", float("nan")),
                     metrics.get("image_auroc", float("nan")),
                     metrics.get("map50", float("nan")),
@@ -1009,10 +1008,11 @@ class Trainer:
                     format_seconds(timer.elapsed),
                 )
                 self.logger.info(
-                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f (top16 %.3f / max %.3f) | 同批次AUROC %.3f | "
+                    "  检测 | pixelAUROC %.4f (同图 %.4f) | imgAUROC %.4f (top16 %.3f / max %.3f) | 同批次AUROC %.3f | "
                     "mAP50 %.4f | 检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图, 框外误报 %.2f/图) | "
                     "正常图 %.2f 区域/图 | thr %.4f",
                     metrics.get("pixel_auroc", float("nan")),
+                    metrics.get("pixel_auroc_in_image", float("nan")),
                     metrics.get("image_auroc", float("nan")),
                     metrics.get("image_auroc_top16", float("nan")),
                     metrics.get("image_auroc_max", float("nan")),

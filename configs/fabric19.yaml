@@ -45,6 +45,9 @@ data:
   cloth_mask: full
   mask_work_size: auto  # 布面掩码估计的长边尺寸: auto = 按实测经纬周期自动定
                         # (周期 6 px 的细密布只能缩到 ~1/2, 周期 20 px 可缩到 1/5)
+  # 布面掩码里把标注框向外扩多少像素再挖掉 (防止疵点边缘被当成正常布).
+  # null = 自动取 max(4, 短边的 1%) —— 固定 12px 在 2448 长边上太窄, 在缩放到 800 后又太宽.
+  box_pad: null
   limit_train: null
   limit_val: null
 
@@ -113,7 +116,12 @@ model:
     # pseudo_ratio: 用记忆库距离把"整框"正样本收缩成异常核心. 本地 A/B (小疵点+大框)
     # 实测反而掉点 (pAUROC 0.62 -> 0.45): 记忆库还不准时, 收缩会把真实疵点像素也丢掉.
     # 默认关闭; 只有当框显著大于疵点、且记忆库已经很稳时才建议开到 0.3 试试.
-    anomaly: {focal_weight: 1.0, dice_weight: 1.0, gamma: 2.0, alpha: 0.65, pseudo_ratio: 0.0}
+    # background_as_negative: 框外的**所有**像素都算正常布面 (负样本).
+    #   true  (默认) = 合成布宽底色 (augment.width_margin 造出来的约 21% 像素) 也拿到负监督.
+    #   false        = 旧行为: region = cloth_mask > 0.5, 那 21% 像素既非正也非负, 没有梯度,
+    #                  模型可以随便填任意值, 推理时整片变成误报.
+    anomaly: {focal_weight: 1.0, dice_weight: 1.0, gamma: 2.0, alpha: 0.65,
+              pseudo_ratio: 0.0, background_as_negative: true}
     fabric: {bce_weight: 0.5, dice_weight: 0.5, edge_weight: 0.5}
     cls: {weight: 1.0, label_smoothing: 0.05, box_shrink: 0.9}
     supcon: {weight: 0.5, temperature: 0.1}
@@ -175,11 +183,14 @@ eval:
   cloth_gate: false
   threshold: null        # null = 自适应阈值
   threshold_sigma: 3.0
-  min_area_ratio: 0.0004
+  min_area_ratio: 1.0e-4
   merge_strategy: area_weighted   # area_weighted | top1 | max
   calib_sigma: 6.0                # 阈值 = max(正常集999分位, 均值+kσ)
   peak_ratio: 0.35                # 区域主元素筛选: 保留峰值 >= thr+ratio*(max-thr)
-  open_radius: 1
+  # 区域连通域的开运算半径 (score 图尺度). 半径 1 = 抹掉 3x3 以下的连通域,
+  # 换算回原图 (1/8) 就是 24x24 像素以内的小疵点 (断经/飞花/毛羽) 全部消失.
+  # 分数图已经过 3x3 平滑, 默认不再做开运算.
+  open_radius: 0
   bbox_refine_ratio: 0.7          # 用高分核心收缩区域框
   min_cls_score: 0.0
   # 图像级分数: 优先用固定像素数 (k_pixels), 而非比例. 1% 在 800x1952 上等于

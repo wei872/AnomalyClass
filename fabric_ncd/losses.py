@@ -211,6 +211,11 @@ class FabricCriterion(nn.Module):
         self.compact_weight = float(loss_cfg.get("compact", {}).get("weight", 0.1))
         # 框内伪标签修正: 用记忆库距离把矩形标签收缩成异常核心 (0 或 >=1 = 关闭)
         self.ano_pseudo = float(loss_cfg.get("anomaly", {}).get("pseudo_ratio", 0.0))
+        # region 默认只取布面 (cloth_mask > 0.5). 但 width_margin 增广每张图会造出
+        # 一圈合成深色背景 (实测占画面 21%), 这些像素在 region 之外 = **完全没有梯度**:
+        # 既不算正样本也不算负样本, 纯浪费. 打开 background_as_negative 后 region = 全部
+        # 像素, 合成背景/辊筒等非布区域作为**负样本**参与 (它们是"正常背景", 不是疵点).
+        self.ano_bg_negative = bool(loss_cfg.get("anomaly", {}).get("background_as_negative", True))
         self.ignore_index = -100
 
     # ------------------------------------------------------------------ #
@@ -232,7 +237,7 @@ class FabricCriterion(nn.Module):
         h, w = ano_logit.shape[-2:]
         defect_mask = _resize_mask(targets["defect_mask"], (h, w), mode="max")
         cloth_mask = _resize_mask(targets["cloth_mask"], (h, w), mode="area")
-        region = (cloth_mask > 0.5).float()
+        region = torch.ones_like(cloth_mask) if self.ano_bg_negative else (cloth_mask > 0.5).float()
         if region.sum() < 1:
             region = torch.ones_like(cloth_mask)
 

@@ -61,14 +61,11 @@ def main() -> int:
         num_workers=int(cfg.get("data", {}).get("num_workers", 2)),
         collate_fn=collate_fn,
     )
-    analyzer = RegionAnalyzer(
-        use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
-        names=names,
-        threshold=args.threshold,
-        sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),
-        min_area_ratio=float(cfg.get("eval", {}).get("min_area_ratio", 4e-4)),
-        merge_strategy=str(cfg.get("eval", {}).get("merge_strategy", "area_weighted")),
-    )
+    from fabric_ncd.engine import analyzer_kwargs
+
+    kwargs = analyzer_kwargs(cfg)
+    kwargs.update(names=names, threshold=args.threshold)
+    analyzer = RegionAnalyzer(**kwargs)
     metrics = evaluate(
         model,
         loader,

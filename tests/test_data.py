@@ -280,3 +280,24 @@ def test_defect_background_dataset_excludes_boxes(tmp_path):
         assert float(sample["defect_mask"].sum()) == 0.0
         checked += 1
     assert checked > 0
+
+
+def test_boxes_to_mask_keeps_rect_when_polygon_shares_class():
+    """同一张图里既有类 3 的多边形、又有类 3 的矩形时, 矩形不能被丢掉.
+
+    早期实现按"多边形出现过的类别号"跳过矩形框, 导致这类标注在像素监督里整条消失.
+    """
+    from fabric_ncd.data.yolo import boxes_to_mask
+
+    poly = np.array([3, 0.05, 0.05, 0.25, 0.05, 0.25, 0.25, 0.05, 0.25], dtype=np.float32)
+    polys = [poly]
+    boxes = np.array(
+        [
+            [3, 0.05, 0.05, 0.25, 0.25],   # 多边形的 bbox, 应跳过 (已画过多边形)
+            [3, 0.60, 0.60, 0.90, 0.90],   # 同类别的独立矩形, 必须保留
+        ],
+        dtype=np.float32,
+    )
+    mask = boxes_to_mask(boxes, polys, 100, 100)
+    assert mask[70, 75] == 1, "同类别的矩形框被误删了"
+    assert mask[10, 10] == 1

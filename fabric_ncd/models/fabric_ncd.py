@@ -262,12 +262,16 @@ class FabricNCD(nn.Module):
         out = self.forward(images, compute_memory=False)
         emb = out["embedding"]  # (B,d,h,w)
         b, d, h, w = emb.shape
-        flat = emb.permute(0, 2, 3, 1).reshape(-1, d)
+        flat = emb.permute(0, 2, 3, 1).reshape(b, h * w, d)
         if mask is not None:
-            keep = F.interpolate(mask.float(), size=(h, w), mode="area").reshape(-1) > 0.5
-            if keep.any():
-                flat = flat[keep]
-        self.memory.update(flat)
+            keep = F.interpolate(mask.float(), size=(h, w), mode="area").reshape(b, h * w) > 0.5
+            flat = flat[keep]
+        else:
+            flat = flat.reshape(-1, d)
+        # 逐样本生效: 整张都被掩掉的样本直接丢弃. 旧实现只要批里有一张有掩码,
+        # 其余整张缺失的样本就会被**连同疵点像素**一起塞进记忆库.
+        if flat.shape[0] > 0:
+            self.memory.update(flat)
         self.train(was_training)
 
     @property

@@ -189,9 +189,30 @@ def boxes_to_mask(boxes: np.ndarray, polygons: Sequence[np.ndarray], h: int, w: 
         pts = [(float(x) * w, float(y) * h) for x, y in coords]
         if len(pts) >= 3:
             drawer.polygon(pts, fill=1)
-    covered = [p[0] for p in polygons]
+    # 多边形的 bbox 也会出现在 boxes 里; 只跳过"这批坐标本来就是某个多边形"的那一条.
+    # 早期实现按类别号判断 (covered = 多边形类别列表), 同一张图里如果既有类 3 的多边形
+    # 又有类 3 的矩形框, 矩形会被整条丢掉 -> 该疵点在监督里直接消失.
+    poly_keys = set()
+    for poly in polygons:
+        pts = poly[1:].reshape(-1, 2)
+        poly_keys.add(
+            (
+                int(poly[0]),
+                round(float(pts[:, 0].min()), 5),
+                round(float(pts[:, 1].min()), 5),
+                round(float(pts[:, 0].max()), 5),
+                round(float(pts[:, 1].max()), 5),
+            )
+        )
     for box in boxes:
-        if int(box[0]) in covered:
+        key = (
+            int(box[0]),
+            round(float(box[1]), 5),
+            round(float(box[2]), 5),
+            round(float(box[3]), 5),
+            round(float(box[4]), 5),
+        )
+        if key in poly_keys:
             continue
         x1, y1, x2, y2 = box[1:5]
         drawer.rectangle([float(x1) * w, float(y1) * h, max(float(x2) * w, float(x1) * w + 1), max(float(y2) * h, float(y1) * h + 1)], fill=1)
@@ -426,7 +447,7 @@ class DefectBackgroundDataset(Dataset):
         augment_cfg: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
         train: bool = True,
-        box_pad: int = 12,
+        box_pad: Optional[int] = None,
     ) -> None:
         aug_cfg = dict(augment_cfg or {})
         aug_cfg["image_size"] = tuple(image_size)
@@ -439,7 +460,12 @@ class DefectBackgroundDataset(Dataset):
         self.base.entries = [e for e in self.base.entries if not e.normal]
         if limit:
             self.base.entries = self.base.entries[: max(1, int(limit))]
-        self.box_pad = int(box_pad)
+        # 框外余量按图像短边取 1% (最少 4 px): 固定像素数在小图上会把"正常区"全吃掉,
+        # 在大图上又不足以躲开弱标注框的边界误差.
+        self.box_pad = (
+            int(box_pad) if box_pad is not None
+            else max(4, int(round(0.01 * min(image_size))))
+        )
 
     def __len__(self) -> int:
         return len(self.base.entries)

@@ -89,8 +89,6 @@ def test_image_score_mode_contrast_removes_global_offset():
 
 def test_spearman_and_pair_auc():
     """探针的两个基础统计量: 秩相关 / 同源内与跨源的成对 AUROC."""
-    import numpy as np
-
     from fabric_ncd.metrics import spearman
 
     assert abs(spearman([1, 2, 3, 4], [1, 2, 3, 4]) - 1.0) < 1e-9
@@ -133,3 +131,41 @@ def test_grouped_auroc_ignores_between_group_shift():
     # 没有任何组同时含两类 -> nan
     auc2, pairs2 = grouped_auroc([1, 1, 0, 0], scores, groups)
     assert np.isnan(auc2) and pairs2 == 0
+
+
+def test_analyzer_kwargs_reads_eval_section():
+    """eval 段里的区域后处理参数必须真的被读取 (以前只写在配置里, 代码不读)."""
+    from fabric_ncd.engine import analyzer_kwargs
+
+    cfg = {
+        "eval": {
+            "cloth_gate": False, "threshold": None, "threshold_sigma": 2.5,
+            "min_area_ratio": 3e-4, "merge_strategy": "top1",
+            "open_radius": 0, "peak_ratio": 0.5, "bbox_refine_ratio": 0.9,
+            "topk_ratio": 0.02,
+        }
+    }
+    kw = analyzer_kwargs(cfg)
+    assert kw["use_cloth"] is False
+    assert kw["open_radius"] == 0 and kw["peak_ratio"] == 0.5
+    assert kw["bbox_refine_ratio"] == 0.9 and kw["topk_ratio"] == 0.02
+    assert kw["merge_strategy"] == "top1"
+
+
+def test_pixel_auroc_in_image_skips_images_without_positive():
+    """同图像素 AUROC 只统计"框内有疵点"的图; 没有正样本的图只会拉低下界."""
+    from fabric_ncd.metrics import MetricAccumulator
+
+    acc = MetricAccumulator(num_classes=2, names=["a", "b"])
+    rng = np.random.default_rng(0)
+    # 一张有疵点的图: 框内高分
+    score = rng.uniform(0, 0.3, size=(8, 8)).astype(np.float32)
+    score[2:4, 2:4] += 0.6
+    gt = np.zeros((8, 8), dtype=np.float32)
+    gt[2:4, 2:4] = 1
+    acc.update(score, gt, normal=False, image_score=float(score.max()))
+    # 一张"疵点图"但框被裁没了: 整片低分, 不应影响同图指标
+    acc.update(np.full((8, 8), 0.05, dtype=np.float32), np.zeros((8, 8), np.float32),
+               normal=False, image_score=0.05)
+    out = acc.compute()
+    assert out["pixel_auroc_in_image"] == 1.0

@@ -129,6 +129,41 @@ def pixel_auroc(
     return auroc(y_true, y_score)
 
 
+def pixel_auroc_in_image(
+    scores: Sequence[np.ndarray],
+    gts: Sequence[np.ndarray],
+    max_negatives: int = 20000,
+    seed: int = 0,
+) -> float:
+    """同图像素 AUROC: 逐图算 AUC, 再按该图的正样本像素数加权平均.
+
+    负样本只用**同一张图**框外的像素, 布料批次/曝光/纹理的整体差异被消掉,
+    剩下的就是"同一块布上, 疵点像素的分数是否高于周围布面"——也就是线上真正要看的东西.
+    每张图的负样本随机下采样到 ``max_negatives`` (正样本全保留): 一次 800x1952 的排序
+    要几十毫秒, 整个验证集会明显变慢, 而下采样到这个量级对 AUC 的偏差 < 0.01.
+    """
+    rng = np.random.default_rng(seed)
+    weighted = 0.0
+    weight = 0.0
+    for score, gt in zip(scores, gts):
+        y = np.asarray(gt).ravel() > 0.5
+        n_pos = int(y.sum())
+        if n_pos == 0 or n_pos >= y.size:
+            continue
+        x = np.asarray(score, dtype=np.float64).ravel()
+        pos_idx = np.flatnonzero(y)
+        neg_idx = np.flatnonzero(~y)
+        if neg_idx.size > max_negatives:
+            neg_idx = rng.choice(neg_idx, size=max_negatives, replace=False)
+        idx = np.concatenate([pos_idx, neg_idx])
+        auc = auroc(y[idx], x[idx])
+        if np.isnan(auc):
+            continue
+        weighted += float(auc) * n_pos
+        weight += n_pos
+    return float(weighted / weight) if weight > 0 else float("nan")
+
+
 def pixel_f1(scores: Sequence[np.ndarray], gts: Sequence[np.ndarray], threshold: float = 0.5) -> Dict[str, float]:
     pred = np.concatenate([(s.ravel() > threshold) for s in scores])
     gt = np.concatenate([(g.ravel() > 0.5) for g in gts])
@@ -373,6 +408,11 @@ class MetricAccumulator:
         self.pixel_scores: List[np.ndarray] = []
         self.pixel_gts: List[np.ndarray] = []
         self.normal_scores: List[np.ndarray] = []
+        # 只含疵点图的像素对: 正 = 框内, 负 = 同一张图里框外的布面.
+        # 跨图的 pixelAUROC 会被"正常图来自另一种布"污染 (正常图的整片布都可能比
+        # 疵点图更热), 这个指标只看同一种布上的对比.
+        self.defect_pixel_scores: List[np.ndarray] = []
+        self.defect_pixel_gts: List[np.ndarray] = []
         self.image_scores: List[float] = []
         self.image_labels: List[int] = []  # 0 = 正常, 1 = 异常
         self.multi_true: List[int] = []
@@ -405,6 +445,9 @@ class MetricAccumulator:
         else:
             self.pixel_scores.append(score)
             self.pixel_gts.append(gt_mask)
+            if gt_mask.max() > 0.5:  # 没有正样本的图对 AUROC 无贡献, 只会拉低下界
+                self.defect_pixel_scores.append(score)
+                self.defect_pixel_gts.append(gt_mask)
             if multi_true >= 0:
                 self.multi_true.append(int(multi_true))
                 self.multi_pred.append(int(multi_pred))
@@ -419,6 +462,10 @@ class MetricAccumulator:
         if self.image_scores:
             out["image_auroc"] = auroc(np.asarray(self.image_labels), np.asarray(self.image_scores))
             out["image_ap"] = average_precision(np.asarray(self.image_labels), np.asarray(self.image_scores))
+        if self.defect_pixel_scores:
+            out["pixel_auroc_in_image"] = pixel_auroc_in_image(
+                self.defect_pixel_scores, self.defect_pixel_gts
+            )
         if self.pixel_scores:
             out["pixel_auroc"] = pixel_auroc(self.pixel_scores, self.pixel_gts)
             out.update(

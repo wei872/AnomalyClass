@@ -402,14 +402,13 @@ class FabricPredictor:
         if resolved_thr is None and calib_thr is not None:
             resolved_thr = float(calib_thr)
         self.cloth_gate = bool(eval_cfg.get("cloth_gate", True))
-        self.analyzer = RegionAnalyzer(
-            names=self.names,
-            use_cloth=self.cloth_gate,
-            threshold=resolved_thr,
-            sigma=float(eval_cfg.get("threshold_sigma", 3.0)),
-            min_area_ratio=float(eval_cfg.get("min_area_ratio", 4e-4)),
-            merge_strategy=str(eval_cfg.get("merge_strategy", "area_weighted")),
-        )
+        # 区域提取参数与训练/评估共用一套 (否则线上和服务端的后处理会不一致:
+        # 开运算半径、主元素筛选、bbox 收缩任何一项不同都会改变检出框)
+        from .engine import analyzer_kwargs
+
+        kwargs = analyzer_kwargs(self.cfg if hasattr(self, "cfg") else {"eval": eval_cfg})
+        kwargs.update(names=self.names, use_cloth=self.cloth_gate, threshold=resolved_thr)
+        self.analyzer = RegionAnalyzer(**kwargs)
         self.threshold = self.analyzer.threshold
 
     # ------------------------------------------------------------------ #
