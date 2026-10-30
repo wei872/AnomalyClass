@@ -49,6 +49,18 @@ def auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(auc)
 
 
+def spearman(a: Sequence[float], b: Sequence[float]) -> float:
+    """Spearman 秩相关 (并列取平均秩, 无 scipy 依赖). 任一轴为常数时返回 0."""
+    ra = _rankdata(np.asarray(a, dtype=np.float64).ravel())
+    rb = _rankdata(np.asarray(b, dtype=np.float64).ravel())
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    denom = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    if denom <= 1e-12:
+        return 0.0
+    return float((ra * rb).sum() / denom)
+
+
 def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y_true = np.asarray(y_true).astype(bool).ravel()
     y_score = np.asarray(y_score, dtype=np.float64).ravel()

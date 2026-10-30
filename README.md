@@ -432,7 +432,8 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 记忆库与当前嵌入脱节（`记忆项尺度` 接近 1.0） | 把 `train.memory_refresh_interval` 设为 1，并适当降低 `memory_warmup_batches`（24 ≈ 15 s/轮），否则记忆分支退化成常数、检出率被拖到 0 |
 | 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
-| 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint runs/.../last.pt`（**`best.pt` 常是早期轮次**）：`topk_raw` 明显高于 `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false`；`topk_minus_med` 明显高于 `topk_raw` → 逐图**底色偏移**把绝对分数带反了，设 `eval.image_score_mode: contrast` |
+| 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint runs/.../last.pt`（**`best.pt` 常是早期轮次**）。`同源内` 高而 `AUROC` 低 → 跨批次采集差异（按批次切分/补正常图）；`topk_minus_med` > `topk_raw` → 逐图底色偏移，设 `eval.image_score_mode: contrast`；`topk_raw` > `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false` |
+| 正常图分数比疵点图还高，且集中在某几批图 | 先跑探针看 `批次覆盖`：这些批次在 `normal/images/train` 里可能从未出现；同时确认 `train.memory_shuffle: true`（否则每轮记忆库都只看最前面那几十张正常图） |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |
@@ -460,21 +461,39 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 ### 8.1.1 图级分数探针（`tools/diagnose_scores.py`）
 
 ```bash
-python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/best.pt --csv scores.csv
+# 完整探针: 跑一遍验证集, 逐图算各种聚合口径 + 外观统计
+python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/last.pt --csv scores.csv
+
+# 只分析已经导出的 csv (秒级, 不加载模型/数据集)
+python tools/diagnose_scores.py --from-csv scores_last.csv
 ```
 
-逐图打印 `topk_gated / topk_raw / top16_raw / max_raw / mean1pct_raw / topk_minus_med / max_minus_med /
-median / learned_max / cloth_cov`，给出"疵点图均值 vs 正常图均值 vs AUROC vs 组内标准差"表格，
-最后自动判读属于哪一类：
+**用 `last.pt`, 不要用 `best.pt`**: `best.pt` 是按验证集分数挑出来的, 早期轮次一旦
+"碰巧"分得好就会被永久保存, 你可能一直在看第 2 轮的权重。工具会打印 checkpoint 的轮次。
 
-- `topk_raw` 远高于 `topk_gated` → 布面蒙版在裁掉疵点 → `eval.cloth_gate: false`；
-- `topk_minus_med` 远高于 `topk_raw` → **逐图底色偏移**在主导图像级分数（疵点图与正常图的 `median`
-  差得比峰值还多）→ `eval.image_score_mode: contrast`，峰值减去本图中位数后再比；
-- 全部口径都远低于 0.5 → 分数**反向**：先确认 checkpoint 的轮次（工具会打印 `epoch`），
-  早期轮次的权重没有任何判据可用；确认是多轮之后仍如此，再怀疑两组图不同源。
+输出三块:
 
-> `eval.image_score_mode` 默认 `topk`（与历史行为一致），校准阈值与推理共用同一口径，
-> 切换后必须**重新校准**（训练每轮会自动校准，或推理加载时用验证集正常图校准）。
+1. **聚合口径表** — `topk_gated / topk_raw / top16_raw / max_raw / mean1pct_raw / topk_minus_med /
+   max_minus_med / learned_max`, 每行给 `疵点均值 / 正常均值 / AUROC / 同源内 / 跨源`。
+   `同源内` = 只用同一批次(文件名前缀)里的 (疵点, 正常) 对, `跨源` = 只用不同批次之间的对。
+2. **批次表** — 每个批次的疵点数/正常数/平均分/组内 AUROC/布面覆盖。
+3. **外观秩相关** — 各分数与 `brightness / contrast / saturation / sharpness` 的 Spearman $ho$。
+
+判读顺序(前一条命中就停):
+
+| 现象 | 结论 | 处理 |
+|---|---|---|
+| 同源内 ≥ 0.7 且明显高于跨源 | 分数是对的, 指标被**跨批次采集差异**拖垮 | 报指标按批次分组; 或让验证集的正常图与疵点图同批次 |
+| 同源内 < 0.7, 跨源偏离 0.5 ≥ 0.25 | **分数在区分布料批次/采集条件, 不是在区分疵点** | 见下面的"批次覆盖": 缺的批次补进 `normal/images/train`; 训练/验证**按批次切分** |
+| 分数与亮度 \|ρ\| ≥ 0.5 | 模型在测曝光 | 正常图要覆盖亮/暗两种工况 |
+| `topk_minus_med` 明显高于 `topk_raw` | 逐图底色偏移主导 | `eval.image_score_mode: contrast` |
+| `topk_raw` 远高于 `topk_gated` | 布面掩码在裁掉疵点 | `eval.cloth_gate: false` |
+| 只有 peak 类高 | top-k 稀释 | 调小 `eval.topk_pixels` |
+
+探针还会打印 **批次覆盖**: 训练正常图的批次 vs 验证集的批次、交集、以及"验证集里训练
+正常图从未出现过的批次"。批次覆盖率低 + 记忆库抽样不洗牌, 是 imageAUROC 反向最常见的原因
+—— 训练侧对应 `train.memory_shuffle: true`(默认开): 只取前若干批建记忆库时打乱抽样,
+让每个 epoch 抽到的正常图子集不同, 覆盖率随训练累积。
 
 ### 8.2 两个已经做过 A/B、证明**无效**的方向（别再试）
 

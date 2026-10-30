@@ -85,3 +85,30 @@ def test_image_score_mode_contrast_removes_global_offset():
     assert image_score_of(defect, topk_cfg) > image_score_of(base, topk_cfg)
     # 叠加偏移后 topk 失效, contrast 仍然分得开
     assert image_score_of(defect_shifted, contrast_cfg) > image_score_of(normal_shifted, contrast_cfg)
+
+
+def test_spearman_and_pair_auc():
+    """探针的两个基础统计量: 秩相关 / 同源内与跨源的成对 AUROC."""
+    import numpy as np
+
+    from fabric_ncd.metrics import spearman
+
+    assert abs(spearman([1, 2, 3, 4], [1, 2, 3, 4]) - 1.0) < 1e-9
+    assert abs(spearman([1, 2, 3, 4], [4, 3, 2, 1]) + 1.0) < 1e-9
+    assert spearman([1, 1, 1, 1], [1, 2, 3, 4]) == 0.0  # 常数列
+
+    from tools.diagnose_scores import _pair_auc, source_of
+
+    assert source_of("DA9670287_1777190506830_毛羽_0_orig.png") == "DA9670287"
+    assert source_of("KBA26050009_20261015_104918_712034.bmp") == "KBA26050009"
+
+    # 每批内部疵点都略高于正常 (0.9>0.8 / 0.3>0.2), 但 A、B 两批之间差 0.6:
+    # 同源内 AUROC = 1.0, 跨源只剩 0.5 -> 说明"批次偏移"把判据吃掉了.
+    rows = [
+        {"src": "A", "defect": 1, "s": 0.9},
+        {"src": "A", "defect": 0, "s": 0.8},
+        {"src": "B", "defect": 1, "s": 0.3},
+        {"src": "B", "defect": 0, "s": 0.2},
+    ]
+    assert _pair_auc(rows, "s", same_src=True) == (1.0, 2)
+    assert _pair_auc(rows, "s", same_src=False) == (0.5, 2)

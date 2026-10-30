@@ -1,86 +1,353 @@
 #!/usr/bin/env python
-"""图级分数探针: 为什么 imageAUROC < 0.5 (正常图分数反而更高)?
+"""图级分数探针: imageAUROC < 0.5 到底是哪里错了?
 
-不重训, 直接用已有 checkpoint 跑一遍验证集, 逐图打印各种图像级聚合分数, 并对比
-"疵点图组" 与 "正常图组" 的分布, 定位到底是:
-  1. 聚合口径不对 (top-k 像素数太大, 把小疵点的峰值稀释了);
-  2. 布面掩码把疵点裁掉了 (score * cloth 之后疵点归零);
-  3. 两组图本身分布不同 (验证集正常图与训练集不是同一种布).
+不重训, 直接用已有 checkpoint 跑一遍验证集, 逐图算各种图像级聚合分数, 然后回答
+**分数在跟踪什么**:
+
+  1. 聚合口径 (top-k 稀释 / 峰值 vs 均值);
+  2. 布面掩码把疵点裁掉 (score * cloth);
+  3. **采集域混淆**: 疵点图和正常图来自不同的布料批次/机台/曝光, 分数只是在区分"来源";
+  4. 分数跟着**亮度/清晰度**走 (等于一个曝光检测器).
+
+第 3、4 条是本工具的重点: 按文件名前缀 (批次号) 分组, 给出
+
+* 每个批次内部的 AUROC (同源内还分得开吗);
+* 跨批次的 AUROC (只比 "A 批的正常图" vs "B 批的疵点图");
+* 训练正常图的批次覆盖 vs 验证集的批次覆盖 (三个集合的交集决定这个指标能不能用);
+* 各聚合分数与图像外观统计 (亮度/对比度/饱和度/清晰度) 的 Spearman 秩相关.
 
 用法::
 
-    python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/best.pt
-    python tools/diagnose_scores.py --checkpoint best.pt --csv scores.csv
+    # 完整探针 (需要 GPU/CPU 跑一遍验证集, 记忆库默认用**全部**训练正常图)
+    python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/last.pt --csv scores.csv
+
+    # 只分析已经导出的 csv (秒级, 不用加载模型和数据集)
+    python tools/diagnose_scores.py --from-csv scores_last.csv
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import copy
+import csv
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from torch.nn import functional as F  # noqa: E402
 
-from fabric_ncd.data.yolo import build_dataloaders, build_normal_loader  # noqa: E402
-from fabric_ncd.metrics import auroc  # noqa: E402
-from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
-from fabric_ncd.ops import topk_mean  # noqa: E402
-from fabric_ncd.utils import get_logger, load_yaml, resolve_device  # noqa: E402
+from fabric_ncd.metrics import auroc, spearman  # noqa: E402
+from fabric_ncd.utils import get_logger  # noqa: E402
 
 LOGGER = get_logger("diagnose")
 
-
-def _load(ckpt: str, device: torch.device, cfg_override: Dict) -> tuple:
-    state = torch.load(ckpt, map_location="cpu", weights_only=False)
-    cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
-    LOGGER.info("checkpoint: %s (epoch %s)", ckpt, state.get("epoch", "?"))
-    cfg.update(cfg_override or {})
-    model = FabricNCD(cfg)
-    key = "ema" if "ema" in state else "model"
-    model.load_state_dict(state[key])
-    calibration = state.get("calibration") or {}
-    scale = float(calibration.get("memory_distance_scale", 0.0) or 0.0)
-    if scale > 0:
-        model.memory_distance_scale = scale
-    return model.to(device).eval(), cfg, calibration
+# 逐图统计的所有口径. topk_gated 需要布面掩码; 其余全是 raw / 对比度口径.
+KEYS = [
+    "topk_gated", "topk_raw", "top16_raw", "max_raw", "mean1pct_raw",
+    "topk_minus_med", "max_minus_med", "median", "learned_max", "cloth_cov",
+]
+# 外观统计 (越大越亮/越平/越花/越锐)
+STATS = ["brightness", "contrast", "saturation", "sharpness"]
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="图级分数诊断: 查 imageAUROC < 0.5 的原因")
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--samples", type=int, default=0, help="每个子集最多多少张 (0 = 全部)")
-    ap.add_argument("--memory-batches", type=int, default=16)
-    ap.add_argument("--device", default="auto")
-    ap.add_argument("--csv", default="", help="把逐图明细写到 csv")
-    args = ap.parse_args()
+# --------------------------------------------------------------------------- #
+# 分组 / 外观统计
+# --------------------------------------------------------------------------- #
+def source_of(name: str, depth: int = 1) -> str:
+    """取文件名前缀作为"批次号": DA9670287_1777190506830_毛羽_0_orig.png -> DA9670287."""
+    stem = Path(str(name)).stem
+    parts = [p for p in stem.split("_") if p]
+    if not parts:
+        return Path(str(name)).stem
+    return "_".join(parts[: max(1, depth)])
+
+
+def appearance_stats(path: str) -> Dict[str, float]:
+    """原图的亮度/对比度/饱和度/清晰度 (缩小到长边 256 后算, 快且稳定)."""
+    try:
+        from PIL import Image
+    except Exception:  # pragma: no cover - PIL 一定在依赖里
+        return {k: float("nan") for k in STATS}
+    try:
+        with Image.open(str(path)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((256, 256))
+            arr = np.asarray(im, dtype=np.float32) / 255.0
+    except Exception:
+        return {k: float("nan") for k in STATS}
+    gray = arr.mean(axis=2)
+    colorfulness = float(np.abs(arr - gray[..., None]).mean())
+    gx = np.diff(gray, axis=1)
+    gy = np.diff(gray, axis=0)
+    sharpness = float(np.var(gx) + np.var(gy))
+    return {
+        "brightness": float(gray.mean()),
+        "contrast": float(gray.std()),
+        "saturation": colorfulness,
+        "sharpness": sharpness,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 分析
+# --------------------------------------------------------------------------- #
+def _pair_auc(rows: List[Dict], key: str, same_src: bool) -> Tuple[float, int]:
+    """同源内 / 跨源的 AUROC, 都按"正负样本对"直接统计 (与类别构成无关).
+
+    ``same_src=True`` 只用**同一批次**里的 (疵点, 正常) 对: 去掉采集差异后还分得开吗?
+    ``same_src=False`` 只用**不同批次**之间的对: 分数把批次差异本身也吃进去了多少?
+    """
+    pos = [(float(r[key]), r["src"]) for r in rows if r["defect"] == 1]
+    neg = [(float(r[key]), r["src"]) for r in rows if r["defect"] == 0]
+    num = 0.0
+    den = 0
+    for pv, ps in pos:
+        for nv, ns in neg:
+            if (ps == ns) != same_src:
+                continue
+            den += 1
+            if pv > nv:
+                num += 1.0
+            elif pv == nv:
+                num += 0.5
+    return ((num / den) if den else float("nan")), den
+
+
+def _group_table(rows: List[Dict], key: str) -> None:
+    by_src: Dict[str, List[Dict]] = defaultdict(list)
+    for r in rows:
+        by_src[r["src"]].append(r)
+    LOGGER.info(
+        "%-16s %6s %6s %10s %10s %10s %10s",
+        "来源(批次)", "疵点", "正常", "疵点均值", "正常均值", "组内AUROC", "布面覆盖",
+    )
+    for src in sorted(by_src):
+        sub = by_src[src]
+        lab = np.array([r["defect"] for r in sub])
+        vals = np.array([r[key] for r in sub], dtype=np.float64)
+        d = float(vals[lab == 1].mean()) if (lab == 1).any() else float("nan")
+        n = float(vals[lab == 0].mean()) if (lab == 0).any() else float("nan")
+        auc = auroc(lab, vals) if lab.min() != lab.max() else float("nan")
+        cov = np.array([r.get("cloth_cov", np.nan) for r in sub], dtype=np.float64)
+        cov_m = float(np.nanmean(cov)) if np.isfinite(cov).any() else float("nan")
+        LOGGER.info("%-16s %6d %6d %10.4f %10.4f %10.4f %10.4f",
+                    src, int((lab == 1).sum()), int((lab == 0).sum()), d, n, auc, cov_m)
+
+
+def _coverage(train_src: Dict[str, int], val_src: Dict[str, int]) -> None:
+    """训练正常图的批次 vs 验证集的批次, 直接决定 imageAUROC 能不能用."""
+    t, v = set(train_src), set(val_src)
+    LOGGER.info(
+        "批次覆盖: 训练正常图 %d 个批次 / 验证集 %d 个批次 / 交集 %d",
+        len(t), len(v), len(t & v),
+    )
+    only_val = sorted(v - t)
+    if only_val:
+        LOGGER.info(
+            "  验证集有 %d 个批次在训练正常图里**从未出现**: %s",
+            len(only_val), ", ".join(only_val[:8]) + (" ..." if len(only_val) > 8 else ""),
+        )
+    only_train = sorted(t - v)
+    if only_train:
+        LOGGER.info(
+            "  训练正常图有 %d 个批次不在验证集里: %s",
+            len(only_train), ", ".join(only_train[:8]) + (" ..." if len(only_train) > 8 else ""),
+        )
+
+
+def analyze(rows: List[Dict], topk: int = 256, gate: bool = True) -> int:
+    labels = np.array([r["defect"] for r in rows])
+    keys = [k for k in KEYS if k != "cloth_cov" and k in rows[0]]
+    LOGGER.info("样本: 疵点 %d 张 / 正常 %d 张 / 来源 %d 个",
+                int((labels == 1).sum()), int((labels == 0).sum()),
+                len({r["src"] for r in rows}))
+
+    LOGGER.info("%-15s %-10s %-10s %-10s %-10s %-10s", "聚合方式", "疵点均值", "正常均值", "AUROC", "同源内", "跨源")
+    table: Dict[str, Tuple[float, float, float, float]] = {}
+    within_pairs = 0
+    cross_pairs = 0
+    for key in keys:
+        vals = np.array([r[key] for r in rows], dtype=np.float64)
+        d_mean = float(vals[labels == 1].mean()) if (labels == 1).any() else float("nan")
+        n_mean = float(vals[labels == 0].mean()) if (labels == 0).any() else float("nan")
+        auc = auroc(labels, vals)
+        within, w_pairs = _pair_auc(rows, key, same_src=True)
+        cross, c_pairs = _pair_auc(rows, key, same_src=False)
+        within_pairs = max(within_pairs, w_pairs)
+        cross_pairs = cross_pairs or c_pairs
+        table[key] = (auc, within, cross)
+        LOGGER.info("%-15s %-10.4f %-10.4f %-10.4f %-10.4f %-10.4f", key, d_mean, n_mean, auc, within, cross)
+
+    if "cloth_cov" in rows[0]:
+        low = sorted({r["src"] for r in rows if r.get("cloth_cov", 1.0) < 0.3})
+        if low:
+            LOGGER.info(
+                "注意: %d 个批次的平均布面覆盖 < 0.3 (布面掩码认为这些图几乎没有布): %s "
+                "-> 这些图要么不是布, 要么曝光/尺度与训练不同源",
+                len(low), ", ".join(low[:6]) + (" ..." if len(low) > 6 else ""),
+            )
+    if within_pairs == 0:
+        LOGGER.info(
+            "提示: 没有任何一个批次同时含疵点图和正常图 -> 同源内验证做不了, "
+            "imgAUROC 里混着'批次差异'和'疵点差异'两种信号, 无法区分"
+        )
+    if "brightness" in rows[0]:
+        LOGGER.info("分数与图像外观的秩相关 (Spearman, |rho|>0.5 说明分数在跟踪外观):")
+        for key in ("topk_raw", "learned_max", "topk_minus_med"):
+            if key not in rows[0]:
+                continue
+            sv = np.array([r[key] for r in rows], dtype=np.float64)
+            parts = []
+            for stat in STATS:
+                uv = np.array([r.get(stat, np.nan) for r in rows], dtype=np.float64)
+                ok = np.isfinite(uv) & np.isfinite(sv)
+                parts.append(f"{stat} {spearman(uv[ok], sv[ok]):+.2f}" if ok.sum() > 2 else f"{stat} n/a")
+            LOGGER.info("  %-14s %s", key, " | ".join(parts))
+
+    scored = [k for k in keys if k != "median"]
+    if not scored:
+        return 0
+    best = max(scored, key=lambda k: table[k][0] if np.isfinite(table[k][0]) else -1)
+    best_auc, best_within, best_cross = table[best]
+    LOGGER.info("最佳聚合方式: %s (AUROC %.4f)", best, best_auc)
+
+    # ---------------- 自动判读 ----------------
+    if np.isfinite(best_auc) and best_auc >= 0.90:
+        LOGGER.info("判读: 该 checkpoint 上已经分得开, 无需处理")
+        return 0
+
+    gate_on = bool(gate)
+    auc_gated = table["topk_gated"][0] if "topk_gated" in table else float("nan")
+    auc_raw = table["topk_raw"][0]
+    auc_contrast = table["topk_minus_med"][0] if "topk_minus_med" in table else np.nan
+    within_best = max((v[1] for v in table.values() if np.isfinite(v[1])), default=np.nan)
+    cross_best = max((v[2] for v in table.values() if np.isfinite(v[2])), default=np.nan)
+    bright_rho = 0.0
+    if "brightness" in rows[0]:
+        sv = np.array([r["topk_raw"] for r in rows], dtype=np.float64)
+        bv = np.array([r["brightness"] for r in rows], dtype=np.float64)
+        ok = np.isfinite(bv) & np.isfinite(sv)
+        if ok.sum() > 2:
+            bright_rho = abs(spearman(bv[ok], sv[ok]))
+
+    if np.isfinite(within_best) and within_best >= 0.70 and (not np.isfinite(cross_best) or within_best > cross_best + 0.15):
+        LOGGER.info(
+            "判读: 同源内 AUROC %.3f 明显高于跨源 %.3f -> 分数是好的, 指标被跨批次的采集差异拖垮; "
+            "报告指标时按批次分组, 或把验证集限制在同一批次", within_best, cross_best,
+        )
+    elif (np.isfinite(cross_best) and abs(cross_best - 0.5) >= 0.25
+          and (within_pairs == 0 or (np.isfinite(within_best) and within_best < 0.70))):
+        LOGGER.info(
+            "判读: 同源内只分到 %.3f, 而跨源能分到 %.3f -> **分数在区分布料批次/采集条件, 不是在区分疵点**. "
+            "验证集的正常图与疵点图来自不同批次, 这个 imgAUROC 不可用: 见上面的 '批次覆盖' 一行, "
+            "缺的批次要进训练正常图 (normal/images/train), 或者按批次重新切分 train/val", within_best, cross_best,
+        )
+    elif bright_rho >= 0.5:
+        LOGGER.info(
+            "判读: 分数与整图亮度秩相关 %.2f -> 模型在测曝光, 不在测疵点; 先把正常图按批次补齐 (含亮/暗两种工况)", bright_rho,
+        )
+    elif np.isfinite(auc_contrast) and auc_contrast - auc_raw > 0.10:
+        LOGGER.info(
+            "判读: 绝对分数被逐图底色偏移带偏 (topk %.3f -> 去中位数 %.3f) -> 设 eval.image_score_mode: contrast",
+            auc_raw, auc_contrast,
+        )
+    elif gate_on and np.isfinite(auc_raw) and np.isfinite(auc_gated) and auc_raw - auc_gated > 0.10:
+        LOGGER.info(
+            "判读: 布面蒙版在裁掉疵点 (关闭 %.3f -> %.3f) -> 把 eval.cloth_gate 设为 false", auc_gated, auc_raw,
+        )
+    elif best in ("top16_raw", "max_raw") and best_auc > 0.75 and auc_raw < 0.7:
+        LOGGER.info("判读: top-k(%d 像素) 把小疵点峰值稀释了 -> 把 eval.topk_pixels 调小 (试试 16~64)", topk)
+    elif np.isfinite(table["learned_max"][0]) and table["learned_max"][0] > 0.75 and auc_raw < 0.7:
+        LOGGER.info("判读: 学习式异常头本身能分开, 融合后的分数被记忆项拖累 -> 调 model.memory.score_weight")
+    else:
+        LOGGER.info(
+            "判读: 各口径都分不开 -> 先确认 checkpoint 的轮次 (早期权重没有判据价值); "
+            "确认是多轮之后仍如此, 就按上面的批次覆盖表检查训练正常图是否覆盖了验证集的全部批次"
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 两种入口
+# --------------------------------------------------------------------------- #
+def _write_csv(rows: List[Dict], path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    LOGGER.info("逐图明细已写入 %s", path)
+
+
+def _read_csv(path: str, depth: int) -> List[Dict]:
+    rows: List[Dict] = []
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        for raw in csv.DictReader(f):
+            row: Dict = {"path": raw.get("path", ""), "src": source_of(raw.get("path", ""), depth)}
+            for key, val in raw.items():
+                if key in ("path", "src"):
+                    continue
+                try:
+                    row[key] = float(val)
+                except (TypeError, ValueError):
+                    row[key] = val
+            row["defect"] = int(float(raw.get("defect", 0) or 0))
+            rows.append(row)
+    return rows
+
+
+def _probe(args) -> int:
+    import torch  # 只有完整探针才需要
+    from torch.nn import functional as F
+
+    from fabric_ncd.data.yolo import build_dataloaders, build_normal_dataset, build_normal_loader
+    from fabric_ncd.models.fabric_ncd import FabricNCD
+    from fabric_ncd.ops import topk_mean
+    from fabric_ncd.utils import load_yaml, resolve_device
+
+    def _load(ckpt: str, device):
+        state = torch.load(ckpt, map_location="cpu", weights_only=False)
+        cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
+        LOGGER.info("checkpoint: %s (epoch %s)", ckpt, state.get("epoch", "?"))
+        model = FabricNCD(cfg)
+        model.load_state_dict(state["ema" if "ema" in state else "model"])
+        calibration = state.get("calibration") or {}
+        scale = float(calibration.get("memory_distance_scale", 0.0) or 0.0)
+        if scale > 0:
+            model.memory_distance_scale = scale
+        return model.to(device).eval(), cfg
 
     device = resolve_device(args.device)
-    model, cfg, calibration = _load(args.checkpoint, device, {})
-    datasets = build_dataloaders(cfg)
-    loader = datasets["val"]
+    model, cfg = _load(args.checkpoint, device)
+    loader = build_dataloaders(cfg)["val"]
+
+    # ---- 批次覆盖: 训练正常图 vs 验证集 ----
+    train_src: Dict[str, int] = {}
+    train_ds = build_normal_dataset(cfg, "train")
+    if train_ds is not None:
+        for entry in train_ds.entries:
+            key = source_of(entry.image.name, args.group_depth)
+            train_src[key] = train_src.get(key, 0) + 1
 
     normal_loader = build_normal_loader(cfg, "train")
+    bank_images = 0
     if normal_loader is not None:
         model.memory.reset()
         with torch.no_grad():
             for i, batch in enumerate(normal_loader):
-                model.update_memory(
-                    batch["image"].to(device), mask=batch["cloth_mask"].to(device)
-                )
-                if i + 1 >= args.memory_batches:
+                model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
+                bank_images += int(batch["image"].shape[0])
+                if args.memory_batches and i + 1 >= args.memory_batches:
                     break
+        LOGGER.info("记忆库: 用 %d 张训练正常图建立 (共 %d 张可用)", bank_images, len(train_ds) if train_ds else 0)
 
-    rows: List[Dict] = []
     topk = int(cfg.get("eval", {}).get("topk_pixels", 256) or 256)
     gate = bool(cfg.get("eval", {}).get("cloth_gate", True))
     LOGGER.info("布面蒙版裁剪 (eval.cloth_gate): %s", "开" if gate else "关")
+
+    rows: List[Dict] = []
     with torch.no_grad():
         for batch in loader:
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -92,88 +359,65 @@ def main() -> int:
             masked = score * cloth_bin if gate else score
             learned = F.interpolate(out["learned_score"], size=(h, w), mode="bilinear", align_corners=False)
             for i in range(score.shape[0]):
-                normal = bool(batch["normal"][i].item())
+                path = str(batch["path"][i])
                 raw = score[i, 0].detach().cpu().numpy()
                 mkd = masked[i, 0].detach().cpu().numpy()
                 cl = cloth_bin[i, 0].detach().cpu().numpy()
                 lr = learned[i, 0].detach().cpu().numpy()
                 gt_boxes = batch["boxes"][i].detach().cpu().numpy()
-                rows.append(
-                    {
-                        "path": Path(batch["path"][i]).name,
-                        "defect": 0 if normal else 1,
-                        "n_gt": int(gt_boxes.shape[0]) if gt_boxes.ndim > 1 else 0,
-                        "topk_gated": topk_mean(mkd, k_pixels=topk),
-                        "topk_raw": topk_mean(raw, k_pixels=topk),
-                        "top16_raw": topk_mean(raw, k_pixels=16),
-                        "max_raw": float(raw.max()),
-                        "mean1pct_raw": float(np.sort(raw.ravel())[-max(1, raw.size // 100):].mean()),
-                        "topk_minus_med": float(topk_mean(raw, k_pixels=topk) - np.median(raw)),
-                        "max_minus_med": float(raw.max() - np.median(raw)),
-                        "median": float(np.median(raw)),
-                        "cloth_cov": float(cl.mean()),
-                        "learned_max": float(lr.max()),
-                    }
-                )
+                row = {
+                    "path": Path(path).name,
+                    "src": source_of(path, args.group_depth),
+                    "defect": 0 if bool(batch["normal"][i].item()) else 1,
+                    "n_gt": int(gt_boxes.shape[0]) if gt_boxes.ndim > 1 else 0,
+                    "topk_gated": topk_mean(mkd, k_pixels=topk),
+                    "topk_raw": topk_mean(raw, k_pixels=topk),
+                    "top16_raw": topk_mean(raw, k_pixels=16),
+                    "max_raw": float(raw.max()),
+                    "mean1pct_raw": float(np.sort(raw.ravel())[-max(1, raw.size // 100):].mean()),
+                    "topk_minus_med": float(topk_mean(raw, k_pixels=topk) - np.median(raw)),
+                    "max_minus_med": float(raw.max() - np.median(raw)),
+                    "median": float(np.median(raw)),
+                    "learned_max": float(lr.max()),
+                    "cloth_cov": float(cl.mean()),
+                }
+                row.update(appearance_stats(path))
+                rows.append(row)
             if args.samples and len(rows) >= 2 * args.samples:
                 break
 
-    labels = np.array([r["defect"] for r in rows])
-    LOGGER.info("验证集样本: 疵点 %d 张 / 正常 %d 张", int((labels == 1).sum()), int((labels == 0).sum()))
-
-    keys = [
-        "topk_gated", "topk_raw", "top16_raw", "max_raw", "mean1pct_raw",
-        "topk_minus_med", "max_minus_med", "median", "learned_max", "cloth_cov",
-    ]
-    LOGGER.info("%-15s %-10s %-10s %-10s %-10s", "聚合方式", "疵点图均值", "正常图均值", "AUROC", "组内标准差")
-    for key in keys:
-        vals = np.array([r[key] for r in rows], dtype=np.float64)
-        d_mean = float(vals[labels == 1].mean()) if (labels == 1).any() else float("nan")
-        n_mean = float(vals[labels == 0].mean()) if (labels == 0).any() else float("nan")
-        score = auroc(labels, vals) if key != "cloth_cov" else float("nan")
-        spread = float(vals.std()) if key != "cloth_cov" else float("nan")
-        LOGGER.info("%-15s %-10.4f %-10.4f %-10.4f %-10.4f", key, d_mean, n_mean, score, spread)
-
+    val_src: Dict[str, int] = defaultdict(int)
+    for r in rows:
+        val_src[r["src"]] += 1
+    _coverage(train_src, val_src)
     if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        LOGGER.info("逐图明细已写入 %s", args.csv)
+        _write_csv(rows, args.csv)
+    _group_table(rows, "topk_raw")
+    return analyze(rows, topk=topk, gate=gate)
 
-    # ------- 自动判读 -------
-    scored = [k for k in keys if k not in ("cloth_cov", "median")]
-    best = max(scored, key=lambda k: auroc(labels, np.array([r[k] for r in rows], dtype=np.float64)))
-    best_auc = auroc(labels, np.array([r[best] for r in rows], dtype=np.float64))
-    LOGGER.info("最佳聚合方式: %s (AUROC %.4f)", best, best_auc)
-    if best_auc >= 0.90:
-        LOGGER.info("判读: 该 checkpoint 上所有口径都分得开, 无需处理 (换 last.pt 再看当前轮次)")
-        return 0
-    auc_gated = auroc(labels, np.array([r["topk_gated"] for r in rows]))
-    auc_raw = auroc(labels, np.array([r["topk_raw"] for r in rows]))
-    auc_contrast = auroc(labels, np.array([r["topk_minus_med"] for r in rows]))
-    if auc_contrast - auc_raw > 0.10:
-        LOGGER.info(
-            "判读: 绝对分数被逐图底色偏移带偏 (topk %.3f -> 去中位数 %.3f) -> 设 eval.image_score_mode: contrast",
-            auc_raw, auc_contrast,
-        )
-    elif auc_raw - auc_gated > 0.10:
-        LOGGER.info(
-            "判读: 布面蒙版在裁掉疵点 (关闭 %s -> %s) -> 把 eval.cloth_gate 设为 false",
-            f"{auc_gated:.3f}", f"{auc_raw:.3f}",
-        )
-    elif best in ("top16_raw", "max_raw") and best_auc > 0.75 and auc_raw < 0.7:
-        LOGGER.info(
-            "判读: top-k(%d 像素) 把小疵点峰值稀释了 -> 把 eval.topk_pixels 调小 (试试 16~64)", topk,
-        )
-    elif auroc(labels, np.array([r["learned_max"] for r in rows])) > 0.75 and auc_raw < 0.7:
-        LOGGER.info("判读: 学习式异常头本身能分开, 融合后的分数反而被记忆项拖累 -> 调 model.memory.score_weight")
-    else:
-        LOGGER.info(
-            "判读: 各口径都分不开 -> 先确认这是不是早期 checkpoint; 若确认是多轮之后的权重, "
-            "则检查两组图是否同源 (正常验证图与训练正常图是否同种布)"
-        )
-    return 0
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="图级分数诊断: 分数到底在跟踪什么")
+    ap.add_argument("--checkpoint", default="", help="完整探针需要; 用 --from-csv 时可省")
+    ap.add_argument("--from-csv", default="", help="只分析已导出的逐图 csv, 不加载模型")
+    ap.add_argument("--samples", type=int, default=0, help="最多多少张 (0 = 全部)")
+    ap.add_argument("--memory-batches", type=int, default=0,
+                    help="建立记忆库用多少批正常图 (0 = 全部; 小于全部会让部分批次变成'没见过'而虚高)")
+    ap.add_argument("--group-depth", type=int, default=1, help="按文件名前几段分组 (默认 1 = 批次号)")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--csv", default="", help="把逐图明细写到 csv")
+    args = ap.parse_args()
+
+    if args.from_csv:
+        rows = _read_csv(args.from_csv, args.group_depth)
+        if not rows:
+            LOGGER.info("csv 是空的: %s", args.from_csv)
+            return 1
+        _group_table(rows, "topk_raw")
+        return analyze(rows)
+    if not args.checkpoint:
+        ap.error("需要 --checkpoint 或 --from-csv")
+    return _probe(args)
 
 
 if __name__ == "__main__":

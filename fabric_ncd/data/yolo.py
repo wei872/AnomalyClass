@@ -599,7 +599,16 @@ def build_normal_dataset(cfg: Dict[str, Any], split: str = "train") -> Optional[
     return dataset
 
 
-def build_normal_loader(cfg: Dict[str, Any], split: str = "train") -> Optional[DataLoader]:
+def build_normal_loader(
+    cfg: Dict[str, Any], split: str = "train", shuffle: bool = False
+) -> Optional[DataLoader]:
+    """正常图 loader.
+
+    ``shuffle=True`` 用于**只取前若干批**建记忆库的场合 (``train.memory_shuffle``):
+    不洗牌时每轮都只看数据集目录里最前面的那几十张, 一旦它们的布料批次/曝光与验证集
+    不同, 记忆库就会系统性地"没见过"某些正常外观 —— 表现为这些正常图分数虚高、
+    imageAUROC 反向. 洗牌后每个 epoch 抽到的子集不同, 覆盖率随训练累积.
+    """
     dataset = build_normal_dataset(cfg, split)
     if dataset is None:
         return None
@@ -607,7 +616,7 @@ def build_normal_loader(cfg: Dict[str, Any], split: str = "train") -> Optional[D
     return DataLoader(
         dataset,
         batch_size=int(cfg.get("data", {}).get("eval_batch_size", 4)),
-        shuffle=False,
+        shuffle=shuffle,
         num_workers=max(0, workers // 2),
         pin_memory=True,
         collate_fn=collate_fn,

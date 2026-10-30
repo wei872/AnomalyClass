@@ -522,9 +522,17 @@ class Trainer:
             self.logger.warning("没有可用的正常图, 跳过记忆库预热 (将仅使用学习式异常头)")
             return
         self.model.eval()
+        loader = self.normal_loader
+        # 只取前 max_batches 批时, 不洗牌 = 每轮都只看最前面那几十张正常图;
+        # 若这些图与验证集正常图的批次/曝光不同, 记忆库会系统性漏掉某些正常外观.
+        # 洗牌后每个 epoch 抽到的子集不同, 覆盖率随训练累积.
+        if max_batches and bool(self.train_cfg.get("memory_shuffle", True)):
+            shuffled = build_normal_loader(self.cfg, "train", shuffle=True)
+            if shuffled is not None:
+                loader = shuffled
         batches = 0
         with torch.no_grad():
-            for batch in self.normal_loader:
+            for batch in loader:
                 batch = move_to(batch, self.device)
                 self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
                 batches += 1

@@ -124,6 +124,10 @@ train:
   val_interval: 1
   log_interval: 10
   early_stop_patience: 15
+  # 只取前 N 批正常图建记忆库 (0 = 全部). 数量受显存/时间限制时, 一定要让抽样**洗牌**
+  # (memory_shuffle), 否则每轮都是同一批图, 记忆库会漏掉别的布料批次/曝光,
+  # 那些正常图在验证集上就会分数虚高 -> imageAUROC 反向.
+  memory_shuffle: true
   memory_warmup_batches: 24
   # 记忆库必须跟当前嵌入一致: 只在第 5/10/15... 轮重建时, 前几轮嵌入变化最快,
   # 库会迅速脱节 (实测正常像素到库的中位距离 1.03, 余弦相似度≈0, 记忆分支退化成常数).
