@@ -136,7 +136,13 @@ eval:
   open_radius: 1
   bbox_refine_ratio: 0.7          # 用高分核心收缩区域框
   min_cls_score: 0.0
-  topk_ratio: 0.01
+  # 图像级分数: 优先用固定像素数 (k_pixels), 而非比例. 1% 在 800x1952 上等于
+  # 一万五千像素, 而小疵点常常只有一两千像素 -> 均值被正常像素稀释, 图像级
+  # AUROC 会掉到 0.5 以下. 256 个像素与疵点尺度无关, 更适合小疵点.
+  topk_pixels: 256
+  topk_ratio: 0.01        # 仅在 topk_pixels 未设置时生效
+  calib_interval: 1       # 每几轮用正常图重新校准阈值; 设成 >= epochs 即等于只在启动时校准
+  calib_batches: 4        # 重新校准时用几个 batch 的正常图 (越多越稳, 越慢)
 
 infer:
   tile: false              # 1600x846 整图一次前向 (tile=true 才切块, 更慢, 一般不开)

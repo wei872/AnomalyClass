@@ -392,6 +392,27 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 > 因此 `map50` 会低于同数据上的全监督 YOLO——换来的能力是换布种/新疵点/无标签冷启动。
 > 若产线允许，可把本模型的异常图与布面掩码作为**前置筛选**，再对候选区域接一个小分类器。
 
+### 7.1 怎么读训练日志
+
+每个 epoch 会额外打印两行诊断：
+
+```
+分类头 | cls 2.000 (均匀基线 ln19=2.944, 已低于基线) | 框内准确率 0.435
+检测   | pixelAUROC 0.6968 | imgAUROC 0.1772 | mAP50 0.0000 | 检出率 0.00 (30 张疵点图, 平均 0.0 区域/图) | thr 0.1937
+```
+
+- **`cls` 对比 `ln(C)`**：`ln(19)=2.944` 是"瞎猜"的交叉熵。`cls` 高于它说明分类头还没学到东西，
+  通常出现在 warmup 阶段（`train.warmup_epochs` 个 epoch）；低于它才算真的在学。
+  `框内准确率` 的分母是框内像素，随机基线是 `1/19≈0.05`。
+- **`检出率`**：验证集疵点图中**至少检出一个区域**的比例。它是 0 而 `pixelAUROC` 正常（>0.6）时，
+  说明是**阈值/后处理**问题，不是模型问题——优先看 `thr` 与 `正常最大值`（见 `阈值校准` 那行），
+  再把 `eval.calib_sigma` 调小或 `eval.normal_quantile` 调到 0.99。
+- **`阈值校准`** 每 `eval.calib_interval` 轮执行一次（默认每轮，`eval.calib_batches` 张正常图），
+  日志会给出 `q0.999` / `mean+kσ` / `正常最大值` 三个分量。阈值一定 ≤ 正常最大值：
+  否则训练后分数分布一变尖，`mean+6σ` 会超过 1.0，任何像素都超不过阈值，验证集区域数直接归零。
+- **`imgAUROC` 长期低于 0.5**：图像级分数被大图稀释了。图像级打分用 `eval.topk_pixels`（默认 256 个像素）
+  而不是 `topk_ratio=1%`——1% 在 800×1952 上是一万五千个像素，小疵点连同周围正常布一起被平均掉。
+
 ---
 
 ## 8. 调参手册（按症状查）
@@ -403,6 +424,8 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 小疵点（断经、飞花）漏检 | 提高输入分辨率（`data.image_size` 640/768）；`loss.anomaly.alpha` 调高到 0.7–0.75；`eval.min_area_ratio` 调小 |
 | 整幅性缺陷（纬斜）漏检 | 用 `mobilenet_v3_large` 或 `efficientnet_b0`；提高 `neck.global_channels`、`neck.dilations` |
 | 正常图少量误报 | 提高 `eval.calib_sigma`（阈值更保守）；增大 `model.memory.capacity` 与训练集正常图数量 |
+| 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
+| 图像级 AUROC < 0.5 | 检查 `eval.topk_pixels`（小疵点用 128~256）；不要把 `topk_ratio` 设大 |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |

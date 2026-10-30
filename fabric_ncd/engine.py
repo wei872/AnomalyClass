@@ -30,7 +30,7 @@ from .losses import FabricCriterion
 from .metrics import MetricAccumulator
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer, postprocess_outputs
-from .ops import topk_mean
+from .ops import threshold_from_normal_pixels, topk_mean
 from .utils import (
     AverageMeter,
     Timer,
@@ -81,6 +81,12 @@ class ModelEMA:
 # 验证
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def image_score_of(score: np.ndarray, eval_cfg: dict) -> float:
+    """图像级异常分数 (评估 / 校准 / 推理共用一套口径)."""
+    k_pixels = int(eval_cfg.get("topk_pixels", 0) or 0)
+    return topk_mean(score, float(eval_cfg.get("topk_ratio", 0.01)), k_pixels=k_pixels or None)
+
+
 def evaluate(
     model: FabricNCD,
     loader: DataLoader,
@@ -104,12 +110,16 @@ def evaluate(
     # 未显式指定阈值时优先使用正常集校准出的绝对阈值
     if analyzer.threshold is None and calibration:
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
+    eval_cfg = cfg.get("eval", {})
     acc = MetricAccumulator(num_classes=len(names), names=names)
     if analyzer.threshold is not None:
         acc.pixel_threshold = float(analyzer.threshold)
     loss_meter = AverageMeter()
     predictions: List[Dict[str, Any]] = []
     seen = 0
+    defect_images = 0
+    detected_images = 0
+    region_total = 0
 
     for batch in loader:
         batch = move_to(batch, device)
@@ -132,8 +142,13 @@ def evaluate(
         region_results = postprocess_outputs(outputs, analyzer, input_size=(h, w))
         for i in range(score.shape[0]):
             normal = bool(batch["normal"][i].item())
-            image_score = topk_mean(score_np[i], float(cfg.get("eval", {}).get("topk_ratio", 0.01)))
+            image_score = image_score_of(score_np[i], eval_cfg)
             infos, image_level = region_results[i]
+            region_total += len(infos)
+            if not normal:
+                defect_images += 1
+                if infos:
+                    detected_images += 1
             gt_mask = batch["anomaly_mask"][i, 0].detach().cpu().numpy()
 
             gt_labels = batch["labels"][i].detach().cpu().numpy().astype(int)
@@ -183,6 +198,9 @@ def evaluate(
     if criterion is not None:
         metrics["val_loss"] = loss_meter.avg
     metrics["num_samples"] = seen
+    metrics["det_rate"] = detected_images / defect_images if defect_images else 0.0
+    metrics["num_defect_images"] = defect_images
+    metrics["regions_per_image"] = region_total / max(1, seen)
     if collect_predictions:
         metrics["predictions"] = predictions
     return metrics
@@ -265,7 +283,7 @@ def evaluate_tiled(
         )
         score = maps["score"] * (maps["cloth"] > 0.5)
         infos, image_level = analyzer.analyze(score, maps["cloth"], maps["probs"])
-        image_score = topk_mean(score, float(eval_cfg.get("topk_ratio", 0.01)))
+        image_score = image_score_of(score, eval_cfg)
 
         # 像素级统计下采样, 大幅面图 (2000x3000) 全分辨率累计会吃掉数 GB 内存
         factor = max(1, int(math.ceil(math.sqrt((h * w) / max(max_pixels, 1.0)))))
@@ -517,7 +535,7 @@ class Trainer:
             cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
             score = (score * (cloth > 0.5).float()).squeeze(1).cpu().numpy()
             for i in range(score.shape[0]):
-                image_scores.append(topk_mean(score[i], float(eval_cfg.get("topk_ratio", 0.01))))
+                image_scores.append(image_score_of(score[i], eval_cfg))
                 flat = score[i].ravel()
                 if flat.size > 20000:
                     flat = flat[:: max(1, flat.size // 20000)]
@@ -531,13 +549,18 @@ class Trainer:
         if pixel_values.size > max_pixels:
             idx = np.random.default_rng(0).choice(pixel_values.size, max_pixels, replace=False)
             pixel_values = pixel_values[idx]
+        k = float(eval_cfg.get("calib_sigma", 6.0))
+        thr_stats = threshold_from_normal_pixels(pixel_values, q, k)
+        if thr_stats["max"] <= 1e-6:
+            self.logger.warning(
+                "校准失败: 正常图分数全为 0 (布面掩码可能还没学出来), 暂用 0.5 作为阈值"
+            )
+        q_thr, sigma_thr, vmax = thr_stats["quantile_thr"], thr_stats["sigma_thr"], thr_stats["max"]
         self.calibration = {
-            "pixel_threshold": float(
-                max(
-                    np.quantile(pixel_values, q),
-                    pixel_values.mean() + float(eval_cfg.get("calib_sigma", 6.0)) * pixel_values.std(),
-                )
-            ),
+            "pixel_threshold": thr_stats["threshold"],
+            "pixel_thr_quantile": q_thr,
+            "pixel_thr_sigma": sigma_thr,
+            "pixel_max": vmax,
             "pixel_mean": float(pixel_values.mean()),
             "pixel_std": float(pixel_values.std()),
             "image_threshold": float(
@@ -549,10 +572,16 @@ class Trainer:
             "quantile": q,
         }
         self.logger.info(
-            "阈值校准完成: pixel_thr=%.4f (q=%.4f) | image_thr=%.4f | %d 张正常图",
+            "阈值校准: pixel_thr=%.4f (q%.3f=%.4f, mean+%.0fσ=%.4f, 正常最大值=%.4f) | "
+            "image_thr=%.4f (正常图均值 %.4f) | %d 张正常图",
             self.calibration["pixel_threshold"],
             q,
+            q_thr,
+            k,
+            sigma_thr,
+            vmax,
             self.calibration["image_threshold"],
+            float(np.mean(image_scores)),
             len(image_scores),
         )
         self.model.train()
@@ -579,7 +608,12 @@ class Trainer:
             metrics: Dict[str, Any] = {}
             if (epoch + 1) % int(self.train_cfg.get("val_interval", 1)) == 0 or epoch == self.epochs - 1:
                 model_for_eval = self.ema.ema if self.ema is not None else self.model
-                if self.cfg.get("eval", {}).get("threshold") is None and self.calibration:
+                # 阈值必须跟着模型走: 固定阈值在训练中会逐渐失配, 表现为验证集区域数
+                # 突然变 0 (map50/acc 一起塌), 所以默认每轮用正常图重新校准一次.
+                if self.cfg.get("eval", {}).get("threshold") is None and self.normal_loader is not None:
+                    interval = int(self.cfg.get("eval", {}).get("calib_interval", 1))
+                    if (epoch + 1) % max(1, interval) == 0:
+                        self.calibrate(max_batches=int(self.cfg.get("eval", {}).get("calib_batches", 4)))
                     self.analyzer.threshold = self.calibration.get("pixel_threshold")
                 metrics = self.eval_model(model_for_eval)
                 score = self._composite_score(metrics)
@@ -596,6 +630,23 @@ class Trainer:
                     score,
                     format_seconds(timer.elapsed),
                 )
+                self.logger.info(
+                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f | mAP50 %.4f | 检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图) | thr %.4f",
+                    metrics.get("pixel_auroc", float("nan")),
+                    metrics.get("image_auroc", float("nan")),
+                    metrics.get("map50", float("nan")),
+                    metrics.get("det_rate", 0.0),
+                    int(metrics.get("num_defect_images", 0)),
+                    metrics.get("regions_per_image", 0.0),
+                    float(self.analyzer.threshold or 0.0),
+                )
+                if metrics.get("det_rate", 1.0) <= 0.0 and int(metrics.get("num_defect_images", 0)) > 0:
+                    self.logger.warning(
+                        "验证集检出率为 0: 阈值 %.4f 高于所有像素分数 (正常最大值 %.4f), "
+                        "可调 eval.calib_sigma 或 eval.normal_quantile",
+                        float(self.analyzer.threshold or 0.0),
+                        float(self.calibration.get("pixel_max", 0.0)),
+                    )
                 if score > self.best_score:
                     self.best_score = score
                     bad_epochs = 0

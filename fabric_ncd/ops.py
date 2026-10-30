@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -233,15 +233,52 @@ def extract_regions(
     return regions[:max_regions]
 
 
-def topk_mean(values: np.ndarray, k_ratio: float = 0.01, min_k: int = 16) -> float:
-    """图像级异常分数: 取最高 k% 像素的均值 (抗噪, 优于 max)."""
+def topk_mean(
+    values: np.ndarray, k_ratio: float = 0.01, min_k: int = 16, k_pixels: int | None = None
+) -> float:
+    """图像级异常分数: 取最高 k% 像素的均值 (抗噪, 优于 max).
+
+    ``k_pixels`` 优先于 ``k_ratio``: 固定 1% 在整图上意味着"最高的一万多个像素",
+    而小疵点往往只占几千像素, 均值会被大量正常像素稀释, 于是疵点图的图像级分数
+    反而低于正常图 (imageAUROC < 0.5). 用绝对像素数 (如 256) 才和疵点尺度无关.
+    """
     flat = values.ravel()
     if flat.size == 0:
         return 0.0
-    k = max(min_k, int(flat.size * k_ratio))
+    if k_pixels:
+        k = max(1, int(k_pixels))  # 显式指定像素数时不受 min_k 影响
+    else:
+        k = max(min_k, int(flat.size * k_ratio))
     k = min(k, flat.size)
     part = np.partition(flat, -k)[-k:]
     return float(part.mean())
+
+
+def threshold_from_normal_pixels(
+    values: np.ndarray, quantile: float = 0.999, sigma_k: float = 6.0
+) -> Dict[str, float]:
+    """用正常图素级分数分布确定绝对阈值.
+
+    ``max(高分位, 均值 + kσ)`` 里的 σ 项没有上界: 异常分数是 0~1 的概率, 训练后
+    正常像素分布变得很尖 (σ 很小) 但均值抬高时, ``均值 + 6σ`` 会超过 1.0, 阈值
+    高到**任何像素都不可能超过** -> 验证集区域数恒为 0, mAP/分类准确率一起归零.
+    因此用正常像素的最大值兜底, 保证阈值一定落在可达范围内.
+    """
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    if arr.size == 0:
+        return {"threshold": 0.5, "quantile_thr": 0.5, "sigma_thr": 0.5, "max": 0.5}
+    if float(arr.max()) <= 1e-6:
+        # 布面掩码还没学出来时分数会被整片置 0, 阈值 0 会让每个像素都变成区域
+        return {"threshold": 0.5, "quantile_thr": 0.0, "sigma_thr": 0.0, "max": float(arr.max())}
+    q_thr = float(np.quantile(arr, float(quantile)))
+    sigma_thr = float(arr.mean() + float(sigma_k) * arr.std())
+    vmax = float(arr.max())
+    return {
+        "threshold": float(min(max(q_thr, sigma_thr), vmax)),
+        "quantile_thr": q_thr,
+        "sigma_thr": sigma_thr,
+        "max": vmax,
+    }
 
 
 def bbox_iou(a: Sequence[float], b: Sequence[float]) -> float:
