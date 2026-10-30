@@ -62,6 +62,7 @@ def main() -> int:
         collate_fn=collate_fn,
     )
     analyzer = RegionAnalyzer(
+        use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
         names=names,
         threshold=args.threshold,
         sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),

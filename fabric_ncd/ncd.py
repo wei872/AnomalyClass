@@ -82,6 +82,7 @@ class RegionAnalyzer:
         peak_ratio: float = 0.35,
         open_radius: int = 1,
         bbox_refine_ratio: float = 0.7,
+        use_cloth: bool = True,
     ) -> None:
         self.names = list(names) if names is not None else None
         self.min_area_ratio = min_area_ratio
@@ -93,6 +94,9 @@ class RegionAnalyzer:
         self.peak_ratio = peak_ratio
         self.open_radius = open_radius
         self.bbox_refine_ratio = bbox_refine_ratio
+        # 整幅都是布 (无辊筒/背景) 时, 布面蒙版不但没用, 还会把"长得不像布"的疵点
+        # 一起裁掉: 实测疵点图的图级分数反而低于正常图 (imageAUROC < 0.5).
+        self.use_cloth = bool(use_cloth)
 
     def analyze(
         self,
@@ -113,10 +117,11 @@ class RegionAnalyzer:
         ps = max(1, int(probs_scale))
         if self.smooth > 1:
             score = box_filter(score, self.smooth // 2)
-        masked = score * (cloth > 0.5)
+        cloth_ok = (cloth > 0.5) if self.use_cloth else np.ones_like(cloth, dtype=bool)
+        masked = score * cloth_ok
 
         thr = self.threshold if self.threshold is not None else auto_threshold(masked, cloth, self.sigma)
-        binary = ((masked > thr) & (cloth > 0.5)).astype(np.uint8)
+        binary = ((masked > thr) & cloth_ok).astype(np.uint8)
         binary = binary_close(binary_open(binary, self.open_radius), self.open_radius)
 
         h, w = score.shape

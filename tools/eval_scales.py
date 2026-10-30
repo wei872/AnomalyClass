@@ -112,7 +112,11 @@ def main() -> int:
                         break
 
         hw = resolved_hw
-        analyzer = RegionAnalyzer(names=None, threshold=None)
+        analyzer = RegionAnalyzer(
+            names=None,
+            use_cloth=bool(cfg_s.get("eval", {}).get("cloth_gate", True)),
+            threshold=None,
+        )
         started = time.time()
         metrics = evaluate(
             model, val_loader, cfg_s, device, criterion=None,

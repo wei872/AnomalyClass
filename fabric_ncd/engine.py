@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 
 from .data.yolo import build_dataloaders, build_normal_loader, load_dataset_spec
 from .losses import FabricCriterion
-from .metrics import MetricAccumulator
+from .metrics import MetricAccumulator, auroc
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer, postprocess_outputs
 from .ops import threshold_from_normal_pixels, topk_mean
@@ -82,6 +82,13 @@ class ModelEMA:
 # 验证
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def gate_by_cloth(score, cloth, enabled: bool = True):
+    """按布面掩码裁剪异常分数. 整幅都是布时应关闭, 否则会把疵点本身裁掉."""
+    if not enabled:
+        return score
+    return score * (cloth > 0.5)
+
+
 def image_score_of(score: np.ndarray, eval_cfg: dict) -> float:
     """图像级异常分数 (评估 / 校准 / 推理共用一套口径)."""
     k_pixels = int(eval_cfg.get("topk_pixels", 0) or 0)
@@ -103,6 +110,7 @@ def evaluate(
     names = _class_names(cfg)
     analyzer = analyzer or RegionAnalyzer(
         names=names,
+        use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
         threshold=cfg.get("eval", {}).get("threshold"),
         sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),
         min_area_ratio=float(cfg.get("eval", {}).get("min_area_ratio", 4e-4)),
@@ -112,6 +120,7 @@ def evaluate(
     if analyzer.threshold is None and calibration:
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
     eval_cfg = cfg.get("eval", {})
+    gate = bool(eval_cfg.get("cloth_gate", True))
     acc = MetricAccumulator(num_classes=len(names), names=names)
     if analyzer.threshold is not None:
         acc.pixel_threshold = float(analyzer.threshold)
@@ -121,6 +130,9 @@ def evaluate(
     defect_images = 0
     detected_images = 0
     region_total = 0
+    # 图像级聚合方式对比: 小疵点用 top-k 均值容易被稀释, 这里同时统计 peak 与小 top-k
+    agg = {"topk": [], "top16": [], "max": []}
+    agg_labels: List[int] = []
 
     for batch in loader:
         batch = move_to(batch, device)
@@ -137,13 +149,17 @@ def evaluate(
         h, w = batch["image"].shape[-2:]
         score = F.interpolate(outputs["anomaly_score"], size=(h, w), mode="bilinear", align_corners=False)
         cloth = F.interpolate(outputs["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
-        score = score * (cloth > 0.5).float()
+        score = gate_by_cloth(score, cloth, gate)
         score_np = score.squeeze(1).detach().cpu().numpy()
 
         region_results = postprocess_outputs(outputs, analyzer, input_size=(h, w))
         for i in range(score.shape[0]):
             normal = bool(batch["normal"][i].item())
             image_score = image_score_of(score_np[i], eval_cfg)
+            agg["topk"].append(image_score)
+            agg["top16"].append(topk_mean(score_np[i], k_pixels=16))
+            agg["max"].append(float(score_np[i].max()))
+            agg_labels.append(0 if normal else 1)
             infos, image_level = region_results[i]
             region_total += len(infos)
             if not normal:
@@ -202,6 +218,9 @@ def evaluate(
     metrics["det_rate"] = detected_images / defect_images if defect_images else 0.0
     metrics["num_defect_images"] = defect_images
     metrics["regions_per_image"] = region_total / max(1, seen)
+    if agg_labels and 0 < sum(agg_labels) < len(agg_labels):
+        for key, values in agg.items():
+            metrics[f"image_auroc_{key}"] = auroc(np.asarray(agg_labels), np.asarray(values))
     if collect_predictions:
         metrics["predictions"] = predictions
     return metrics
@@ -238,6 +257,7 @@ def evaluate_tiled(
     eval_cfg = cfg.get("eval", {})
     analyzer = analyzer or RegionAnalyzer(
         names=names,
+        use_cloth=bool(eval_cfg.get("cloth_gate", True)),
         threshold=eval_cfg.get("threshold"),
         sigma=float(eval_cfg.get("threshold_sigma", 3.0)),
         min_area_ratio=float(eval_cfg.get("min_area_ratio", 4e-4)),
@@ -254,6 +274,7 @@ def evaluate_tiled(
     tile_hw = as_hw(tile_size or eval_cfg.get("tile_size") or image_size)
     overlap = int(tile_overlap if tile_overlap is not None else eval_cfg.get("tile_overlap", 128))
     tile_batch = int(eval_cfg.get("tile_batch", 4))
+    gate = bool(eval_cfg.get("cloth_gate", True))
     max_pixels = float(eval_cfg.get("max_pixels", 3e5))
 
     defect_images = list_images(spec.splits.get(split))
@@ -282,7 +303,7 @@ def evaluate_tiled(
             model, rgb, device, image_size,
             tile=True, tile_size=tile_hw, tile_overlap=overlap, tile_batch=tile_batch,
         )
-        score = maps["score"] * (maps["cloth"] > 0.5)
+        score = gate_by_cloth(maps["score"], maps["cloth"], gate)
         infos, image_level = analyzer.analyze(score, maps["cloth"], maps["probs"])
         image_score = image_score_of(score, eval_cfg)
 
@@ -452,6 +473,7 @@ class Trainer:
         self.start_epoch = 0
         self.calibration: Dict[str, float] = {}
         self._memory_stale = False
+        self._calib_calls = 0
         self.best_score = -float("inf")
         self.history: List[Dict[str, Any]] = []
         self.global_step = 0
@@ -627,7 +649,11 @@ class Trainer:
                 out["learned_score"], size=(h, w), mode="bilinear", align_corners=False
             ).squeeze(1).float().cpu().numpy()
             cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
-            keep = (cloth > 0.5).squeeze(1).cpu().numpy()
+            keep = (
+                (cloth > 0.5).squeeze(1).cpu().numpy()
+                if bool(eval_cfg.get("cloth_gate", True))
+                else np.ones_like(cloth.squeeze(1).cpu().numpy(), dtype=bool)
+            )
             dist = out.get("memory_distance")
             if dist is None:
                 dist_np = np.zeros_like(learned)
@@ -700,17 +726,31 @@ class Trainer:
                 "校准失败: 正常图分数全为 0 (布面掩码可能还没学出来), 暂用 0.5 作为阈值"
             )
         q_thr, sigma_thr, vmax = thr_stats["quantile_thr"], thr_stats["sigma_thr"], thr_stats["max"]
+        image_thr_new = float(
+            threshold_from_normal_pixels(np.asarray(image_scores), qi, 3.0)["threshold"]
+        )
+        # 8~16 张正常图估 99.9 分位本身抖动很大 (实测阈值在 0.50~0.61 之间跳),
+        # 会让"检出率"在 0 / 0.6 之间来回翻 —— 那是采样噪声, 不是模型变化.
+        # 首次直接采用, 之后用指数滑动平均跟上, 读数才稳定可比.
+        smooth = float(eval_cfg.get("calib_smooth", 0.5))
+        pixel_thr_new = float(thr_stats["threshold"])
+        if self._calib_calls > 0 and 0.0 < smooth < 1.0:
+            prev = self.calibration.get("pixel_threshold")
+            prev_img = self.calibration.get("image_threshold")
+            if prev is not None:
+                pixel_thr_new = smooth * float(prev) + (1.0 - smooth) * pixel_thr_new
+            if prev_img is not None:
+                image_thr_new = smooth * float(prev_img) + (1.0 - smooth) * image_thr_new
+        self._calib_calls += 1
         self.calibration = {
-            "pixel_threshold": thr_stats["threshold"],
+            "pixel_threshold": pixel_thr_new,
             "pixel_thr_quantile": q_thr,
             "pixel_thr_sigma": sigma_thr,
             "pixel_max": vmax,
             "pixel_mean": float(pixel_values.mean()),
             "pixel_std": float(pixel_values.std()),
             "memory_distance_scale": float(scale if use_memory else 0.0),
-            "image_threshold": float(
-                threshold_from_normal_pixels(np.asarray(image_scores), qi, 3.0)["threshold"]
-            ),
+            "image_threshold": image_thr_new,
             "image_mean": float(np.mean(image_scores)),
             "image_std": float(np.std(image_scores)),
             "num_normal_images": len(image_scores),
@@ -780,9 +820,12 @@ class Trainer:
                     format_seconds(timer.elapsed),
                 )
                 self.logger.info(
-                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f | mAP50 %.4f | 检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图) | thr %.4f",
+                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f (top16 %.3f / max %.3f) | mAP50 %.4f | "
+                    "检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图) | thr %.4f",
                     metrics.get("pixel_auroc", float("nan")),
                     metrics.get("image_auroc", float("nan")),
+                    metrics.get("image_auroc_top16", float("nan")),
+                    metrics.get("image_auroc_max", float("nan")),
                     metrics.get("map50", float("nan")),
                     metrics.get("det_rate", 0.0),
                     int(metrics.get("num_defect_images", 0)),

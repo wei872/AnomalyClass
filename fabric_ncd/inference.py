@@ -401,8 +401,10 @@ class FabricPredictor:
         resolved_thr = threshold if threshold is not None else eval_cfg.get("threshold")
         if resolved_thr is None and calib_thr is not None:
             resolved_thr = float(calib_thr)
+        self.cloth_gate = bool(eval_cfg.get("cloth_gate", True))
         self.analyzer = RegionAnalyzer(
             names=self.names,
+            use_cloth=self.cloth_gate,
             threshold=resolved_thr,
             sigma=float(eval_cfg.get("threshold_sigma", 3.0)),
             min_area_ratio=float(eval_cfg.get("min_area_ratio", 4e-4)),
@@ -465,7 +467,7 @@ class FabricPredictor:
 
     def analyze_maps(self, maps: Dict[str, np.ndarray]) -> Dict[str, Any]:
         """第二阶段: 区域分析 + 图像级判定 (纯 CPU, 可与下一帧的 GPU 计算重叠)."""
-        score = maps["score"] * (maps["cloth"] > 0.5)
+        score = maps["score"] * (maps["cloth"] > 0.5) if getattr(self, "cloth_gate", True) else maps["score"]
         infos, image_level = self.analyzer.analyze(
             score, maps["cloth"], maps["probs"], probs_scale=int(maps.get("probs_scale", 1))
         )

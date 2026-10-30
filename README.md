@@ -413,8 +413,10 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 - **`阈值校准`** 每 `eval.calib_interval` 轮执行一次（默认每轮，`eval.calib_batches` 张正常图），
   日志会给出 `q0.999` / `mean+kσ` / `正常最大值` 三个分量。阈值一定 ≤ 正常最大值：
   否则训练后分数分布一变尖，`mean+6σ` 会超过 1.0，任何像素都超不过阈值，验证集区域数直接归零。
-- **`imgAUROC` 长期低于 0.5**：图像级分数被大图稀释了。图像级打分用 `eval.topk_pixels`（默认 256 个像素）
-  而不是 `topk_ratio=1%`——1% 在 800×1952 上是一万五千个像素，小疵点连同周围正常布一起被平均掉。
+- **`imgAUROC` 长期低于 0.5**：先看同一行的 `top16 / max` 两个括号值。三者都低 = 分数真的分不开；
+  只有 top-k 低、peak 高 = 聚合口径问题（`eval.topk_pixels` 调小）。若三者都低但 `pixelAUROC` 正常，
+  多半是**布面蒙版把疵点裁掉了**——整幅都是布的数据必须 `eval.cloth_gate: false`，
+  用 `python tools/diagnose_scores.py --checkpoint best.pt` 可以对同一个权重逐图验证（不重训）。
 
 ---
 
@@ -430,7 +432,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 记忆库与当前嵌入脱节（`记忆项尺度` 接近 1.0） | 把 `train.memory_refresh_interval` 设为 1，并适当降低 `memory_warmup_batches`（24 ≈ 15 s/轮），否则记忆分支退化成常数、检出率被拖到 0 |
 | 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
-| 图像级 AUROC < 0.5 | 检查 `eval.topk_pixels`（小疵点用 128~256）；不要把 `topk_ratio` 设大 |
+| 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint best.pt`：`topk_raw` 明显高于 `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false`（整幅都是布时必须关） |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |
@@ -454,6 +456,19 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 
 - `pixelAUROC` 随尺度明显上升（Δ > 0.05）→ 小疵点在 1/8 特征图上不足一格，值得提分辨率或改切块；
 - 基本平坦 → 分辨率不是瓶颈，继续加显存只会更慢，应回去调损失/增广/标注质量。
+
+### 8.1.1 图级分数探针（`tools/diagnose_scores.py`）
+
+```bash
+python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/best.pt --csv scores.csv
+```
+
+逐图打印 `topk_gated / topk_raw / top16_raw / max_raw / mean1pct_raw / learned_max / cloth_cov`，
+并给出"疵点图均值 vs 正常图均值 vs AUROC"表格，最后自动判读属于哪一类：
+
+- `topk_raw` 远高于 `topk_gated` → 布面蒙版在裁掉疵点 → `eval.cloth_gate: false`；
+- 只有 peak 类高 → top-k 稀释 → 调小 `eval.topk_pixels`；
+- 全部分不开 → 两组图可能不同源（验证集正常图与训练不是同一种布），或异常头没学到东西。
 
 ### 8.2 两个已经做过 A/B、证明**无效**的方向（别再试）
 

@@ -145,6 +145,10 @@ eval:
   tile_overlap: 128
   tile_batch: 2
   max_pixels: 3.0e5         # 像素级指标统计前下采样到的像素数上限 (内存保护)
+  # 布面蒙版裁剪: 整幅都是布 (没有辊筒/背景) 时务必关闭 —— 否则"长得不像布"的疵点
+  # 会被蒙版一起裁掉, 表现为 imageAUROC < 0.5 (正常图分数反而更高), 检出率忽高忽低.
+  # 本数据集 (source5_augmenteds) 整图都是布 -> false. 有背景辊筒时再设 true.
+  cloth_gate: false
   threshold: null        # null = 自适应阈值
   threshold_sigma: 3.0
   min_area_ratio: 0.0004
@@ -160,7 +164,9 @@ eval:
   topk_pixels: 256
   topk_ratio: 0.01        # 仅在 topk_pixels 未设置时生效
   calib_interval: 1       # 每几轮用正常图重新校准阈值; 设成 >= epochs 即等于只在启动时校准
-  calib_batches: 4        # 重新校准时用几个 batch 的正常图 (越多越稳, 越慢)
+  calib_batches: 12       # 重新校准时用几个 batch 的正常图 (越多越稳, 越慢)
+  calib_smooth: 0.5       # 阈值的指数滑动平均系数: 0 = 完全跟随当轮, 越大越平滑
+                          # 8 张图估 99.9 分位会在 0.50~0.61 之间乱跳, 检出率随之翻来覆去
 
 infer:
   tile: false              # 1600x846 整图一次前向 (tile=true 才切块, 更慢, 一般不开)

@@ -44,3 +44,23 @@ def test_topk_pixels_not_diluted_by_image_size():
     score[:10] = 1.0
     assert topk_mean(score, k_pixels=10) == 1.0
     assert topk_mean(score, k_ratio=0.01) < 0.01
+
+
+def test_region_analyzer_cloth_gate_switch():
+    """整幅都是布时必须能关掉布面蒙版, 否则疵点会被蒙版裁掉."""
+    import numpy as np
+
+    from fabric_ncd.ncd import RegionAnalyzer
+
+    score = np.zeros((60, 60), dtype=np.float32)
+    score[20:30, 20:30] = 0.9                      # 疵点
+    cloth = np.ones((60, 60), dtype=np.float32)
+    cloth[20:30, 20:30] = 0.2                      # 布面头把疵点判成"非布"
+
+    gated = RegionAnalyzer(threshold=0.5, use_cloth=True)
+    infos_gated, _ = gated.analyze(score, cloth)
+    ungated = RegionAnalyzer(threshold=0.5, use_cloth=False)
+    infos_ungated, _ = ungated.analyze(score, cloth)
+
+    assert len(infos_gated) == 0                   # 被蒙版裁掉 -> 检不出
+    assert len(infos_ungated) == 1                 # 关闭蒙版 -> 正常检出
