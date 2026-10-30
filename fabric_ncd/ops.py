@@ -273,8 +273,11 @@ def threshold_from_normal_pixels(
     q_thr = float(np.quantile(arr, float(quantile)))
     sigma_thr = float(arr.mean() + float(sigma_k) * arr.std())
     vmax = float(arr.max())
+    # σ 项越过正常分布的实际最大值时它已经失去意义 (通常是分布有尖峰/长尾),
+    # 退回分位数; 直接把阈值顶到最大值等于"任何像素都不算异常", 检出率必然为 0.
+    thr = q_thr if sigma_thr >= vmax else max(q_thr, sigma_thr)
     return {
-        "threshold": float(min(max(q_thr, sigma_thr), vmax)),
+        "threshold": float(min(thr, vmax)),
         "quantile_thr": q_thr,
         "sigma_thr": sigma_thr,
         "max": vmax,

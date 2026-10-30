@@ -348,6 +348,10 @@ class FabricPredictor:
                     f"已跳过 {len(missing)} 个参数 / {len(unexpected)} 个多余参数; "
                     "建议用新结构重新训练或微调"
                 )
+        # 记忆项尺度必须和训练时校准出来的一致, 否则记忆库分数尺度漂移
+        scale = float(self.calibration.get("memory_distance_scale", 0.0) or 0.0)
+        if scale > 0 and hasattr(self.model, "memory_distance_scale"):
+            self.model.memory_distance_scale = scale
         self.model.to(self.device).eval()
         if not self.names:
             self.names = [f"class_{i}" for i in range(self.model.num_classes)]

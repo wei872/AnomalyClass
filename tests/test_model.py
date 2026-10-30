@@ -113,3 +113,25 @@ def test_lite_backbone_path():
     with torch.no_grad():
         out = m(torch.randn(1, 3, 64, 64))
     assert out["anomaly_logit"].shape[-2:] == (8, 8)
+
+
+def test_memory_score_does_not_saturate():
+    """记忆项必须平滑映射: 距离超过尺度时不能全堆到 1.0.
+
+    否则正常图的 999 分位也是 1.0, 阈值退化为不可达, 验证集检出率恒为 0.
+    """
+    torch.manual_seed(0)
+    cfg = tiny_config()
+    m = FabricNCD(cfg)
+    m.eval()
+    # 造一个和当前嵌入相差很远的记忆库, 让距离远大于尺度
+    with torch.no_grad():
+        feats = torch.randn(64, m.memory.dim)
+        m.memory.update(feats, use_kcenter=False)
+    m.memory_distance_scale = 0.01
+    with torch.no_grad():
+        out = m(torch.randn(2, 3, 64, 64))
+    assert out["memory_distance"] is not None
+    assert float(out["memory_distance"].max()) > m.memory_distance_scale
+    assert float(out["memory_score"].max()) < 1.0
+    assert float(out["memory_score"].min()) >= 0.0

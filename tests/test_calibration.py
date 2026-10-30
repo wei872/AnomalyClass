@@ -19,10 +19,22 @@ def test_threshold_never_exceeds_normal_max():
 def test_threshold_prefers_larger_of_quantile_and_sigma():
     rng = np.random.default_rng(0)
     values = rng.random(20000).astype(np.float32) * 0.5
-    stats = threshold_from_normal_pixels(values, quantile=0.999, sigma_k=2.0)
-    expected = min(max(stats["quantile_thr"], stats["sigma_thr"]), stats["max"])
-    assert stats["threshold"] == expected
+    stats = threshold_from_normal_pixels(values, quantile=0.999, sigma_k=1.0)
+    if stats["sigma_thr"] >= stats["max"]:
+        assert stats["threshold"] == stats["quantile_thr"]
+    else:
+        assert stats["threshold"] == max(stats["quantile_thr"], stats["sigma_thr"])
     assert stats["threshold"] <= stats["max"]
+
+
+def test_sigma_term_falls_back_to_quantile_when_unreachable():
+    # 分布有尖峰时 mean+kσ 会超过正常最大值, 此时阈值必须退回分位数,
+    # 否则阈值等于"任何像素都达不到", 检出率恒为 0.
+    rng = np.random.default_rng(1)
+    values = np.clip(rng.normal(0.60, 0.10, 50000), 0.0, 1.0).astype(np.float32)
+    stats = threshold_from_normal_pixels(values, quantile=0.999, sigma_k=6.0)
+    assert stats["sigma_thr"] >= stats["max"]
+    assert stats["threshold"] == stats["quantile_thr"]
 
 
 def test_topk_pixels_not_diluted_by_image_size():

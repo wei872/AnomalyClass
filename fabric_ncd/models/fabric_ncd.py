@@ -207,10 +207,15 @@ class FabricNCD(nn.Module):
 
         learned_score = torch.sigmoid(anomaly_logit)
         memory_score: Optional[torch.Tensor] = None
+        memory_distance: Optional[torch.Tensor] = None
         if compute_memory and self.memory_enabled and self.memory.is_ready:
             sim = self.memory.similarity(emb)
-            distance = (1.0 - sim).clamp_min(0.0)
-            memory_score = (distance / max(self.memory_distance_scale, 1e-3)).clamp(0.0, 1.0)
+            memory_distance = (1.0 - sim).clamp_min(0.0)
+            scale = max(self.memory_distance_scale, 1e-3)
+            # 平滑映射 d/(d+scale): 单调、落在 (0,1), 且**不会饱和**.
+            # 原来的 clamp(d/scale) 会让距离超过 scale 的正常像素全部堆在 1.0,
+            # 于是正常图的 999 分位也变成 1.0, 阈值退化成"不可达", 检出率恒为 0.
+            memory_score = memory_distance / (memory_distance + scale)
             anomaly_score = (1.0 - self.memory_weight) * learned_score + self.memory_weight * memory_score
         else:
             anomaly_score = learned_score
@@ -220,6 +225,7 @@ class FabricNCD(nn.Module):
             "anomaly_score": anomaly_score,
             "learned_score": learned_score,
             "memory_score": memory_score,
+            "memory_distance": memory_distance,
             "cloth_logit": mask_out["cloth_logit"],
             "boundary_logit": mask_out["boundary_logit"],
             "cloth_prob": cloth_prob,

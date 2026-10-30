@@ -503,6 +503,12 @@ class Trainer:
             self.ema.update(self.model)
         self.calibrate()
 
+    def _set_memory_scale(self, scale: float) -> None:
+        """记忆项尺度同步给训练模型与 EMA (两者都会被用于评估/推理)."""
+        for m in (self.model, self.ema.ema if self.ema is not None else None):
+            if m is not None and hasattr(m, "memory_distance_scale"):
+                m.memory_distance_scale = float(scale)
+
     @torch.no_grad()
     def calibrate(
         self,
@@ -524,28 +530,69 @@ class Trainer:
         qi = float(image_quantile if image_quantile is not None else eval_cfg.get("image_quantile", 0.995))
         model = self.ema.ema if self.ema is not None else self.model
         model.eval()
-        pixels: List[np.ndarray] = []
-        image_scores: List[float] = []
+        # 一次前向同时收集: 学习式分数 / 记忆库距离 / 布面掩码.
+        # 拿到距离分布后先定记忆项尺度, 再据此**重算**综合分数与阈值, 不用多跑一遍.
+        learned_parts: List[np.ndarray] = []
+        dist_parts: List[np.ndarray] = []
+        mask_parts: List[np.ndarray] = []
         seen = 0
         for batch in self.normal_loader:
             batch = move_to(batch, self.device)
             out = model(batch["image"])
             h, w = batch["image"].shape[-2:]
-            score = F.interpolate(out["anomaly_score"], size=(h, w), mode="bilinear", align_corners=False)
+            learned = F.interpolate(
+                out["learned_score"], size=(h, w), mode="bilinear", align_corners=False
+            ).squeeze(1).float().cpu().numpy()
             cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
-            score = (score * (cloth > 0.5).float()).squeeze(1).cpu().numpy()
-            for i in range(score.shape[0]):
-                image_scores.append(image_score_of(score[i], eval_cfg))
-                flat = score[i].ravel()
-                if flat.size > 20000:
-                    flat = flat[:: max(1, flat.size // 20000)]
-                pixels.append(flat)
+            keep = (cloth > 0.5).squeeze(1).cpu().numpy()
+            dist = out.get("memory_distance")
+            if dist is None:
+                dist_np = np.zeros_like(learned)
+            else:
+                if tuple(dist.shape[-2:]) != (h, w):
+                    dist = F.interpolate(dist.float(), size=(h, w), mode="bilinear", align_corners=False)
+                dist_np = dist.squeeze(1).float().cpu().numpy()
+            for i in range(learned.shape[0]):
+                step = max(1, learned[i].size // 20000)
+                learned_parts.append(learned[i].ravel()[::step])
+                dist_parts.append(dist_np[i].ravel()[::step])
+                mask_parts.append(keep[i].ravel()[::step])
                 seen += 1
             if seen >= max_batches * batch["image"].shape[0]:
                 break
-        if not pixels:
+        if not learned_parts:
             return self.calibration
-        pixel_values = np.concatenate(pixels)
+
+        learned_all = np.concatenate(learned_parts)
+        dist_all = np.concatenate(dist_parts)
+        mask_all = np.concatenate(mask_parts) > 0.5
+        if not mask_all.any():
+            mask_all = np.ones_like(learned_all, dtype=bool)
+
+        # 记忆项尺度 = 正常像素距离中位数 (中位数正好映射到 0.5), 让尺度跟着嵌入走
+        scale = float(self.calibration.get("memory_distance_scale", self.model.memory_distance_scale))
+        use_memory = bool(self.model.memory_enabled) and bool(np.any(dist_all[mask_all] > 0))
+        if use_memory:
+            scale = max(float(np.median(dist_all[mask_all])), 1e-3)
+            self._set_memory_scale(scale)
+
+        weight = float(self.model.memory_weight)
+        scores: List[np.ndarray] = []
+        image_scores: List[float] = []
+        cursor = 0
+        for part_learned, part_dist in zip(learned_parts, dist_parts):
+            n = part_learned.shape[0]
+            part_mask = mask_all[cursor : cursor + n]
+            cursor += n
+            if use_memory:
+                mem = part_dist / (part_dist + scale)
+                score = (1.0 - weight) * part_learned + weight * mem
+            else:
+                score = part_learned
+            score = np.where(part_mask, score, 0.0).astype(np.float32)
+            scores.append(score)
+            image_scores.append(image_score_of(score, eval_cfg))
+        pixel_values = np.concatenate(scores)
         if pixel_values.size > max_pixels:
             idx = np.random.default_rng(0).choice(pixel_values.size, max_pixels, replace=False)
             pixel_values = pixel_values[idx]
@@ -563,8 +610,9 @@ class Trainer:
             "pixel_max": vmax,
             "pixel_mean": float(pixel_values.mean()),
             "pixel_std": float(pixel_values.std()),
+            "memory_distance_scale": float(scale if use_memory else 0.0),
             "image_threshold": float(
-                max(np.quantile(image_scores, qi), np.mean(image_scores) + 3.0 * np.std(image_scores))
+                threshold_from_normal_pixels(np.asarray(image_scores), qi, 3.0)["threshold"]
             ),
             "image_mean": float(np.mean(image_scores)),
             "image_std": float(np.std(image_scores)),
@@ -573,7 +621,7 @@ class Trainer:
         }
         self.logger.info(
             "阈值校准: pixel_thr=%.4f (q%.3f=%.4f, mean+%.0fσ=%.4f, 正常最大值=%.4f) | "
-            "image_thr=%.4f (正常图均值 %.4f) | %d 张正常图",
+            "image_thr=%.4f (正常图均值 %.4f) | 记忆项尺度 %.3f | %d 张正常图",
             self.calibration["pixel_threshold"],
             q,
             q_thr,
@@ -582,6 +630,7 @@ class Trainer:
             vmax,
             self.calibration["image_threshold"],
             float(np.mean(image_scores)),
+            float(self.calibration["memory_distance_scale"]),
             len(image_scores),
         )
         self.model.train()
@@ -891,6 +940,9 @@ class Trainer:
         self.best_score = float(state.get("best_score", -1))
         if state.get("calibration"):
             self.calibration = dict(state["calibration"])
+            scale = float(self.calibration.get("memory_distance_scale", 0.0) or 0.0)
+            if scale > 0:
+                self._set_memory_scale(scale)
         self.logger.info("载入权重 %s (%s)", path, key)
         return state
 
