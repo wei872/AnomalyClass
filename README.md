@@ -495,11 +495,19 @@ ho$。
 
 ```bash
 python tools/diagnose_scores.py --dataset-only
+python tools/diagnose_scores.py --dataset-only --mask-check 2   # 同时量布面掩码的估计覆盖率
 ```
 
 打印四个目录各自的批次构成、`normal/images/val` 里哪些批次**不在** `normal/images/train`、
-以及"按文件名排序后的前 48 张"都是哪些批次——后者正是 `train.memory_warmup_batches: 24`
-（`eval_batch_size: 2`）在不洗牌时实际抽到的正常图。
+**缺陷来源与正常来源的交集**、以及"按文件名排序后的前 48 张"都是哪些批次——后者正是
+`train.memory_warmup_batches: 24`（`eval_batch_size: 2`）在不洗牌时实际抽到的正常图。
+
+这里有两个会**直接废掉全部图像级指标**的数据集问题，工具都会点名：
+
+| 体检结果 | 后果 | 处理 |
+|---|---|---|
+| `缺陷来源 ∩ 正常来源 = 0` | 模型只要学会"这是哪批布"就能把训练集分对，这个捷径与"有没有疵点"无关；跨类的 `imageAUROC` / 检出率被捷径污染，可能整体反向 | 把与缺陷同批次的正常图补进 `normal/`；指标只看**同批次内** AUROC |
+| 布面掩码估计覆盖率远低于 1（整幅都是布时） | `region = cloth_mask > 0.5` 只在那一小块像素上给梯度，其余像素的异常头输出**完全不受约束**（会自由漂移到 1.0）；`geography()` 还会用这张噪声掩码逐图缩放特征，注入图像级偏移 | `data.cloth_mask: full`（整幅都是布）；有辊筒/台面才用 `estimate` |
 
 探针还会打印 **批次覆盖**: 训练正常图的批次 vs 验证集的批次、交集、以及"验证集里训练
 正常图从未出现过的批次"。批次覆盖率低 + 记忆库抽样不洗牌, 是 imageAUROC 反向最常见的原因

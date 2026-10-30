@@ -241,6 +241,11 @@ class FabricDataset(Dataset):
 
         cfg_data = (augment_cfg or {})
         self.mask_work_size = cfg_data.get("mask_work_size", "auto")
+        # "整幅都是布"的数据集 (没有辊筒/台面/背景) 必须用 full:
+        #   估计器给出的覆盖率往往只有 5%~60%, 于是异常损失的 region 只覆盖一小部分像素,
+        #   其余像素**没有任何负样本约束**(异常头在这些区域会自由漂移到 1.0), 而且
+        #   geography() 会用这张噪声掩码逐图缩放特征, 直接注入图像级偏移.
+        self.cloth_mask_mode = str(cfg_data.get("cloth_mask", "estimate")).lower()
         self.defect_entries = self._collect(spec.splits.get(split), spec.labels.get(split), spec.mask_dir, normal=False, split=split)
         self.normal_entries = self._collect(spec.normal_splits.get(split), None, spec.mask_dir, normal=True, split=split)
         # 空标注的图也算正常图
@@ -332,6 +337,8 @@ class FabricDataset(Dataset):
     # ------------------------------------------------------------------ #
     def _cloth_mask(self, entry: Entry, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
+        if self.cloth_mask_mode == "full":
+            return np.ones((h, w), dtype=np.uint8)
         if entry.mask is not None:
             m = np.asarray(Image.open(entry.mask).convert("L"), dtype=np.uint8)
             if m.shape[:2] != (h, w):
@@ -522,6 +529,7 @@ def build_datasets(cfg: Dict[str, Any]) -> Dict[str, FabricDataset]:
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
     aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
+    aug_cfg["cloth_mask"] = data_cfg.get("cloth_mask", "estimate")
     normal_ratio = float(data_cfg.get("normal_ratio", 0.4))
     datasets: Dict[str, FabricDataset] = {
         "train": FabricDataset(
@@ -575,6 +583,7 @@ def build_normal_dataset(cfg: Dict[str, Any], split: str = "train") -> Optional[
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
     aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
+    aug_cfg["cloth_mask"] = data_cfg.get("cloth_mask", "estimate")
     # 原尺度裁块训练时, 记忆库也必须用原尺度块建立, 否则分数尺度与推理时不一致
     native = str(aug_cfg.get("crop_mode", "scale")).lower() == "native"
     if native:

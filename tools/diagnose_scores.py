@@ -374,6 +374,31 @@ def _dataset_report(args) -> int:
                 "  -> 这些批次对模型来说从没当过'正常', 在它们上面算 imgAUROC 没有意义; "
                 "把它们补进 normal/images/train (它们本来就是正常图)"
             )
+    # ---- 缺陷图与正常图是否来自**同一批**布料 (决定 imgAUROC 有没有意义) ----
+    defect_src = set(hist.get("images/train (疵点)", {})) | set(hist.get("images/val (疵点)", {}))
+    normal_src = set(hist.get("normal/train (正常)", {})) | set(hist.get("normal/val (正常)", {}))
+    inter = defect_src & normal_src
+    LOGGER.info(
+        "缺陷来源 %d 个 / 正常来源 %d 个 / 交集 %d 个",
+        len(defect_src), len(normal_src), len(inter),
+    )
+    if not inter:
+        LOGGER.info(
+            "  -> **致命**: 缺陷图和正常图完全来自不同的布料批次. 模型只要学会"
+            "'这是 A 批还是 B 批'就能把训练集分对, 而这个能力与\"有没有疵点\"无关; "
+            "任何跨类的 imageAUROC / 检出率都会被这个捷径污染."
+        )
+        LOGGER.info(
+            "  -> 唯一可用的是**同批次内**的指标 (同一批里既有疵点图也有正常图). "
+            "请把与缺陷图同批次的正常图补进 normal/images/train 与 normal/images/val"
+        )
+    elif len(inter) < len(defect_src) * 0.5:
+        LOGGER.info("  -> 交集偏少: 多数缺陷批次没有同批正常图, 跨类指标仍然不可信")
+
+    # ---- 布面掩码估计: 训练时 anomaly 损失的取样区域 ----
+    if args.mask_check > 0:
+        _mask_report(dirs, args.mask_check, args.group_depth)
+
     # 不洗牌时 "前 N 批" 的构成: 文件按名字排序, 这里按同样顺序取前 48 张
     n_first = 48
     for title, directory in dirs.items():
@@ -392,6 +417,45 @@ def _dataset_report(args) -> int:
                 " ..." if len(counts) > len(top) else "",
             )
     return 0
+
+
+def _mask_report(dirs: Dict[str, object], per_src: int, depth: int) -> None:
+    """无监督布面掩码估计的覆盖率 = anomaly 损失真正取样/布面头拿到的弱监督.
+
+    如果某批正常图的估计覆盖率只有几个百分点, 那么这批图在异常损失里几乎不参与
+    (``region = cloth_mask > 0.5``), 异常头在这批外观上等于没有负样本约束 ->
+    分数会在这些图上失控. 这一行直接量这件事.
+    """
+    from fabric_ncd.data.fabric_mask import estimate_cloth_mask
+    from fabric_ncd.data.yolo import list_images, load_rgb
+
+    LOGGER.info("布面掩码估计覆盖率 (每批最多 %d 张):", per_src)
+    for title, directory in dirs.items():
+        if not directory:
+            continue
+        per_group: Dict[str, List[float]] = defaultdict(list)
+        for f in list_images(directory):
+            key = source_of(f.name, depth)
+            if len(per_group[key]) >= per_src:
+                continue
+            try:
+                image = load_rgb(f)
+                mask, conf = estimate_cloth_mask(image, work_size="auto")
+                per_group[key].append(float(mask.mean()))
+            except Exception as exc:  # pragma: no cover
+                LOGGER.info("  %s %s: 估计失败 (%s)", title, f.name, exc)
+        if not per_group:
+            continue
+        flat = [v for vs in per_group.values() for v in vs]
+        n_supervised = float(np.mean(flat))
+        LOGGER.info("  %-22s 平均 %.3f | 最低 %.3f | 最低的批次: %s", title,
+                    n_supervised, float(np.min(flat)),
+                    ", ".join(f"{k} {np.mean(v):.2f}" for k, v in
+                              sorted(per_group.items(), key=lambda kv: np.mean(kv[1]))[:4]))
+    LOGGER.info(
+        "  -> 覆盖率就是 anomaly 损失真正监督到的像素比例. 整幅都是布时它应该 ~1.0; "
+        "明显偏低就设 data.cloth_mask: full (否则其余像素的异常头输出完全不受约束)"
+    )
 
 
 def _probe(args) -> int:
@@ -516,6 +580,8 @@ def main() -> int:
     ap.add_argument("--group-depth", type=int, default=1, help="按文件名前几段分组 (默认 1 = 批次号)")
     ap.add_argument("--dataset-only", action="store_true",
                     help="不加载模型, 只审数据集目录 (批次构成 / 前 N 张 / 覆盖率), 秒级")
+    ap.add_argument("--mask-check", type=int, default=0,
+                    help="配合 --dataset-only: 每个批次抽 N 张估计布面掩码覆盖率 (训练时 anomaly 损失的取样区域)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--csv", default="", help="把逐图明细写到 csv")
     args = ap.parse_args()

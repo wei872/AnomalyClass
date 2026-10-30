@@ -225,3 +225,23 @@ def test_train_augment_aspect_jitter_runs():
     assert out["image"].shape == (48, 48, 3)
     assert out["defect_mask"].shape == (48, 48)
     assert out["cloth_mask"].shape == (48, 48)
+
+
+def test_cloth_mask_full_mode(tmp_path):
+    """整幅都是布的数据集: cloth_mask: full 必须给出全 1 掩码.
+
+    估计器在这种图上常给出 5%~60% 的覆盖率, 于是 anomaly 损失只在那一小块像素上有
+    监督, 其余像素的异常头输出完全不受约束 (实测表现为正常图 learned_max 打满 1.0).
+    """
+    root = make_dataset(tmp_path, n_train=2, n_val=1, n_normal=1, size=(64, 96))
+    spec = load_dataset_spec({"data": {"dataset_yaml": str(root / "dataset.yaml")}})
+
+    full = FabricDataset(spec, "train", (48, 48), train=False,
+                         augment_cfg={"image_size": (48, 48), "cloth_mask": "full"})
+    assert float(full[0]["cloth_mask"].min()) == 1.0
+
+    est = FabricDataset(spec, "train", (48, 48), train=False,
+                        augment_cfg={"image_size": (48, 48), "cloth_mask": "estimate"})
+    # 估计模式保持原行为 (不一定全 1), 但必须仍是 0/1 掩码
+    m = est[0]["cloth_mask"]
+    assert set(m.unique().tolist()) <= {0.0, 1.0}
