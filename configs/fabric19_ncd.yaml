@@ -1,0 +1,11 @@
+extends: fabric19.yaml
+mode: discovery
+# 示例划分：前 10 类已知，后 9 类作为新类。
+# 请按实际业务修改，ID 是 dataset/fabric19.yaml 的 0-based 顺序。
+# 新类训练标签会被屏蔽；val 标签只用于训练完成后的评估。
+discovery:
+  known_class_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+experiment:
+  output_dir: outputs/fabric19_ncd
+training:
+  eval_every: 0              # 0: 仅最终评估，避免用 val 反复选 NCD 模型

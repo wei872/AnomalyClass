@@ -1,7 +1,8 @@
 # =============================================================================
 # 布匹缺陷数据集 (19 类). 类别名与 dataset/dataset.yaml 完全一致。
-# TODO: 把下面四个路径改成你机器上的实际路径 (原 yaml 中是 Windows 路径:
-#   D:/tyhn/yolo/dataset/source5_augmented/... )
+# 下面保留原 Windows 路径和 19 类顺序。
+# 换机器时推荐用 scripts/prepare_data.py --data-root /实际数据根目录 覆盖 path，
+# 无需改动 names；也可以直接把 path/train/val/normaltrain/normalval 改成本机路径。
 # 推荐目录结构:
 #   DATASET_ROOT/
 #     images/train/  images/val/            <- YOLO 图片

@@ -1,0 +1,57 @@
+# 19 类有监督区域分类。类别顺序始终以 dataset/fabric19.yaml 为准。
+data:
+  dataset_config: ../dataset/fabric19.yaml
+  prepared_root: data/processed/fabric19
+  # 可在预处理命令中用 --data-root 覆盖原 YAML 的 Windows 根目录。
+  padding: 0.1
+  min_crop_size: 0.1
+
+mode: supervised
+model:
+  backbone: dino_vitb8
+  pretrained_path: null       # 本地 DINO .pth；null 时从官方地址下载
+  image_size: 224
+  grad_from_block: 11
+  mask_layers: 9
+  n_heads: 4
+  n_views: 2
+  hidden_dim: 2048
+  bottleneck_dim: 256
+
+training:
+  batch_size: 8               # 每个样本另有两个视图；按显存调整
+  accumulation_steps: 2
+  num_workers: 4
+  epochs: 50
+  lr: 0.003
+  min_lr: 0.000003
+  momentum: 0.9
+  weight_decay: 0.00005
+  amp: true                  # 仅 CUDA 生效
+  class_balanced_sampler: false
+  max_grad_norm: 0            # 0 表示不裁剪梯度
+  eval_every: 1              # 仅用于观察；监督 best.pt 按 val macro-F1 保存
+
+loss:
+  sup_weight: 0.3             # NCD 的已知类分支权重
+  supcon_weight: 0.1          # 有监督模式的 SupCon 辅助权重
+  memax_weight: 4.0
+  temperature: 0.1
+  contrastive_temperature: 1.0
+  supcon_temperature: 0.07
+  teacher_temp: 0.04
+  warmup_teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 40
+
+inference:
+  area_temperature: 50.0
+  image_threshold: null       # null: 每图 top-1；设为 0~1 数值则多标签输出
+
+discovery:
+  known_class_ids: null       # NCD 必须显式指定；见 fabric19_ncd.yaml
+
+experiment:
+  seed: 3407
+  device: auto
+  output_dir: outputs/fabric19_supervised
+  print_freq: 10
