@@ -39,29 +39,59 @@ def _peak_period(energy: np.ndarray, work: int, min_period: float, max_period: f
     return float(np.clip(period, min_period, max_period)), peak / mean
 
 
+def _peak_bin(energy: np.ndarray, dim: int, min_period: float, max_period: float) -> Tuple[float, float]:
+    """在谱上找主峰, 返回 (整幅内周期数 k, 置信度). 周期 = dim / k."""
+    nbins = len(energy)
+    k_lo = max(1, int(np.floor(dim / max_period)))
+    k_hi = max(k_lo + 1, min(nbins - 2, int(np.ceil(dim / min_period))))
+    band = energy[k_lo : k_hi + 1]
+    if band.size == 0:
+        return float(dim) / 8.0, 0.0
+    idx = int(np.argmax(band)) + k_lo
+    peak = float(band.max())
+    mean = float(band.mean() + 1e-8)
+    k = float(idx)
+    if 0 < idx < nbins - 1:
+        left = np.log(energy[idx - 1] + 1e-8)
+        center = np.log(energy[idx] + 1e-8)
+        right = np.log(energy[idx + 1] + 1e-8)
+        denom = left - 2 * center + right
+        if abs(denom) > 1e-6:
+            k = k + float(np.clip(0.5 * (left - right) / denom, -0.5, 0.5))
+    return max(k, 1e-3), peak / mean
+
+
 def estimate_period(
     image: np.ndarray,
-    work_size: int = 256,
+    work_size: int = 512,
     min_period: float = 2.0,
     max_period: float = 64.0,
 ) -> Tuple[float, float, float]:
-    """返回 (period_x, period_y, confidence), 单位为输入图像像素."""
+    """返回 (period_x, period_y, confidence), 单位为输入图像像素.
+
+    保持长宽比、只做整数倍池化: 两个方向分别用各自的真实尺寸把谱峰换算成周期
+    (``period = dim / k``), 因此 1440x2440 这类非正方形图像不会被压扁失真,
+    高分辨率下也不会因为过度抽取而丢失细密经纬.
+    """
     gray = to_gray(image)
     h, w = gray.shape
+    factor = max(1, int(min(h, w) // max(8, int(work_size))))
+    ph, pw = max(8, h // factor), max(8, w // factor)
     pil = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8))
-    small = np.asarray(pil.resize((work_size, work_size), Image.BILINEAR), dtype=np.float32)
+    small = np.asarray(pil.resize((pw, ph), Image.BILINEAR), dtype=np.float32)
     small = small - small.mean()
-    win = np.hanning(work_size)
-    window = np.outer(win, win)
+    window = np.outer(np.hanning(ph), np.hanning(pw))
     spec = np.abs(np.fft.rfft2(small * window)) ** 2
     spec[:, 0] = 0
-    energy_y = spec.mean(axis=1)
+    energy_y = spec.mean(axis=1)[: max(2, ph // 2)]
     energy_x = spec.mean(axis=0)
-    period_y, conf_y = _peak_period(energy_y, work_size, min_period, max_period)
-    period_x, conf_x = _peak_period(energy_x, work_size, min_period, max_period)
-    period_y *= h / work_size
-    period_x *= w / work_size
+    k_y, conf_y = _peak_bin(energy_y, h, min_period, max_period)
+    k_x, conf_x = _peak_bin(energy_x, w, min_period, max_period)
+    period_y = float(np.clip(h / k_y, min_period, max_period))
+    period_x = float(np.clip(w / k_x, min_period, max_period))
     conf = min(conf_x, conf_y)
+    if conf < 2.0:
+        period_x = period_y = 8.0
     return period_x, period_y, conf
 
 

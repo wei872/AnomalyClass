@@ -46,6 +46,139 @@ def _load_font(size: int = 14) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def as_hw(value: Any, default: Tuple[int, int] = (512, 512)) -> Tuple[int, int]:
+    """把 int / [h, w] / (h, w) 统一成 (h, w)."""
+    if value is None:
+        return tuple(int(v) for v in default)
+    if isinstance(value, (int, float)):
+        return int(value), int(value)
+    if len(value) == 1:
+        return int(value[0]), int(value[0])
+    return int(value[0]), int(value[1])
+
+
+def to_rgb_uint8(image: Image.Image | np.ndarray) -> np.ndarray:
+    if isinstance(image, Image.Image):
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        return np.stack([arr] * 3, axis=-1).astype(np.uint8)
+    return arr[..., :3].astype(np.uint8)
+
+
+def _prep_tensor(rgb: np.ndarray, size: Tuple[int, int], device: torch.device) -> torch.Tensor:
+    resized = np.asarray(
+        Image.fromarray(rgb).resize((int(size[1]), int(size[0])), Image.BILINEAR), dtype=np.float32
+    ) / 255.0
+    arr = (resized - np.asarray(IMAGENET_MEAN, dtype=np.float32)) / np.asarray(IMAGENET_STD, dtype=np.float32)
+    return torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))[None].to(device)
+
+
+@torch.no_grad()
+def _maps_single(model, rgb, device, input_size, want_embedding):
+    h, w = rgb.shape[:2]
+    out = model(_prep_tensor(rgb, input_size, device))
+    score = F.interpolate(out["anomaly_score"], size=(h, w), mode="bilinear", align_corners=False)
+    cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
+    probs = None
+    if out.get("class_logits") is not None:
+        probs = torch.softmax(
+            F.interpolate(out["class_logits"], size=(h, w), mode="bilinear", align_corners=False), dim=1
+        )
+    maps = {
+        "score": score[0, 0].cpu().numpy(),
+        "cloth": cloth[0, 0].cpu().numpy(),
+        "probs": None if probs is None else probs[0].cpu().numpy(),
+        "weave": {k: float(v[0]) for k, v in (out.get("weave") or {}).items()},
+    }
+    if want_embedding:
+        emb = F.interpolate(out["embedding"], size=(h, w), mode="bilinear", align_corners=False)
+        maps["embedding"] = F.normalize(emb, dim=1)[0].cpu().numpy()
+    return maps
+
+
+@torch.no_grad()
+def _maps_tiled(
+    model,
+    rgb: np.ndarray,
+    device: torch.device,
+    input_size: Tuple[int, int],
+    tile_size: Tuple[int, int],
+    tile_overlap: int,
+    tile_batch: int = 4,
+    want_embedding: bool = False,
+):
+    h, w = rgb.shape[:2]
+    score_map = np.zeros((h, w), dtype=np.float32)
+    cloth_map = np.zeros((h, w), dtype=np.float32)
+    probs_map = np.zeros((model.num_classes, h, w), dtype=np.float32)
+    emb_map = None
+    tile_h, tile_w = int(tile_size[0]), int(tile_size[1])
+    step_y = max(8, tile_h - tile_overlap)
+    step_x = max(8, tile_w - tile_overlap)
+
+    tiles, positions = [], []
+    for y in range(0, max(1, h - tile_overlap), step_y):
+        for x in range(0, max(1, w - tile_overlap), step_x):
+            y2, x2 = min(y + tile_h, h), min(x + tile_w, w)
+            y1, x1 = max(0, y2 - tile_h), max(0, x2 - tile_w)
+            tiles.append(_prep_tensor(rgb[y1:y2, x1:x2], input_size, device))
+            positions.append((y1, x1, y2, x2))
+    if not tiles:
+        return _maps_single(model, rgb, device, input_size, want_embedding)
+
+    if want_embedding:
+        emb_dim = int(model.classifier.dim)
+        emb_map = np.zeros((emb_dim, h, w), dtype=np.float32)
+
+    for start in range(0, len(tiles), max(1, tile_batch)):
+        chunk = torch.cat(tiles[start : start + tile_batch], dim=0)
+        out = model(chunk)
+        for j, idx in enumerate(range(start, min(start + tile_batch, len(tiles)))):
+            y1, x1, y2, x2 = positions[idx]
+            th, tw = y2 - y1, x2 - x1
+            score = F.interpolate(out["anomaly_score"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
+            cloth = F.interpolate(out["cloth_prob"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
+            score_map[y1:y2, x1:x2] = np.maximum(score_map[y1:y2, x1:x2], score.cpu().numpy())
+            cloth_map[y1:y2, x1:x2] = np.maximum(cloth_map[y1:y2, x1:x2], cloth.cpu().numpy())
+            if out.get("class_logits") is not None:
+                p = F.interpolate(out["class_logits"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
+                p = torch.softmax(p, dim=1)[0].cpu().numpy()
+                probs_map[:, y1:y2, x1:x2] = np.maximum(probs_map[:, y1:y2, x1:x2], p)
+            if emb_map is not None:
+                e = F.interpolate(out["embedding"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
+                e = F.normalize(e, dim=1)[0].cpu().numpy()
+                emb_map[:, y1:y2, x1:x2] = np.maximum(emb_map[:, y1:y2, x1:x2], e)
+    maps = {"score": score_map, "cloth": cloth_map, "probs": probs_map, "weave": {}}
+    if emb_map is not None:
+        maps["embedding"] = emb_map
+    return maps
+
+
+@torch.no_grad()
+def forward_maps(
+    model,
+    image: Image.Image | np.ndarray,
+    device: torch.device,
+    input_size: Tuple[int, int],
+    tile: bool = False,
+    tile_size: int | Tuple[int, int] = 512,
+    tile_overlap: int = 128,
+    tile_batch: int = 4,
+    want_embedding: bool = False,
+) -> Dict[str, np.ndarray]:
+    """统一的前向入口: 整图缩放或切块, 输出原图分辨率下的 score/cloth/probs.
+
+    训练/评估/推理共用同一个函数, 保证三者的一致性.
+    """
+    rgb = to_rgb_uint8(image)
+    h, w = rgb.shape[:2]
+    tile_hw = as_hw(tile_size, tuple(input_size))
+    if tile and (h > tile_hw[0] or w > tile_hw[1]):
+        return _maps_tiled(model, rgb, device, input_size, tile_hw, tile_overlap, tile_batch, want_embedding)
+    return _maps_single(model, rgb, device, input_size, want_embedding)
+
+
 class FabricPredictor:
     def __init__(
         self,
@@ -54,7 +187,7 @@ class FabricPredictor:
         device: str = "auto",
         threshold: Optional[float] = None,
         tile: Optional[bool] = None,
-        tile_size: Optional[int] = None,
+        tile_size: Optional[int | Tuple[int, int]] = None,
         tile_overlap: Optional[int] = None,
     ) -> None:
         self.device = resolve_device(device)
@@ -85,10 +218,12 @@ class FabricPredictor:
             self.names = [f"class_{i}" for i in range(self.model.num_classes)]
 
         infer_cfg = cfg.get("infer", {})
-        self.image_size = tuple(cfg.get("data", {}).get("image_size", [512, 512]))
+        self.image_size = as_hw(cfg.get("data", {}).get("image_size", [512, 512]))
         self.tile = bool(infer_cfg.get("tile", False) if tile is None else tile)
-        self.tile_size = int(tile_size or infer_cfg.get("tile_size", self.image_size[0]))
+        # 默认切块尺寸 == 网络输入尺寸: 该尺寸下切块是 1:1 原像素, 不做二次缩放
+        self.tile_size = as_hw(tile_size or infer_cfg.get("tile_size") or self.image_size)
         self.tile_overlap = int(tile_overlap if tile_overlap is not None else infer_cfg.get("tile_overlap", 128))
+        self.tile_batch = int(infer_cfg.get("tile_batch", 4))
 
         eval_cfg = cfg.get("eval", {})
         # 阈值优先级: 命令行 > 配置 > 正常集校准值 (checkpoint 内) > 自适应
@@ -107,77 +242,21 @@ class FabricPredictor:
 
     # ------------------------------------------------------------------ #
     def preprocess(self, image: Image.Image | np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
-        if isinstance(image, Image.Image):
-            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        else:
-            rgb = image if image.ndim == 3 else np.stack([image] * 3, axis=-1)
-            rgb = rgb.astype(np.uint8)
-        h, w = rgb.shape[:2]
-        resized = np.asarray(
-            Image.fromarray(rgb).resize((self.image_size[1], self.image_size[0]), Image.BILINEAR),
-            dtype=np.float32,
-        ) / 255.0
-        arr = (resized - np.asarray(IMAGENET_MEAN, dtype=np.float32)) / np.asarray(IMAGENET_STD, dtype=np.float32)
-        tensor = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))[None]
-        return tensor.to(self.device), (h, w)
+        rgb = to_rgb_uint8(image)
+        return _prep_tensor(rgb, self.image_size, self.device), rgb.shape[:2]
 
-    @torch.no_grad()
     def _forward_single(self, image: Image.Image | np.ndarray) -> Dict[str, np.ndarray]:
-        tensor, (h, w) = self.preprocess(image)
-        out = self.model(tensor)
-        score = F.interpolate(out["anomaly_score"], size=(h, w), mode="bilinear", align_corners=False)
-        cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
-        probs = None
-        if out.get("class_logits") is not None:
-            probs = F.interpolate(out["class_logits"], size=(h, w), mode="bilinear", align_corners=False)
-            probs = torch.softmax(probs, dim=1)
-        embedding = F.interpolate(out["embedding"], size=(h, w), mode="bilinear", align_corners=False)
-        embedding = F.normalize(embedding, dim=1)
-        return {
-            "score": score[0, 0].cpu().numpy(),
-            "cloth": cloth[0, 0].cpu().numpy(),
-            "probs": None if probs is None else probs[0].cpu().numpy(),
-            "embedding": embedding[0].cpu().numpy(),
-            "weave": {k: float(v[0]) for k, v in (out.get("weave") or {}).items()},
-        }
+        return forward_maps(
+            self.model, image, self.device, self.image_size,
+            tile=False, want_embedding=True,
+        )
 
-    # ------------------------------------------------------------------ #
-    @torch.no_grad()
     def _forward_tiled(self, image: Image.Image | np.ndarray) -> Dict[str, np.ndarray]:
-        rgb = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image, dtype=np.uint8)
-        h, w = rgb.shape[:2]
-        score_map = np.zeros((h, w), dtype=np.float32)
-        cloth_map = np.zeros((h, w), dtype=np.float32)
-        probs_map = np.zeros((self.model.num_classes, h, w), dtype=np.float32)
-        step = max(8, self.tile_size - self.tile_overlap)
-
-        tiles, positions = [], []
-        for y in range(0, max(1, h - self.tile_overlap), step):
-            for x in range(0, max(1, w - self.tile_overlap), step):
-                y2, x2 = min(y + self.tile_size, h), min(x + self.tile_size, w)
-                y1, x1 = max(0, y2 - self.tile_size), max(0, x2 - self.tile_size)
-                tile = rgb[y1:y2, x1:x2]
-                tiles.append(self.preprocess(tile)[0])
-                positions.append((y1, x1, y2, x2))
-        if not tiles:  # 图像小于 tile
-            return self._forward_single(rgb)
-
-        batch = 4
-        for start in range(0, len(tiles), batch):
-            chunk = torch.cat(tiles[start : start + batch], dim=0)
-            out = self.model(chunk)
-            for j, idx in enumerate(range(start, min(start + batch, len(tiles)))):
-                y1, x1, y2, x2 = positions[idx]
-                th, tw = y2 - y1, x2 - x1
-                score = F.interpolate(out["anomaly_score"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
-                cloth = F.interpolate(out["cloth_prob"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
-                score_map[y1:y2, x1:x2] = np.maximum(score_map[y1:y2, x1:x2], score.cpu().numpy())
-                cloth_map[y1:y2, x1:x2] = np.maximum(cloth_map[y1:y2, x1:x2], cloth.cpu().numpy())
-                if out.get("class_logits") is not None:
-                    p = F.interpolate(out["class_logits"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
-                    p = torch.softmax(p, dim=1)[0].cpu().numpy()
-                    probs_map[:, y1:y2, x1:x2] = np.maximum(probs_map[:, y1:y2, x1:x2], p)
-        return {"score": score_map, "cloth": cloth_map, "probs": probs_map, "weave": {}}
+        return forward_maps(
+            self.model, image, self.device, self.image_size,
+            tile=True, tile_size=self.tile_size, tile_overlap=self.tile_overlap,
+            tile_batch=self.tile_batch, want_embedding=True,
+        )
 
     # ------------------------------------------------------------------ #
     def predict(self, image: Image.Image | np.ndarray) -> Dict[str, Any]:

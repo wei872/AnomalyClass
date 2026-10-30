@@ -187,6 +187,129 @@ def evaluate(
     return metrics
 
 
+@torch.no_grad()
+def evaluate_tiled(
+    model: "FabricNCD",
+    cfg: Dict[str, Any],
+    device: torch.device,
+    split: str = "val",
+    analyzer: Optional[RegionAnalyzer] = None,
+    calibration: Optional[Dict[str, float]] = None,
+    max_samples: Optional[int] = None,
+    collect_predictions: bool = False,
+    tile_size: Optional[int | Tuple[int, int]] = None,
+    tile_overlap: Optional[int] = None,
+) -> Dict[str, Any]:
+    """大幅面切块评估 —— 与 ``FabricPredictor(tile=True)`` 完全一致的指标.
+
+    对于 1440x2440 这类整图缩放会丢细节的图像, 评估必须和推理走同一条路径:
+    按原始像素尺度切块 -> 融合异常图 -> 区域分析 -> 计算指标.
+    仅有整图缩放的 ``evaluate`` 会低估小疵点的检出能力.
+
+    像素级指标按 ``eval.max_pixels`` 下采样后再统计 (AUROC/PRO 对下采样不敏感),
+    检测框/分类指标仍使用原始坐标, 因此与部署时的输出一致.
+    """
+    from .inference import as_hw, forward_maps
+    from .data.yolo import boxes_to_mask, list_images, load_rgb, read_yolo_labels
+
+    model.eval()
+    spec = load_dataset_spec(cfg)
+    names = list(spec.names) if spec.names else _class_names(cfg)
+    eval_cfg = cfg.get("eval", {})
+    analyzer = analyzer or RegionAnalyzer(
+        names=names,
+        threshold=eval_cfg.get("threshold"),
+        sigma=float(eval_cfg.get("threshold_sigma", 3.0)),
+        min_area_ratio=float(eval_cfg.get("min_area_ratio", 4e-4)),
+        merge_strategy=str(eval_cfg.get("merge_strategy", "area_weighted")),
+    )
+    if analyzer.threshold is None and calibration:
+        analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
+
+    acc = MetricAccumulator(num_classes=len(names), names=names)
+    if analyzer.threshold is not None:
+        acc.pixel_threshold = float(analyzer.threshold)
+
+    image_size = as_hw(cfg.get("data", {}).get("image_size", [512, 512]))
+    tile_hw = as_hw(tile_size or eval_cfg.get("tile_size") or image_size)
+    overlap = int(tile_overlap if tile_overlap is not None else eval_cfg.get("tile_overlap", 128))
+    tile_batch = int(eval_cfg.get("tile_batch", 4))
+    max_pixels = float(eval_cfg.get("max_pixels", 3e5))
+
+    defect_images = list_images(spec.splits.get(split))
+    labels_dir = spec.labels.get(split)
+    normal_images = list_images(spec.normal_splits.get(split))
+    items: List[Tuple[Path, bool]] = [(p, False) for p in defect_images] + [(p, True) for p in normal_images]
+    if max_samples:
+        items = items[:max_samples]
+
+    predictions: List[Dict[str, Any]] = []
+    for path, is_normal in items:
+        rgb = load_rgb(path)
+        h, w = rgb.shape[:2]
+        if is_normal:
+            gt_mask = np.zeros((h, w), dtype=np.uint8)
+            gt_labels = np.zeros((0,), dtype=np.int64)
+            gt_boxes = np.zeros((0, 4), dtype=np.float32)
+        else:
+            label_path = None if labels_dir is None else Path(labels_dir) / f"{path.stem}.txt"
+            boxes, polygons = read_yolo_labels(label_path)
+            gt_mask = boxes_to_mask(boxes, polygons, h, w)
+            gt_labels = boxes[:, 0].astype(np.int64) if len(boxes) else np.zeros((0,), dtype=np.int64)
+            gt_boxes = _xyxy_pixels(boxes, w, h)
+
+        maps = forward_maps(
+            model, rgb, device, image_size,
+            tile=True, tile_size=tile_hw, tile_overlap=overlap, tile_batch=tile_batch,
+        )
+        score = maps["score"] * (maps["cloth"] > 0.5)
+        infos, image_level = analyzer.analyze(score, maps["cloth"], maps["probs"])
+        image_score = topk_mean(score, float(eval_cfg.get("topk_ratio", 0.01)))
+
+        # 像素级统计下采样, 大幅面图 (2000x3000) 全分辨率累计会吃掉数 GB 内存
+        factor = max(1, int(math.ceil(math.sqrt((h * w) / max(max_pixels, 1.0)))))
+        pred_boxes, pred_scores, pred_labels = _regions_to_boxes(infos, w, h, cfg)
+
+        multi_true, multi_pred = -1, -1
+        if len(gt_labels):
+            multi_true = int(np.bincount(gt_labels).argmax())
+            if image_level.get("probs") is not None:
+                multi_pred = int(np.argmax(image_level["probs"]))
+
+        acc.update(
+            anomaly_score=score[::factor, ::factor],
+            anomaly_gt=gt_mask[::factor, ::factor],
+            normal=is_normal,
+            image_score=image_score,
+            pred={"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels},
+            gt={"boxes": gt_boxes, "labels": gt_labels},
+            multi_true=multi_true,
+            multi_pred=multi_pred,
+        )
+        if collect_predictions:
+            predictions.append(
+                {
+                    "path": str(path),
+                    "image_score": image_score,
+                    "normal": is_normal,
+                    "regions": [r.as_dict(names) for r in infos],
+                    "image_probs": None if image_level.get("probs") is None else image_level["probs"].tolist(),
+                    "image_cls": multi_pred,
+                    "gt_cls": multi_true,
+                    "threshold": image_level.get("threshold"),
+                    "tile": list(tile_hw),
+                }
+            )
+
+    metrics = acc.compute()
+    metrics["num_samples"] = len(items)
+    metrics["tile_size"] = list(tile_hw)
+    metrics["tile_overlap"] = overlap
+    if collect_predictions:
+        metrics["predictions"] = predictions
+    return metrics
+
+
 def _class_names(cfg: Dict[str, Any]) -> List[str]:
     data_cfg = cfg.get("data", {})
     names = data_cfg.get("names")
@@ -440,13 +563,10 @@ class Trainer:
 
             metrics: Dict[str, Any] = {}
             if (epoch + 1) % int(self.train_cfg.get("val_interval", 1)) == 0 or epoch == self.epochs - 1:
-                eval_model = self.ema.ema if self.ema is not None else self.model
+                model_for_eval = self.ema.ema if self.ema is not None else self.model
                 if self.cfg.get("eval", {}).get("threshold") is None and self.calibration:
                     self.analyzer.threshold = self.calibration.get("pixel_threshold")
-                metrics = evaluate(
-                    eval_model, self.val_loader, self.cfg, self.device, self.criterion, self.analyzer,
-                    calibration=self.calibration,
-                )
+                metrics = self.eval_model(model_for_eval)
                 score = self._composite_score(metrics)
                 metrics = {k: v for k, v in metrics.items() if k != "predictions"}
                 self.logger.info(
@@ -493,14 +613,24 @@ class Trainer:
         save_yaml(self.cfg, self.output_dir / "config.yaml")
         if best_path.exists():
             self.load_checkpoint(best_path)
-            final = evaluate(
-                self.model, self.val_loader, self.cfg, self.device, self.criterion, self.analyzer,
-                calibration=self.calibration,
-            )
+            final = self.eval_model(self.model)
             final.pop("predictions", None)
             json_dump(final, self.output_dir / "final_metrics.json")
             summary["final_metrics"] = final
         return summary
+
+    # ------------------------------------------------------------------ #
+    def eval_model(self, model: "FabricNCD") -> Dict[str, Any]:
+        """验证入口: ``eval.tile=true`` 时走切块评估, 与部署时的推理路径一致."""
+        if bool(self.cfg.get("eval", {}).get("tile", False)):
+            return evaluate_tiled(
+                model, self.cfg, self.device, split="val",
+                analyzer=self.analyzer, calibration=self.calibration,
+            )
+        return evaluate(
+            model, self.val_loader, self.cfg, self.device, self.criterion, self.analyzer,
+            calibration=self.calibration,
+        )
 
     # ------------------------------------------------------------------ #
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:

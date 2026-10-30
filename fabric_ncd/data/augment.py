@@ -81,6 +81,54 @@ def random_scale_crop(sample: Sample, scale: Tuple[float, float], rng: np.random
     return out
 
 
+
+def native_scale_crop(
+    sample: Sample,
+    out_size: Tuple[int, int],
+    rng: np.random.Generator,
+    weave_scale: float = 1.0,
+    jitter: Tuple[float, float] = (0.9, 1.1),
+) -> Sample:
+    """在原分辨率（而非整图缩放）上随机裁剪一块 ``out_size`` 大小的区域.
+
+    大幅面布匹图（如 1440x2440）整图缩放到 512 会把几像素宽的断经/飞花抹掉，
+    更合理的做法是"按原像素尺度裁块训练"，推理时再用切块（tile）覆盖整图。
+
+    ``weave_scale`` 由织造周期估计给出: 裁剪窗口 = out_size / weave_scale，
+    再缩放回 out_size，等价于把经纬间距归一化到目标尺度，但只在一小块上做，
+    避免整图放大带来的内存与耗时。
+    """
+    h, w = sample["image"].shape[:2]
+    H, W = int(out_size[0]), int(out_size[1])
+    s = float(np.clip(weave_scale * rng.uniform(*jitter), 0.25, 4.0))
+    ch = int(round(H / max(s, 1e-6)))
+    cw = int(round(W / max(s, 1e-6)))
+
+    # 图像比裁剪窗口还小 -> 先整体放大到够裁
+    if ch > h or cw > w:
+        factor = max(ch / max(h, 1), cw / max(w, 1))
+        sample = resize_sample(sample, (max(H, int(round(h * factor))), max(W, int(round(w * factor)))))
+        h, w = sample["image"].shape[:2]
+        ch, cw = min(ch, h), min(cw, w)
+    ch, cw = max(16, min(ch, h)), max(16, min(cw, w))
+
+    y0 = int(rng.integers(0, max(1, h - ch + 1)))
+    x0 = int(rng.integers(0, max(1, w - cw + 1)))
+    out = dict(sample)
+    out["image"] = sample["image"][y0 : y0 + ch, x0 : x0 + cw]
+    for key in ("defect_mask", "cloth_mask", "synth_mask"):
+        if key in sample:
+            out[key] = sample[key][y0 : y0 + ch, x0 : x0 + cw]
+
+    boxes = np.asarray(sample["boxes"], dtype=np.float32).reshape(-1, 5).copy()
+    if boxes.size:
+        boxes[:, [1, 3]] = (boxes[:, [1, 3]] * w - x0) / cw
+        boxes[:, [2, 4]] = (boxes[:, [2, 4]] * h - y0) / ch
+        boxes = _clip_boxes(boxes)
+    out["boxes"] = boxes
+    return resize_sample(out, (H, W))
+
+
 def fabric_width_augment(
     sample: Sample,
     max_margin: float = 0.3,
@@ -322,27 +370,45 @@ class TrainAugment:
         self.synth_types: Sequence[str] = cfg.get("synth_types", list(SYNTH_TYPES))
         self.synth_max_ops = int(cfg.get("synth_max_ops", 2))
         self.synth_scale = float(cfg.get("synth_scale", 1.0))  # 1.0 表示全部样本都可能叠加
+        self.crop_mode = str(cfg.get("crop_mode", "scale")).lower()  # scale | native
+        self.crop_scale = tuple(cfg.get("crop_scale", (0.85, 1.15)))
         self.out_size = tuple(cfg.get("image_size", (512, 512)))
 
     def __call__(self, sample: Sample, rng: np.random.Generator) -> Sample:
         sample = dict(sample)
         sample.setdefault("synth_mask", np.zeros_like(sample["defect_mask"]))
+        native = self.crop_mode == "native"
 
-        if self.weave_norm:
-            sample = weave_scale_normalize(sample, self.target_period)
+        if native:
+            # 大幅面: 先做布幅增广 (全图 + 掩码同步), 再按原像素尺度裁块, 不做整图缩放
+            if self.width_margin > 0 and rng.random() < 0.85:
+                sample = fabric_width_augment(sample, self.width_margin, rng)
+            if rng.random() < self.hflip_p:
+                sample = hflip(sample)
+            if rng.random() < self.vflip_p:
+                sample = vflip(sample)
+            if rng.random() < self.rot90_p:
+                sample = rot90(sample, int(rng.integers(1, 4)))
+            weave_scale = 1.0
+            if self.weave_norm:
+                weave_scale = weave_scale_factor(sample["image"], self.target_period, 0.5, 2.0)
+            sample = native_scale_crop(
+                sample, self.out_size, rng, weave_scale=weave_scale, jitter=self.crop_scale
+            )
+        else:
+            if self.weave_norm:
+                sample = weave_scale_normalize(sample, self.target_period)
+            if rng.random() < 0.8:
+                sample = random_scale_crop(sample, self.scale, rng)
+            if self.width_margin > 0 and rng.random() < 0.85:
+                sample = fabric_width_augment(sample, self.width_margin, rng)
+            if rng.random() < self.hflip_p:
+                sample = hflip(sample)
+            if rng.random() < self.vflip_p:
+                sample = vflip(sample)
+            if rng.random() < self.rot90_p:
+                sample = rot90(sample, int(rng.integers(1, 4)))
 
-        if rng.random() < 0.8:
-            sample = random_scale_crop(sample, self.scale, rng)
-
-        if self.width_margin > 0 and rng.random() < 0.85:
-            sample = fabric_width_augment(sample, self.width_margin, rng)
-
-        if rng.random() < self.hflip_p:
-            sample = hflip(sample)
-        if rng.random() < self.vflip_p:
-            sample = vflip(sample)
-        if rng.random() < self.rot90_p:
-            sample = rot90(sample, int(rng.integers(1, 4)))
         if self.rotate > 0 and rng.random() < 0.5:
             sample = rotate_sample(sample, float(rng.uniform(-self.rotate, self.rotate)))
 
@@ -360,7 +426,8 @@ class TrainAugment:
 
         sample = color_jitter(sample, self.jitter, rng)
         sample = blur_noise(sample, rng)
-        sample = resize_sample(sample, self.out_size)
+        if not native:
+            sample = resize_sample(sample, self.out_size)
         return sample
 
 

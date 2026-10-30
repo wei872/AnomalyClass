@@ -108,22 +108,21 @@ def _parabolic_peak(spec: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def estimate_weave_period(
     images: torch.Tensor,
-    work_size: int = 256,
+    work_size: int = 512,
     min_period: float = 2.0,
     max_period: float = 64.0,
     default_period: float = 8.0,
 ) -> Dict[str, torch.Tensor]:
     """估计经向 / 纬向织造周期 (输入像素单位).
 
-    Args:
-        images: (B, 3, H, W), 取值范围 [0, 1].
+    高分辨率输入 (如 1024x1728) 下如果直接把整图压成 256x256 的正方形再做 FFT,
+    非正方形方向的频率会被严重抽取: 1024x1728 -> 256x256 后, 水平方向相当于
+    14 倍抽取, 周期 < 14 px 的经纬纹理在谱上完全消失, 周期估计退化成噪声.
 
-    Returns:
-        dict:
-            ``period_x`` (B,) 水平方向周期 (经纱间距, 像素)
-            ``period_y`` (B,) 垂直方向周期 (纬纱间距, 像素)
-            ``anisotropy`` (B,) (E_x - E_y) / (E_x + E_y)
-            ``confidence`` (B,) 峰值能量 / 平均能量
+    因此这里改为 **保持长宽比、只做整数倍池化**, 两个方向的频率分别用各自的
+    真实尺寸归一化 ``period = dim / k`` (k 为整幅内的周期数), 这样:
+    * 非正方形输入不再引入系统性的比例误差;
+    * 分析尺寸控制在 ``work_size`` 附近, 长边不会因为保持比例而爆炸.
     """
     if images.dim() != 4:
         raise ValueError("images 需为 (B,3,H,W)")
@@ -133,41 +132,38 @@ def estimate_weave_period(
         + 0.587 * images[:, 1:2]
         + 0.114 * images[:, 2:3]
     )
-    small = F.adaptive_avg_pool2d(gray, work_size)
+    factor = max(1, int(min(h, w) // max(8, int(work_size))))
+    ph, pw = max(8, h // factor), max(8, w // factor)
+    small = F.adaptive_avg_pool2d(gray, (ph, pw))
     small = small - small.mean(dim=(-2, -1), keepdim=True)
-    window = _hann2d(work_size, small.device, small.dtype)[None, None]
-    spec = torch.fft.rfft2(small * window).abs().pow(2)  # (B,1,S,S/2+1)
 
-    # 频率轴上的能量分布
-    energy_y = spec.mean(dim=3).squeeze(1)  # 垂直频率 -> 纬纱周期 (B,S)
-    energy_x = spec.mean(dim=2).squeeze(1)  # 水平频率 -> 经纱周期 (B,S)
+    wy = torch.hann_window(ph, periodic=False, device=small.device, dtype=small.dtype)
+    wx = torch.hann_window(pw, periodic=False, device=small.device, dtype=small.dtype)
+    spec = torch.fft.rfft2(small * wy[None, None, :, None] * wx[None, None, None, :]).abs().pow(2)
+
+    energy_y = spec.mean(dim=3).squeeze(1)[:, : max(2, ph // 2)]  # (B, ph/2)
+    energy_x = spec.mean(dim=2).squeeze(1)                        # (B, pw/2+1)
     energy_y = energy_y.clone()
     energy_x = energy_x.clone()
     energy_y[:, 0] = 0.0
     energy_x[:, 0] = 0.0
 
-    f_lo = int(math.floor(work_size / max_period))
-    f_hi = int(math.ceil(work_size / min_period))
-    f_lo = max(1, f_lo)
-    f_hi = min(work_size // 2, f_hi)
+    def _pick(energy: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """k: 整幅内的周期数 (浮点) -> 周期 = dim / k."""
+        nbins = energy.shape[1]
+        k_lo = max(1, int(math.floor(dim / max_period)))
+        k_hi = max(k_lo + 1, min(nbins - 2, int(math.ceil(dim / min_period))))
+        band = energy[:, k_lo : k_hi + 1]
+        idx = band.argmax(dim=1) + k_lo
+        k = _parabolic_peak(energy, idx.clamp(1, nbins - 2)).clamp(min=1e-3)
+        conf = band.max(dim=1).values / (band.mean(dim=1) + 1e-8)
+        return k, conf
 
-    def _pick(energy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        band = energy[:, f_lo : f_hi + 1]
-        rel = band.argmax(dim=1) + f_lo
-        peak = _parabolic_peak(energy, rel)
-        peak = peak.clamp(f_lo, f_hi)
-        return peak, band.max(dim=1).values / (band.mean(dim=1) + 1e-8)
+    k_y, conf_y = _pick(energy_y, h)
+    k_x, conf_x = _pick(energy_x, w)
 
-    peak_y, conf_y = _pick(energy_y)
-    peak_x, conf_x = _pick(energy_x)
-
-    period_y = work_size / peak_y.clamp(min=1e-3)  # 垂直频率峰 -> 垂直周期
-    period_x = work_size / peak_x.clamp(min=1e-3)
-
-    scale_y = h / work_size
-    scale_x = w / work_size
-    period_y = (period_y * scale_y).clamp(min_period, max_period)
-    period_x = (period_x * scale_x).clamp(min_period, max_period)
+    period_y = (h / k_y).clamp(min_period, max_period)
+    period_x = (w / k_x).clamp(min_period, max_period)
 
     conf = torch.minimum(conf_x, conf_y)
     # 置信度太低 (无纹理/纯色) 时回退到默认周期
@@ -175,8 +171,8 @@ def estimate_weave_period(
     period_x = torch.where(low, torch.full_like(period_x, default_period), period_x)
     period_y = torch.where(low, torch.full_like(period_y, default_period), period_y)
 
-    e_x = energy_x[:, f_lo : f_hi + 1].sum(dim=1)
-    e_y = energy_y[:, f_lo : f_hi + 1].sum(dim=1)
+    e_x = energy_x.sum(dim=1)
+    e_y = energy_y.sum(dim=1)
     anisotropy = (e_x - e_y) / (e_x + e_y + 1e-8)
     return {
         "period_x": period_x,

@@ -472,9 +472,13 @@ def build_normal_dataset(cfg: Dict[str, Any], split: str = "train") -> Optional[
         image_size = [image_size, image_size]
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
+    # 原尺度裁块训练时, 记忆库也必须用原尺度块建立, 否则分数尺度与推理时不一致
+    native = str(aug_cfg.get("crop_mode", "scale")).lower() == "native"
+    if native:
+        aug_cfg["synth_prob"] = 0.0
     try:
         dataset = FabricDataset(
-            spec, split, tuple(image_size), train=False, augment_cfg=aug_cfg, normal_ratio=0.0
+            spec, split, tuple(image_size), train=native, augment_cfg=aug_cfg, normal_ratio=0.0
         )
     except FileNotFoundError:
         return None

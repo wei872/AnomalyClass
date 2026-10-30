@@ -110,7 +110,8 @@ AnomalyClass/
 ├── tools/
 │   ├── train.py  evaluate.py  infer.py  discover.py
 │   ├── export_onnx.py  bench.py  prepare_dataset.py  demo.py
-├── tests/                         # 26 项单元 + 端到端冒烟测试
+│   ├── resolution.py              # 按原图尺寸 + 实测经纬周期推荐输入分辨率
+├── tests/                         # 31 项单元 + 端到端冒烟测试
 └── docs/DESIGN.md                 # 方案细节、消融实验计划、调参手册
 ```
 
@@ -191,24 +192,60 @@ python tools/train.py --no-pretrained              # 离线环境
 
 ### 6.2.1 推荐预设
 
+> 下面按"原图 1440×2440（宽 2440）"给参数。分辨率一律**保持长宽比**、宽高各为 32 的倍数。
+
 ```bash
-# ① 默认（平衡）: 512 输入, MobileNetV3-Small, 1.11 M 参数 / 0.62 GMACs
+# ① 默认（推荐起步）: 整图送进网络, 短边 1024, 4.17 GMACs / 1.11 M 参数
+#    CPU 约 0.75 s/张 (2 核), GPU 约 25–30 ms/张; 训练显存约 1.4 GB/张 (bs=4 约 5.5 GB)
 python tools/train.py --config configs/fabric19.yaml --set data.root=/data/fabric
 
-# ② 高精度: 768 输入 + MobileNetV3-Large（显存约 7–9 GB, batch 4）
+# ② 轻量/低显存: 短边 768, 2.32 GMACs, CPU 约 0.4 s/张
 python tools/train.py --config configs/fabric19.yaml \
-    --set data.image_size=[768,768] --set data.batch_size=4 \
-    --set model.backbone.arch=mobilenet_v3_large --set model.heads.embed_dim=128
+    --set data.image_size=[768,1280] --set data.batch_size=8
 
-# ③ 极速/端侧: 384 输入, 纯 PyTorch 主干（可完全离线, 便于与 ONNX 对齐）
+# ③ 高精度: 短边 1280, 6.57 GMACs, CPU 约 1.4 s/张 (bs 降到 2)
 python tools/train.py --config configs/fabric19.yaml \
-    --set data.image_size=[384,384] --set model.backbone.arch=lite \
-    --set model.backbone.pretrained=false
+    --set data.image_size=[1280,2176] --set data.batch_size=2 \
+    --set model.backbone.arch=mobilenet_v3_large --set model.heads.embed_dim=128
 
 # ④ 只跑异常检测（先不做 19 类分类，用少量框快速验证数据质量）
 python tools/train.py --config configs/fabric19.yaml \
     --set model.loss.cls.weight=0.0 --set model.loss.supcon.weight=0.0
 ```
+
+### 6.2.2 输入分辨率怎么定（1440×2440）
+
+**结论：不要用 1024×1024 / 1280×1280 这种正方形，用 1024×1728 / 1280×2176。**
+
+原图长宽比 1440:2440 = 1:1.69。正方形输入会把经纬方向拉伸成 1:1：经纱间距和纬纱间距在像素上变得一样，
+`texture.py` 里的 FFT 周期估计和 Gabor 分支就失去了"经纬各向异性"这个最有效的线索，
+同时 42% 的像素被浪费在把图压扁上。等比例缩放则完全没有这个问题。
+
+| 输入 (H×W) | 缩放 | GMACs | CPU 延迟 | 训练显存/张 | 适用 |
+|---|---|---|---|---|---|
+| [512, 864] | 0.354 | 1.04 | 0.17 s | 0.35 GB | 只有 CPU、快速验证 |
+| [768, 1280] | 0.525 | 2.32 | 0.41 s | 0.78 GB | 轻量、低显存 |
+| **[1024, 1728]** | **0.711** | **4.17** | **0.75 s** | **1.40 GB** | **默认** |
+| [1280, 2176] | 0.889 | 6.57 | 1.20 s | 2.20 GB | 小疵点/高精度 |
+| [1440, 2464] | 1.000 | 8.36 | 1.80 s | 2.80 GB | 不缩放（右侧补 24 px 到 32 倍数） |
+
+（以上为本机 CPU（2 核）实测 + 卷积乘加解析统计；显存含反向，GPU 上与 batch 近似线性。）
+
+**怎么选**：小疵点的可检出性由"缩放后还剩几个像素"决定，而织造纹理的可建模性由"缩放后的经纬周期"决定。
+
+```bash
+# 先量一下你的布在原始分辨率下的经纬周期（像素）
+python tools/resolution.py --source /data/fabric/normal --native 1440x2440
+```
+
+该工具会给出建议：**缩放后周期 ≥ 4 px** 才能让 Gabor/FFT 稳定工作，**周期 ≥ 3 px** 时网络还能靠卷积纹理特征兜底；
+如果 1024×1728 下周期已经 < 3 px（说明布面很细密、原图里经纬只有 3–4 个像素），
+就把输入提到 [1280, 2176] 或干脆不缩放，并且把 `batch_size` 相应降到 2。
+
+**整图输入 vs 切块**：本仓库默认整图缩放（`eval.tile: false`），一次前向出全图结果，不需要拼接。
+只有在"既要最高细节、又上不去分辨率"的情况下才需要切块：把 `data.augment.crop_mode` 设为 `native`
+（按原像素尺度裁块训练），推理时 `--tile`（切块尺寸默认等于输入尺寸，即 1:1 不缩放）。
+这条路径精度上限更高，但切块边界处需要重叠融合，部署更复杂，因此不作为默认。
 
 ### 6.3 评估
 
@@ -222,7 +259,8 @@ python tools/evaluate.py --ckpt best.pt --save-preds preds.json   # 逐图区域
 ```bash
 python tools/infer.py --ckpt best.pt --source a.jpg
 python tools/infer.py --ckpt best.pt --source /data/images --out outputs/pred
-python tools/infer.py --ckpt best.pt --source line_scan_4096x1024.png --tile --tile-size 512 --tile-overlap 128
+python tools/infer.py --ckpt best.pt --source scan_1440x2440.png          # 默认整图, 一次前向 0.75 s (CPU)
+python tools/infer.py --ckpt best.pt --source huge_4096x1024.png --tile --tile-size 1024x1728 --tile-overlap 128
 ```
 
 输出 `*_pred.png`（热力图 + 框 + 类别 + 分数）与 `results.json`（每张图的区域、类别、到布边距离等）。

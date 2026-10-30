@@ -15,9 +15,17 @@ experiment:
 data:
   dataset_yaml: dataset/fabric19.yaml
   root: null            # 覆盖/重映射数据集根目录
-  image_size: [512, 512]
-  batch_size: 8
-  eval_batch_size: 4
+  # ---- 输入分辨率 (整图缩放到该尺寸, 不切块) ----
+  # 原图 1440x2440 (H x W, 长宽比 1:1.69). 必须保持长宽比, 且宽高各为 32 的倍数.
+  #   [1024, 1728] 默认: 短边 1024, 缩放 0.71, 4.17 GMACs, CPU 约 0.9 s/张
+  #   [768, 1280]  轻量: 缩放 0.53, 2.32 GMACs, CPU 约 0.4 s/张
+  #   [1280, 2176] 高精度: 缩放 0.89, 6.57 GMACs, CPU 约 1.4 s/张
+  # 注意: 不要写 [1024, 1024] 这类正方形 —— 会把 1:1.69 拉成 1:1, 经纬间距比例失真.
+  image_size: [1024, 1728]
+  # 实测显存 (训练含反向): 1024x1728 约 1.4 GB/张 -> bs=4 约 5.5 GB; 8 GB 卡可用
+  # 若换 1280x2176, 显存 x1.57, 请把 batch_size 降到 2
+  batch_size: 4
+  eval_batch_size: 2
   num_workers: 4
   normal_ratio: 0.4     # 每个 batch 中正常图比例 (正常图越多, 记忆库越稳)
   mask_dir: null        # 可选: 真实布面/背景掩码目录 (文件名与图片一致)
@@ -25,6 +33,9 @@ data:
   limit_val: null
 
   augment:
+    crop_mode: scale        # scale = 整图缩放 (默认, 与本配置的大图输入一致)
+                            # native = 原像素尺度裁块 (仅当疵点小于 3 px 时可选, 默认不用)
+    crop_scale: [0.85, 1.15]
     scale: [0.5, 1.0]       # 随机缩放裁剪
     hflip: 0.5
     vflip: 0.5
@@ -93,6 +104,13 @@ train:
   score_weights: {pixel_auroc: 0.35, pro: 0.15, image_auroc: 0.20, map50: 0.10, map50_agnostic: 0.10, f1_macro: 0.10}
 
 eval:
+  # 大幅面 (1440x2440) 整图输入时保持 tile=false: 与训练一致; 仅在显存/耗时受限
+  # 而必须切块推理时才置 true (此时训练也应改用 augment.crop_mode=native)
+  tile: false
+  tile_size: [1024, 1728]   # tile=true 时默认等于 image_size, 即 1:1 原像素切块
+  tile_overlap: 128
+  tile_batch: 2
+  max_pixels: 3.0e5         # 像素级指标统计前下采样到的像素数上限 (内存保护)
   threshold: null        # null = 自适应阈值
   threshold_sigma: 3.0
   min_area_ratio: 0.0004
@@ -105,7 +123,8 @@ eval:
   topk_ratio: 0.01
 
 infer:
-  tile: false
-  tile_size: 512
+  tile: false              # 1440x2440 整图一次前向 (0.9 s/张 CPU, GPU 约 30 ms)
+  tile_size: [1024, 1728]
   tile_overlap: 128
+  tile_batch: 2
   image_score_threshold: 0.5
