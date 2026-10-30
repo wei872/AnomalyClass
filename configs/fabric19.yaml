@@ -73,6 +73,8 @@ model:
     enabled: true
     pool_sizes: [3, 7, 15, 31, 63]
     use_xy: false              # 用 "到布边距离" 而非绝对坐标
+    border_prior: true         # 额外送入"到画面边框距离": 整幅都是布 (无辊筒/台面) 时
+                               # 布面概率图恒为 1, 只剩这条先验能告诉模型布边在哪
   heads:
     embed_dim: 64
     num_classes: 19

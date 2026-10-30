@@ -317,7 +317,16 @@ class FabricPredictor:
         self.model = FabricNCD(cfg)
         if checkpoint:
             key = "ema" if "ema" in state else "model"
-            self.model.load_state_dict(state[key])
+            try:
+                self.model.load_state_dict(state[key])
+            except RuntimeError as exc:
+                # 结构升级 (例如新增 border_prior 两路输入) 后旧权重形状不一致: 尽量加载
+                missing, unexpected = self.model.load_state_dict(state[key], strict=False)
+                print(
+                    f"[warn] 权重与当前结构不完全一致 ({exc.__class__.__name__}), "
+                    f"已跳过 {len(missing)} 个参数 / {len(unexpected)} 个多余参数; "
+                    "建议用新结构重新训练或微调"
+                )
         self.model.to(self.device).eval()
         if not self.names:
             self.names = [f"class_{i}" for i in range(self.model.num_classes)]

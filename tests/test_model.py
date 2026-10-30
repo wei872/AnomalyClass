@@ -44,6 +44,21 @@ def test_weave_stats_range(model):
     assert (out["weave"]["period_x"] >= 2).all()
 
 
+def test_geography_uses_border_prior_when_no_background():
+    """整幅都是布 (布面概率恒为 1) 时, 地理编码仍应给出空间变化 (来自到边框距离)."""
+    from fabric_ncd.models.glocal import GeographyEmbedding
+
+    geo = GeographyEmbedding(8, pool_sizes=(3, 7), use_xy=False, border_prior=True)
+    feat = torch.ones(1, 8, 16, 24)
+    prob = torch.ones(1, 1, 16, 24)  # 全是布
+    with torch.no_grad():
+        out = geo(prob, feat)
+    assert out.shape == feat.shape
+    assert torch.isfinite(out).all()
+    # 左侧边框与画面中央的响应必须不同, 否则等于没有边缘信息
+    assert float((out[:, :, :, 0] - out[:, :, :, feat.shape[-1] // 2]).abs().max()) > 1e-4
+
+
 def test_backward_and_loss(model):
     cfg = tiny_config()
     criterion = FabricCriterion(cfg)

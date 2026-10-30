@@ -729,7 +729,16 @@ class Trainer:
     def load_checkpoint(self, path: str | Path, load_optimizer: bool = False) -> Dict[str, Any]:
         state = torch.load(path, map_location=self.device, weights_only=False)
         key = "ema" if "ema" in state and not load_optimizer else "model"
-        self.model.load_state_dict(state[key])
+        try:
+            self.model.load_state_dict(state[key])
+        except RuntimeError as exc:
+            # 结构升级后旧权重形状可能不一致 (例如 geography 新增 border_prior 输入),
+            # 尽量加载其余权重并明确告警, 而不是直接崩掉
+            missing, unexpected = self.model.load_state_dict(state[key], strict=False)
+            self.logger.warning(
+                "权重与当前结构不一致 (%s): 跳过 %d 个参数, 多余 %d 个; 建议重新训练",
+                exc.__class__.__name__, len(missing), len(unexpected),
+            )
         if load_optimizer and "optimizer" in state:
             self.optimizer.load_state_dict(state["optimizer"])
             if "scheduler" in state:

@@ -161,6 +161,11 @@ DATASET_ROOT/
 # Windows 注意: --root 要写完整盘符 (D:/data/fabric)，只写 /data/fabric 会变成
 # "当前盘符下的相对路径"，掩码会写到别的盘去 (工具现在会告警并自动改写到图像实际目录)
 
+# 如果你的图"整幅都是布"(没有辊筒/台面/背景):
+#   不要加 --export-masks, data.mask_dir 保持 null —— 布面掩码会恒为全白, 没有信息量.
+#   包边/布边(左右布幅边缘)的位置信息由模型内置的 model.fabric_mask.border_prior 提供.
+#   疵点(前景)掩码由 YOLO 标注实时生成, 想肉眼核对用 --export-defect-masks.
+
 # 三种"掩码"别混淆:
 #   ① 布面/前景掩码  <- --export-masks      (逐像素, 告诉你哪里是布/哪里是辊筒台面)
 #   ② 疵点掩码       <- 训练时由 YOLO 标注实时生成, 不落盘 (想看图用 --export-defect-masks)

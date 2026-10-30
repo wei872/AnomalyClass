@@ -174,11 +174,29 @@ class GlocalFusion(nn.Module):
         return self.film(x, cond)
 
 
+def _border_distance(ref: torch.Tensor) -> list:
+    """到画面左右 / 上下边框的归一化距离 (0 = 贴边, 1 = 画面中线).
+
+    "整幅都是布"时布面概率图没有梯度, 这条先验是模型唯一能感知"布边在画面哪儿"的途径,
+    对包边不重叠 / 包边不良 / 单根包不进这类贴着布幅边缘的疵点很关键.
+    """
+    b, _, h, w = ref.shape
+    ys = torch.arange(h, device=ref.device, dtype=ref.dtype)
+    xs = torch.arange(w, device=ref.device, dtype=ref.dtype)
+    dy = torch.minimum(ys, (h - 1) - ys) / max((h - 1) / 2.0, 1.0)
+    dx = torch.minimum(xs, (w - 1) - xs) / max((w - 1) / 2.0, 1.0)
+    d_x = dx[None, None, None, :].expand(b, 1, h, w)
+    d_y = dy[None, None, :, None].expand(b, 1, h, w)
+    return [d_x, d_y]
+
 class GeographyEmbedding(nn.Module):
     """布面地理编码: 由布面概率图得到 "到布边距离" 的软表示.
 
     * 多尺度平均池化金字塔近似距离场 (由内向外扩散), 可微且几乎零成本;
     * 边界带响应 ``4p(1-p)`` 显式标记布边过渡区, 用于加强布边注意力;
+    * **画面边框距离先验**: 产线图常常"整幅都是布"(没有辊筒/台面), 这时布面概率图
+      恒为 1, 上面的金字塔完全拿不到边缘信息; 而包边/布边类疵点恰恰贴着图像的左右边框.
+      因此额外送入"到画面边框的归一化距离" (x 向 / y 向各一路), 不依赖布面掩码也成立;
     * 归一化坐标只作为辅助弱信号 (可选), 使模型在布幅变化时依赖距离而非绝对位置.
     """
 
@@ -187,11 +205,15 @@ class GeographyEmbedding(nn.Module):
         channels: int,
         pool_sizes: Sequence[int] = (3, 7, 15, 31, 63),
         use_xy: bool = False,
+        border_prior: bool = True,
     ) -> None:
         super().__init__()
         self.pool_sizes = list(pool_sizes)
         self.use_xy = use_xy
+        self.border_prior = bool(border_prior)
         in_dim = len(self.pool_sizes) + 2  # 金字塔 + 边界带 + 原概率
+        if self.border_prior:
+            in_dim += 2  # 到左右边框 / 到上下边框的归一化距离
         if use_xy:
             in_dim += 2
         self.embed = nn.Sequential(
@@ -214,6 +236,8 @@ class GeographyEmbedding(nn.Module):
             responses.append(pooled)
         band = 4.0 * mask_prob * (1.0 - mask_prob)  # 布边带
         responses.append(band)
+        if self.border_prior:
+            responses.extend(_border_distance(mask_prob))
         if self.use_xy:
             b, _, h, w = mask_prob.shape
             ys = torch.linspace(-1, 1, h, device=mask_prob.device, dtype=mask_prob.dtype)

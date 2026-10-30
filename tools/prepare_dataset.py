@@ -58,8 +58,13 @@ def _dataset_base(spec) -> Path:
             "请用 --root 指向真实的数据集目录 (Windows 上要写完整盘符, 如 D:/data/fabric)."
         )
     base = Path(os.path.commonpath([str(p) for p in existing]))
-    if base.name.lower() in ("images", "labels", "normal"):
-        base = base.parent
+    # 逐级上卷: images/train -> images -> 数据集根 (也兼容 train/val 同名目录的情况)
+    for _ in range(3):
+        name = base.name.lower()
+        if name in ("images", "labels", "normal", "train", "val", "valid", "test"):
+            base = base.parent
+        else:
+            break
     return base
 
 def _parse_mask_size(value):
@@ -219,9 +224,32 @@ def main() -> int:
                 logger.warning("data.root (%s) 不存在, 掩码改为写到图像实际所在的数据集根: %s",
                                spec.root, out_root)
         logger.info("掩码输出目录: %s", out_root)
+
+        # 先抽样判断"是不是整幅都是布": 这种情况下布面掩码恒为 255, 没有任何信息,
+        # 白导出 550 张反而浪费时间 (包边/布边信息由模型的 border_prior 负责).
+        probe = list_images(spec.splits.get("train"))[:8]
+        all_cloth = False
+        if probe and not args.force:
+            coverages = []
+            for img_path in probe:
+                with Image.open(img_path) as im:
+                    small = np.asarray(im.convert("RGB"), dtype=np.uint8)
+                m, _ = estimate_cloth_mask(small, work_size=512)
+                coverages.append(float(m.mean()))
+            all_cloth = sum(c > 0.995 for c in coverages) >= max(1, int(0.8 * len(coverages)))
+            if all_cloth:
+                logger.warning(
+                    "抽样 %d 张, 布面覆盖率平均 %.2f%% —— 你的图整幅都是布, 布面掩码没有信息量, 已跳过导出.",
+                    len(coverages), 100.0 * float(np.mean(coverages)),
+                )
+                logger.warning("直接用默认配置训练即可 (data.mask_dir 保持 null); 确要导出可加 --force")
+        if all_cloth and not args.export_defect_masks:
+            return 0
         workers = args.workers or min(8, os.cpu_count() or 1)
         mask_size = _parse_mask_size(args.mask_size)
         for split in ("train", "val"):
+            if all_cloth:
+                break
             images = list_images(spec.splits.get(split))
             if args.limit:
                 images = images[: args.limit]
@@ -254,7 +282,8 @@ def main() -> int:
                         logger.info("  %s: %d/%d | %.1f 张/s | 剩余约 %.0f s | 失败 %d",
                                     split, done, len(todo), done / max(elapsed, 1e-6), eta, failed)
             logger.info("掩码导出完成: %s (%d 张, 失败 %d)", target, len(todo) - failed, failed)
-        logger.info("把配置中的 data.mask_dir 设为: %s", out_root)
+        if not all_cloth:
+            logger.info("把配置中的 data.mask_dir 设为: %s", out_root)
 
     if args.export_defect_masks:
         base = _dataset_base(spec)

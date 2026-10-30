@@ -110,6 +110,7 @@ class FabricNCD(nn.Module):
             c_neck,
             pool_sizes=model_cfg.get("fabric_mask", {}).get("pool_sizes", (3, 7, 15, 31, 63)),
             use_xy=bool(model_cfg.get("fabric_mask", {}).get("use_xy", False)),
+            border_prior=bool(model_cfg.get("fabric_mask", {}).get("border_prior", True)),
         )
 
         # ---------------- 检测 / 分类 ----------------
