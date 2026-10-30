@@ -722,10 +722,10 @@ class Trainer:
             return
         est = self.MEM_GB_PER_MPX * (h * w) / 1e6 * max(batch, 1)
         if self.device.type != "cuda" or not torch.cuda.is_available():
-            self.logger.info("预计训练显存 (估算): %.1f GB (非 CUDA 设备, 仅供参考)", est)
+            self.logger.info("预计训练显存 (估算): %.2f GB (非 CUDA 设备, 仅供参考)", est)
             return
         total = torch.cuda.get_device_properties(self.device).total_memory / 2**30
-        self.logger.info("预计训练显存 (估算): %.1f GB / 显卡 %.1f GB", est, total)
+        self.logger.info("预计训练显存 (估算): %.2f GB / 显卡 %.1f GB", est, total)
         if est > 0.85 * total:
             self.logger.warning(
                 "按 %.0fx%d x batch %d 估算要 %.1f GB, 超过 %.1f GB 显存的 85%%, 很可能 OOM. "

@@ -143,8 +143,14 @@ def main() -> int:
         if path is not None:
             logger.info("  %-12s %s%s", split, path, "" if Path(path).exists() else "   <-- 不存在")
     logger.info("类别数: %d", spec.nc)
-    if spec.root and str(spec.root).lower().startswith("d:"):
-        logger.warning("仍是 Windows 路径, 请用 --root 指向本机数据目录")
+    if spec.root and not Path(spec.root).exists():
+        # 只有 root 在本机根本不存在时才提示 (用 --root 指过来了就不用再唠叨)
+        logger.warning(
+            "数据集根目录不存在: %s\n"
+            "  yaml 里是别的机器上的路径时, 用 --root 指到本机目录, 例如 "
+            "--root D:/tyhn/yolo/dataset/source5_augmenteds",
+            spec.root,
+        )
 
     total_defect = 0
     hist = Counter()

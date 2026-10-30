@@ -201,3 +201,27 @@ def test_cloth_mask_small_work_size_falls_back_to_color():
     union = np.logical_or(full, fast).sum()
     assert inter / union > 0.95
     assert abs(float(fast.mean()) - float(full.mean())) < 0.03
+
+
+def test_aspect_jitter_keeps_boxes_and_masks_aligned():
+    """各向异性拉伸: 归一化坐标不变, 图像/掩码同步变形."""
+    from fabric_ncd.data.augment import aspect_jitter
+
+    sample = _blank_sample(64, 96)
+    sample["defect_mask"][20:40, 30:60] = 1
+    rng = np.random.default_rng(0)
+    out = aspect_jitter(sample, (1.15, 1.15), rng)
+    assert out["image"].shape[:2] == out["defect_mask"].shape[:2]
+    assert out["image"].shape[0] != 64  # 确实变形了
+    np.testing.assert_allclose(out["boxes"], sample["boxes"])
+    # 掩码内容仍在框附近 (相对位置不变)
+    frac = out["defect_mask"].mean()
+    assert abs(frac - sample["defect_mask"].mean()) < 0.02
+
+
+def test_train_augment_aspect_jitter_runs():
+    aug = TrainAugment({"image_size": (48, 48), "aspect_jitter": (0.85, 1.18), "aspect_prob": 1.0})
+    out = aug(_blank_sample(64, 96), np.random.default_rng(1))
+    assert out["image"].shape == (48, 48, 3)
+    assert out["defect_mask"].shape == (48, 48)
+    assert out["cloth_mask"].shape == (48, 48)

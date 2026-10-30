@@ -60,6 +60,27 @@ def _clip_boxes(boxes: np.ndarray) -> np.ndarray:
     return boxes[keep]
 
 
+def aspect_jitter(sample: Sample, scale: Tuple[float, float], rng: np.random.Generator) -> Sample:
+    """各向异性拉伸 (x/y 独立缩放), 用来吃掉数据集里长宽比不一致的问题.
+
+    画布整体 resize, 归一化坐标不变 (框/掩码自动跟随), 相当于把内容横向/纵向拉伸
+    ``sx`` / ``sy`` 倍. 训练时见过各种拉伸比例, 推理时那 1.9~2.4 的长宽比差异就不再是分布外样本.
+    """
+    lo, hi = float(scale[0]), float(scale[1])
+    h, w = sample["image"].shape[:2]
+    sx = float(rng.uniform(lo, hi))
+    sy = float(rng.uniform(lo, hi))
+    nh = int(np.clip(round(h * sy), 64, max(64, h * 2)))
+    nw = int(np.clip(round(w * sx), 64, max(64, w * 2)))
+    if (nh, nw) == (h, w):
+        return sample
+    out = dict(sample)
+    out["image"] = _np(_pil(sample["image"]).resize((nw, nh), Image.BILINEAR))
+    for key in ("defect_mask", "cloth_mask", "synth_mask"):
+        if key in sample:
+            out[key] = _np(_pil(sample[key]).resize((nw, nh), Image.NEAREST))
+    return out
+
 def random_scale_crop(sample: Sample, scale: Tuple[float, float], rng: np.random.Generator) -> Sample:
     h, w = sample["image"].shape[:2]
     s = float(rng.uniform(*scale))
@@ -372,6 +393,9 @@ class TrainAugment:
         self.synth_scale = float(cfg.get("synth_scale", 1.0))  # 1.0 表示全部样本都可能叠加
         self.crop_mode = str(cfg.get("crop_mode", "scale")).lower()  # scale | native
         self.crop_scale = tuple(cfg.get("crop_scale", (0.85, 1.15)))
+        # 各向异性拉伸: 数据集里长宽比不统一 (实测 1.88~2.42) 时, 让模型在训练中就见惯
+        self.aspect = tuple(cfg.get("aspect_jitter", (1.0, 1.0)))
+        self.aspect_p = float(cfg.get("aspect_prob", 0.0))
         self.out_size = tuple(cfg.get("image_size", (512, 512)))
 
     def __call__(self, sample: Sample, rng: np.random.Generator) -> Sample:
@@ -408,6 +432,16 @@ class TrainAugment:
                 sample = vflip(sample)
             if rng.random() < self.rot90_p:
                 sample = rot90(sample, int(rng.integers(1, 4)))
+
+        # native 裁块模式下画布固定为 out_size 且末尾不再 resize, 拉伸会让 batch 尺寸不一致,
+        # 所以只在整图缩放模式里做 (该模式末尾会统一 resize 回 out_size)
+        if (
+            not native
+            and self.aspect_p > 0
+            and self.aspect[1] > self.aspect[0]
+            and rng.random() < self.aspect_p
+        ):
+            sample = aspect_jitter(sample, self.aspect, rng)
 
         if self.rotate > 0 and rng.random() < 0.5:
             sample = rotate_sample(sample, float(rng.uniform(-self.rotate, self.rotate)))

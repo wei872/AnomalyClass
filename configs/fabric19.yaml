@@ -53,6 +53,10 @@ data:
     rotate: 3.0             # 小角度旋转 (度)
     color_jitter: 0.3
     width_margin: 0.3       # 布幅增广: 最大边距比例
+    # 各向异性拉伸: 数据集长宽比常常不统一 (实测 1.88~2.42), 整图缩放到同一输入会被各自拉伸;
+    # 这里是"让模型见惯各种拉伸比例", 不是在制造畸变 —— 参数范围对应 ±15% 左右的形变
+    aspect_jitter: [0.85, 1.18]
+    aspect_prob: 0.5
     weave_norm: true        # 织造尺度归一化 (跨布种泛化关键)
     target_period: 8.0
     synth_prob: 0.5         # 合成疵点概率
