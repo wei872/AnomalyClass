@@ -33,7 +33,12 @@ from PIL import Image  # noqa: E402
 from _common import base_parser, load_config  # noqa: E402
 
 from fabric_ncd.data.fabric_mask import auto_work_size, estimate_cloth_mask  # noqa: E402
-from fabric_ncd.data.yolo import list_images, load_dataset_spec, read_yolo_labels  # noqa: E402
+from fabric_ncd.data.yolo import (  # noqa: E402
+    boxes_to_mask,
+    list_images,
+    load_dataset_spec,
+    read_yolo_labels,
+)
 from fabric_ncd.utils import ensure_dir, get_logger  # noqa: E402
 
 
@@ -79,12 +84,37 @@ def _export_one(image_path: str, out_dir: str, mask_size) -> tuple:
     return str(out_path), time.perf_counter() - t0
 
 
+def _export_defect_one(image_path: str, label_path: str, out_dir: str, mask_size) -> str:
+    """子进程: 把 YOLO 标注 (框/多边形) 画成疵点掩码, 用于核对标注是否读对.
+
+    训练时并不需要这些文件: dataloader 会实时用 ``boxes_to_mask`` 从 txt 生成.
+    这里只是把它们落盘, 方便肉眼确认类别/坐标没读错.
+    """
+    with Image.open(image_path) as im:
+        w, h = im.size
+    boxes, polygons = read_yolo_labels(Path(label_path))
+    mask = boxes_to_mask(boxes, polygons, h, w)
+
+    target_long = 640 if mask_size == "auto" else int(mask_size)
+    scale = min(1.0, float(target_long) / float(max(h, w)))
+    if scale < 1.0:
+        nw, nh = max(8, int(round(w * scale))), max(8, int(round(h * scale)))
+        mask = (np.asarray(Image.fromarray(mask * 255).resize((nw, nh), Image.NEAREST)) > 127).astype(np.uint8)
+
+    out_path = Path(out_dir) / f"{Path(image_path).stem}.png"
+    Image.fromarray((mask * 255).astype(np.uint8)).save(out_path)
+    return str(out_path)
+
+
 def main() -> int:
     parser = base_parser("数据集检查 / 预处理")
     parser.add_argument("--root", default=None, help="本机数据集根目录 (用于重映射 Windows 路径)")
     parser.add_argument("--write-yaml", default=None, help="输出路径已解析的 yaml")
-    parser.add_argument("--export-masks", action="store_true", help="导出无监督布面掩码")
-    parser.add_argument("--mask-out", default=None, help="掩码输出根目录 (默认 <root>/cloth_masks)")
+    parser.add_argument("--export-masks", action="store_true", help="导出无监督布面(前景)掩码")
+    parser.add_argument("--export-defect-masks", action="store_true",
+                        help="导出由 YOLO 标注框生成的疵点掩码 (用于核对标注是否读对)")
+    parser.add_argument("--mask-out", default=None, help="布面掩码输出根目录 (默认 <数据集根>/cloth_masks)")
+    parser.add_argument("--defect-mask-out", default=None, help="疵点掩码输出根目录 (默认 <数据集根>/defect_masks)")
     parser.add_argument("--mask-size", default="auto",
                         help="掩码估计/保存的长边尺寸: auto (按实测经纬周期自动决定) 或整数, 如 1024")
     parser.add_argument("--workers", type=int, default=None, help="并行进程数 (默认 min(8, CPU 核数))")
@@ -225,6 +255,44 @@ def main() -> int:
                                     split, done, len(todo), done / max(elapsed, 1e-6), eta, failed)
             logger.info("掩码导出完成: %s (%d 张, 失败 %d)", target, len(todo) - failed, failed)
         logger.info("把配置中的 data.mask_dir 设为: %s", out_root)
+
+    if args.export_defect_masks:
+        base = _dataset_base(spec)
+        out_root = Path(os.path.abspath(str(args.defect_mask_out or base / "defect_masks")))
+        workers = args.workers or min(8, os.cpu_count() or 1)
+        mask_size = _parse_mask_size(args.mask_size)
+        logger.info("疵点掩码输出目录: %s", out_root)
+        for split in ("train", "val"):
+            images = list_images(spec.splits.get(split))
+            if args.limit:
+                images = images[: args.limit]
+            label_dir = spec.labels.get(split)
+            target = ensure_dir(out_root / split)
+            todo = [
+                img for img in images
+                if label_dir is not None and (Path(label_dir) / f"{img.stem}.txt").exists()
+                and (args.force or not (target / f"{img.stem}.png").exists())
+            ]
+            logger.info("%s: 待处理 %d 张 (workers=%d)", split, len(todo), workers)
+            if not todo:
+                continue
+            done = 0
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_export_defect_one, str(img), str(Path(label_dir) / f"{img.stem}.txt"),
+                                str(target), mask_size): img
+                    for img in todo
+                }
+                for future in as_completed(futures):
+                    done += 1
+                    try:
+                        future.result()
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("失败: %s (%s)", futures[future].name, exc)
+                    if done % 100 == 0 or done == len(todo):
+                        logger.info("  %s: %d/%d", split, done, len(todo))
+            logger.info("疵点掩码导出完成: %s (%d 张)", target, len(todo))
+        logger.info("这些掩码只用于人工核对标注; 训练时疵点掩码由 dataloader 实时生成, 无需配置")
     return 0
 
 

@@ -161,6 +161,12 @@ DATASET_ROOT/
 # Windows 注意: --root 要写完整盘符 (D:/data/fabric)，只写 /data/fabric 会变成
 # "当前盘符下的相对路径"，掩码会写到别的盘去 (工具现在会告警并自动改写到图像实际目录)
 
+# 三种"掩码"别混淆:
+#   ① 布面/前景掩码  <- --export-masks      (逐像素, 告诉你哪里是布/哪里是辊筒台面)
+#   ② 疵点掩码       <- 训练时由 YOLO 标注实时生成, 不落盘 (想看图用 --export-defect-masks)
+#   ③ 异常热力图     <- 模型输出, 推理/评估时生成
+python tools/prepare_dataset.py --root D:/data/fabric --export-defect-masks --workers 8
+
 # 可选：预计算布面掩码（多进程 + 按经纬周期自动降采样，550 张约 1–2 分钟）
 python tools/prepare_dataset.py --root /data/fabric --export-masks --workers 8
 # 支持断点续跑（已存在的掩码自动跳过）与试跑：--limit 20 --mask-size 1024

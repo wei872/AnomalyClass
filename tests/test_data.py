@@ -109,6 +109,27 @@ def test_cloth_mask_work_size_matches_full():
     assert full[0, 0] == 0 and full[200, 320] == 1
 
 
+def test_export_defect_mask_from_yolo(tmp_path):
+    """YOLO 标注应能落成疵点掩码 (训练时是实时生成的, 这里验证同一套逻辑)."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from prepare_dataset import _export_defect_one
+
+    root = make_dataset(tmp_path / "d", n_train=2, n_val=1, n_normal=1, size=(64, 96))
+    images = sorted((root / "images" / "train").iterdir())
+    labels = sorted((root / "labels" / "train").iterdir())
+    assert images and labels
+    out = tmp_path / "defect_masks"
+    out.mkdir()
+    path = _export_defect_one(str(images[0]), str(labels[0]), str(out), "auto")
+    assert Path(path).exists()
+    mask = np.asarray(__import__("PIL.Image", fromlist=["Image"]).open(path))
+    assert mask.shape[0] <= 64 and mask.shape[1] <= 96
+    assert (mask > 127).sum() > 0
+
+
 def test_yolo_dataset(tmp_path):
     root = make_dataset(tmp_path, n_train=4, n_val=2, n_normal=2)
     spec = load_dataset_spec({"data": {"dataset_yaml": str(root / "dataset.yaml")}})
