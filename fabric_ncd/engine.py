@@ -596,10 +596,19 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     # ------------------------------------------------------------------ #
-    def _reference_batches(self):
-        """参照集批次 (良品图 + / 或 疵点图框外布面). 记忆库与阈值校准共用同一套来源."""
+    def _reference_batches(self, skip_bank: bool = True):
+        """参照集批次 (良品图 + / 或 疵点图框外布面). 记忆库与阈值校准共用同一套来源.
+
+        ``skip_bank``: 跳过已经进了记忆库的图. 这一步必须做 —— 如果校准用的就是建库用的
+        那几张, 正常像素到库的中位距离会被压到 ≈0 (实测 0.001), 于是
+        ``memory_score = d/(d+scale)`` 对任何没入库的图都直接饱和到 1.0, 记忆分支退化
+        成一个常数偏置, 图像级分数整体被它带平.
+        """
+        bank = getattr(self, "_bank_paths", set()) if skip_bank else set()
         for loader in getattr(self, "memory_loaders", []) or []:
             for batch in loader:
+                if bank and any(str(p) in bank for p in batch.get("path", [])):
+                    continue
                 yield batch
 
     def warmup_memory(self, max_batches: Optional[int] = None, calibrate: bool = True) -> None:
@@ -614,9 +623,12 @@ class Trainer:
         if max_batches and bool(self.train_cfg.get("memory_shuffle", True)):
             loaders = [_reshuffled(self.cfg, loader) or loader for loader in loaders]
         batches = 0
+        self._bank_paths = set()
         with torch.no_grad():
             for loader in loaders:
                 for batch in loader:
+                    for path in batch.get("path", []):
+                        self._bank_paths.add(str(path))
                     batch = move_to(batch, self.device)
                     self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
                     batches += 1
@@ -625,7 +637,10 @@ class Trainer:
                 if max_batches and batches >= max_batches:
                     break
         self.model.train()
-        self.logger.info("记忆库预热完成: %d 个正常 patch 特征", int(self.model.memory.size.item()))
+        self.logger.info(
+            "记忆库预热完成: %d 个 patch 特征 (来自 %d 张参照图; 阈值校准会跳过这些图)",
+            int(self.model.memory.size.item()), len(self._bank_paths),
+        )
         # 先把新记忆库同步给 EMA, 再用 EMA 做阈值校准, 否则校准用的是旧记忆库,
         # 得到的阈值会系统性偏高.
         if self.ema is not None:
@@ -760,7 +775,17 @@ class Trainer:
         dist_parts: List[np.ndarray] = []
         mask_parts: List[np.ndarray] = []
         seen = 0
-        for batch in self._reference_batches():
+        # 若参照图全部进了记忆库 (memory_warmup_batches = 0 / 图很少), 跳过就什么都不剩,
+        # 这时退回全部图 —— 尺度会被压小, 但至少不会算不出阈值 (会由 scale floor 兜底).
+        n_ref = sum(len(getattr(l, "dataset", [])) for l in getattr(self, "memory_loaders", []))
+        skip_bank = len(getattr(self, "_bank_paths", ())) < n_ref
+        if not skip_bank:
+            self.logger.warning(
+                "参照图全部在记忆库里 (共 %d 张), 阈值校准只能复用这些图; "
+                "记忆项尺度会被压小, 请增大参照集或减小 memory_warmup_batches",
+                n_ref,
+            )
+        for batch in self._reference_batches(skip_bank=skip_bank):
             batch = move_to(batch, self.device)
             out = model(batch["image"])
             h, w = batch["image"].shape[-2:]
@@ -806,7 +831,17 @@ class Trainer:
         use_memory = bool(self.model.memory_enabled) and bool(np.any(dist_all[mask_all] > 0))
         if use_memory:
             median_dist = float(np.median(dist_all[mask_all]))
-            scale = max(median_dist, 1e-3)
+            # 尺度过小 = 参照像素本来就在库里 (余弦距离≈0), 记忆分支会整体饱和到 1.0.
+            # 正常是 0.01~0.05 量级; 真的掉到 0 附近时先兜底, 并明确告警.
+            floor = float(self.train_cfg.get("memory_scale_floor", 0.01))
+            if median_dist < floor:
+                self.logger.warning(
+                    "记忆项尺度只有 %.4f (正常 0.01~0.05): 校准用的像素基本就在记忆库里, "
+                    "记忆分支会整体饱和 -> 已抬到 %.3f. 检查参照集是否与建库图重叠",
+                    median_dist, floor,
+                )
+                median_dist = floor
+            scale = median_dist
             self._set_memory_scale(scale)
             # 中位距离 ~1.0 意味着"每个正常像素在记忆库里都找不到相似的特征"
             # (余弦相似度≈0), 此时记忆分支退化成常数, 只剩学习式分数在起作用.
