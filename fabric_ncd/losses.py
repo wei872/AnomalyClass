@@ -53,6 +53,41 @@ def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> 
     return (1.0 - (2 * inter + eps) / (union + eps)).mean()
 
 
+def refine_boxes_by_distance(
+    box_mask: torch.Tensor, distance: torch.Tensor, ratio: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """用**记忆库距离**在框内挑出异常核心, 作为更精确的像素级正样本.
+
+    背景: 数据集只有 YOLO 框, ``boxes_to_mask`` 得到的是整块矩形. 把矩形当像素真值
+    会让异常头学成"把整个框刷成异常": 边界糊、定位差, 而且框内的真实正常像素被当成
+    负样本压制, 训练目标和推理目标不一致. 实测这是 pixelAUROC 卡在 0.6~0.7 的主因.
+
+    这里用**无监督**的记忆库距离 (只由正常图建立, 与监督标签独立) 在框内保留距离最大
+    的 ``ratio`` 比例像素作为正样本, 框内其余像素标记为**忽略** (既不推高也不压低).
+
+    返回 ``(pos_mask, ignore_mask)``, 形状同 ``box_mask``.
+    """
+    ignore = torch.zeros_like(box_mask, dtype=torch.bool)
+    if ratio <= 0.0 or ratio >= 1.0:
+        return box_mask, ignore
+    d = distance.detach()
+    if d.shape[-2:] != box_mask.shape[-2:]:
+        d = F.interpolate(d, size=box_mask.shape[-2:], mode="bilinear", align_corners=False)
+    pos = torch.zeros_like(box_mask)
+    inside = box_mask > 0.5
+    for b in range(box_mask.shape[0]):
+        sel = inside[b, 0]
+        if not bool(sel.any()):
+            continue
+        vals = d[b, 0][sel]
+        k = min(vals.numel(), max(1, int(round(vals.numel() * ratio))))
+        thr = torch.topk(vals, k).values.min()
+        keep = sel & (d[b, 0] >= thr)
+        pos[b, 0] = keep.float()
+        ignore[b, 0] = sel & (~keep)
+    return pos, ignore
+
+
 def masked_bce(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """只在 mask>0.5 的区域计算 BCE."""
     loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
@@ -174,6 +209,8 @@ class FabricCriterion(nn.Module):
         self.supcon = SupConLoss(temperature=float(sup.get("temperature", 0.1)))
 
         self.compact_weight = float(loss_cfg.get("compact", {}).get("weight", 0.1))
+        # 框内伪标签修正: 用记忆库距离把矩形标签收缩成异常核心 (0 或 >=1 = 关闭)
+        self.ano_pseudo = float(loss_cfg.get("anomaly", {}).get("pseudo_ratio", 0.0))
         self.ignore_index = -100
 
     # ------------------------------------------------------------------ #
@@ -199,18 +236,29 @@ class FabricCriterion(nn.Module):
         if region.sum() < 1:
             region = torch.ones_like(cloth_mask)
 
+        ano_pos, ignore = defect_mask, None
+        memory_distance = outputs.get("memory_distance")
+        if 0.0 < self.ano_pseudo < 1.0 and memory_distance is not None:
+            ano_pos, ignore = refine_boxes_by_distance(defect_mask, memory_distance, self.ano_pseudo)
+
         focal = sigmoid_focal_loss(
             ano_logit,
-            defect_mask,
+            ano_pos,
             alpha=self.ano_alpha,
             gamma=self.ano_gamma,
             reduction="none",
         )
-        focal = (focal * region).sum() / region.sum().clamp_min(1.0)
-        dice = dice_loss(ano_logit * region, defect_mask * region)
+        weight = region if ignore is None else region * (~ignore).float()
+        focal = (focal * weight).sum() / weight.sum().clamp_min(1.0)
+        dice = dice_loss(ano_logit * region, ano_pos * region)
         loss_ano = self.ano_focal * focal + self.ano_dice * dice
         total = total + loss_ano
-        logs.update(anomaly=focal.item(), anomaly_dice=dice.item(), loss_ano=loss_ano.item())
+        logs.update(
+            anomaly=focal.item(),
+            anomaly_dice=dice.item(),
+            loss_ano=loss_ano.item(),
+            ano_pos_ratio=float((ano_pos * region).sum() / region.sum().clamp_min(1.0)),
+        )
 
         # ---------- 2. 布面 / 布边 ----------
         if "cloth_logit" in outputs and outputs["cloth_logit"] is not None:
@@ -231,10 +279,11 @@ class FabricCriterion(nn.Module):
             logs.update(cloth=loss_cloth.item(), edge=loss_edge.item(), loss_fabric=loss_fab.item())
 
         # ---------- 3. 疵点分类 (弱监督, 仅框内) ----------
+        class_logits = outputs["class_logits"]  # (B,C,h,w) 可能与异常图不同尺度
+        cls_hw = tuple(class_logits.shape[-2:])
         label_map = build_label_map(
-            targets["boxes"], (h, w), self.ignore_index, self.cls_shrink, device=device
+            targets["boxes"], cls_hw, self.ignore_index, self.cls_shrink, device=device
         )
-        class_logits = outputs["class_logits"]  # (B,C,h,w)
         loss_cls, acc = masked_ce(class_logits, label_map, self.ignore_index, self.cls_smoothing)
         if loss_cls is not None:
             total = total + self.cls_weight * loss_cls
@@ -243,7 +292,9 @@ class FabricCriterion(nn.Module):
         # ---------- 4. 区域嵌入的 SupCon ----------
         if self.supcon_weight > 0:
             region_emb, region_labels = pooled_region_embeddings(
-                outputs["embedding"], targets["boxes"], outputs["anomaly_score"].shape[-2:]
+                outputs["embedding"],
+                targets["boxes"],
+                tuple(outputs["embedding"].shape[-2:]),
             )
             loss_sc = self.supcon(region_emb, region_labels)
             if loss_sc.requires_grad:
@@ -254,7 +305,9 @@ class FabricCriterion(nn.Module):
         if memory is not None and memory.is_ready and self.compact_weight > 0:
             from .models.memory import compact_loss
 
-            loss_c = compact_loss(memory, outputs["embedding"] * region)
+            emb = outputs["embedding"]
+            region_emb = _resize_mask(region, tuple(emb.shape[-2:]), mode="area")
+            loss_c = compact_loss(memory, emb * region_emb)
             total = total + self.compact_weight * loss_c
             logs.update(compact=float(loss_c.detach()))
 

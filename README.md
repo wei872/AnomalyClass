@@ -424,11 +424,32 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 小疵点（断经、飞花）漏检 | 提高输入分辨率（`data.image_size` 640/768）；`loss.anomaly.alpha` 调高到 0.7–0.75；`eval.min_area_ratio` 调小 |
 | 整幅性缺陷（纬斜）漏检 | 用 `mobilenet_v3_large` 或 `efficientnet_b0`；提高 `neck.global_channels`、`neck.dilations` |
 | 正常图少量误报 | 提高 `eval.calib_sigma`（阈值更保守）；增大 `model.memory.capacity` 与训练集正常图数量 |
+| 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
 | 图像级 AUROC < 0.5 | 检查 `eval.topk_pixels`（小疵点用 128~256）；不要把 `topk_ratio` 设大 |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |
+
+### 8.1 分辨率瓶颈怎么判定（不重训也能判）
+
+```bash
+python tools/eval_scales.py --checkpoint runs/fabric19_fabricncd_s/best.pt --scales 0.5,0.65,0.8,1.0
+```
+
+同一个权重在不同输入尺度上跑一遍验证集，输出 `pixelAUROC / imageAUROC / 相对耗时` 表格：
+
+- `pixelAUROC` 随尺度明显上升（Δ > 0.05）→ 小疵点在 1/8 特征图上不足一格，值得提分辨率或改切块；
+- 基本平坦 → 分辨率不是瓶颈，继续加显存只会更慢，应回去调损失/增广/标注质量。
+
+### 8.2 两个已经做过 A/B、证明**无效**的方向（别再试）
+
+| 尝试 | 结果 | 结论 |
+|---|---|---|
+| 异常头改到 1/4 尺度（`heads.anomaly_stride: 4`） | pixelAUROC 0.62 → 0.40 | 多出来的只是纹理噪声；真正受限时应该整体提分辨率 |
+| 用记忆库距离把"整框"正样本收缩成异常核心（`loss.anomaly.pseudo_ratio`） | 0.62 → 0.45 | 记忆库还不准时，收缩会把真实疵点像素一起丢掉 |
+
+两者的实现都保留在代码里（默认关闭），想在自己的数据上复验可以打开对比。
 
 ---
 

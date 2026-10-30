@@ -92,13 +92,22 @@ model:
     num_classes: 19
     proto_temperature: 0.1
     anomaly_mid: 32
+    # 异常图尺度: 8 = 标准 (1/8 特征); 4 = 把异常头挂到 1/4 (融合特征上采样 + 纹理).
+    # 本地 A/B 实测 4 更差 (pAUROC 0.62 -> 0.40): 多出来的只是纹理噪声, 分辨率不足
+    # 时请优先用 tools/eval_scales.py 判断要不要整体提分辨率, 而不是只换这一层.
+    anomaly_stride: 8
   memory:
     enabled: true
     capacity: 2048
     score_weight: 0.35
     distance_scale: 0.08      # 正常 patch 到记忆库的典型余弦距离, 用于归一化
   loss:
-    anomaly: {focal_weight: 1.0, dice_weight: 1.0, gamma: 2.0, alpha: 0.65}
+    # pseudo_ratio: 框是弱标注(只框住疵点), 直接把整框当像素真值会让异常头"刷满矩形".
+    # 用记忆库距离在框内保留 top-k 比例像素作正样本, 其余框内像素忽略; 0 或 >=1 = 关闭.
+    # pseudo_ratio: 用记忆库距离把"整框"正样本收缩成异常核心. 本地 A/B (小疵点+大框)
+    # 实测反而掉点 (pAUROC 0.62 -> 0.45): 记忆库还不准时, 收缩会把真实疵点像素也丢掉.
+    # 默认关闭; 只有当框显著大于疵点、且记忆库已经很稳时才建议开到 0.3 试试.
+    anomaly: {focal_weight: 1.0, dice_weight: 1.0, gamma: 2.0, alpha: 0.65, pseudo_ratio: 0.0}
     fabric: {bce_weight: 0.5, dice_weight: 0.5, edge_weight: 0.5}
     cls: {weight: 1.0, label_smoothing: 0.05, box_shrink: 0.9}
     supcon: {weight: 0.5, temperature: 0.1}

@@ -135,3 +135,21 @@ def test_memory_score_does_not_saturate():
     assert float(out["memory_distance"].max()) > m.memory_distance_scale
     assert float(out["memory_score"].max()) < 1.0
     assert float(out["memory_score"].min()) >= 0.0
+
+
+def test_refine_boxes_by_distance_keeps_top_pixels():
+    from fabric_ncd.losses import refine_boxes_by_distance
+
+    boxes = torch.zeros(1, 1, 8, 8)
+    boxes[0, 0, 2:6, 2:6] = 1.0           # 4x4 = 16 个框内像素
+    dist = torch.zeros(1, 1, 8, 8)
+    dist[0, 0, 3:5, 3:5] = 1.0            # 只有核心 4 个像素真的异常
+    pos, ignore = refine_boxes_by_distance(boxes, dist, ratio=0.25)
+    assert pos.sum().item() == 4                      # 16 * 0.25
+    assert pos[0, 0, 3:5, 3:5].min().item() == 1.0    # 选中的正是核心
+    assert ignore.sum().item() == 12                  # 其余框内像素忽略, 不当负样本
+    assert pos[0, 0, 0:2].sum().item() == 0           # 框外不参与
+
+    # ratio 关闭时退回整框
+    pos2, ignore2 = refine_boxes_by_distance(boxes, dist, ratio=0.0)
+    assert torch.equal(pos2, boxes) and ignore2.sum().item() == 0

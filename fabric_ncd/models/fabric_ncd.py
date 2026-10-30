@@ -124,6 +124,14 @@ class FabricNCD(nn.Module):
         head_cfg = model_cfg.get("heads", {})
         embed_dim = int(head_cfg.get("embed_dim", 64))
         self.anomaly_head = AnomalyHead(c_neck, mid=int(head_cfg.get("anomaly_mid", 32)))
+        # 疵点很小时 1/8 的异常图只有 1~2 格, 无从定位 (实测 pixelAUROC 卡在 0.5 附近).
+        # anomaly_stride=4 把异常头挂到 1/4 的纹理特征上, 用一点点算力换回小疵点分辨率.
+        self.anomaly_stride = int(head_cfg.get("anomaly_stride", 8))
+        self.anomaly_head4 = (
+            AnomalyHead(c_neck + tex_channels, mid=int(head_cfg.get("anomaly_mid", 32)))
+            if self.anomaly_stride == 4
+            else None
+        )
         self.embed_head = EmbeddingHead(c_neck, dim=embed_dim)
         num_classes = int(head_cfg.get("num_classes", 19))
         self.classifier = PrototypeClassifier(
@@ -201,7 +209,14 @@ class FabricNCD(nn.Module):
         if self.fabric_enabled:
             fused = self.geography(cloth_prob, fused)
 
-        anomaly_logit = self.anomaly_head(fused)
+        if self.anomaly_head4 is not None:
+            # 1/4 尺度: 融合特征(含全局上下文)上采样 + 原始纹理细节.
+            # 只用 p3+tex 会丢掉全局上下文, 实测反而更差, 所以这里保留 fused.
+            size4 = tex.shape[-2:]
+            fused_up4 = F.interpolate(fused, size=size4, mode="bilinear", align_corners=False)
+            anomaly_logit = self.anomaly_head4(torch.cat([fused_up4, tex], dim=1))
+        else:
+            anomaly_logit = self.anomaly_head(fused)
         emb = self.embed_head(fused)
         class_logits = self.classifier(emb)
 
@@ -216,6 +231,10 @@ class FabricNCD(nn.Module):
             # 原来的 clamp(d/scale) 会让距离超过 scale 的正常像素全部堆在 1.0,
             # 于是正常图的 999 分位也变成 1.0, 阈值退化成"不可达", 检出率恒为 0.
             memory_score = memory_distance / (memory_distance + scale)
+            if memory_score.shape[-2:] != anomaly_logit.shape[-2:]:
+                memory_score = F.interpolate(
+                    memory_score, size=anomaly_logit.shape[-2:], mode="bilinear", align_corners=False
+                )
             anomaly_score = (1.0 - self.memory_weight) * learned_score + self.memory_weight * memory_score
         else:
             anomaly_score = learned_score
