@@ -79,10 +79,14 @@ class PrototypeClassifier(nn.Module):
         self.num_classes = num_classes
 
     def forward(self, emb: torch.Tensor) -> torch.Tensor:
-        """emb: (B,dim,C,H,W) 或 (B,dim) -> logits (B,C,*)"""
+        """emb: (B,dim,H,W) 或 (B,dim) -> logits (B,C,*)
+
+        特征必须**先 L2 归一化**: 原型分类器是余弦相似度, 不归一化时 logit 的量级随
+        ‖emb‖ 漂移 (训练初期 ‖emb‖ 会一直涨), 等于温度在乱变, 分类头收敛很慢.
+        """
         proto = F.normalize(self.prototypes, dim=1)
+        emb = F.normalize(emb, dim=1)
         if emb.dim() == 4:
-            b, d, h, w = emb.shape
             logits = torch.einsum("bdhw,cd->bchw", emb, proto) / self.temperature
             return logits
         return emb @ proto.t() / self.temperature

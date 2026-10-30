@@ -610,6 +610,7 @@ class Trainer:
                     format_seconds(timer.elapsed),
                 )
 
+            self._log_cls_progress(epoch, train_logs)
             record = {"epoch": epoch + 1, **train_logs, **metrics, "lr": self.optimizer.param_groups[0]["lr"]}
             self.history.append(record)
             self._write_history(record)
@@ -648,9 +649,36 @@ class Trainer:
         )
 
     # ------------------------------------------------------------------ #
+    def _log_cls_progress(self, epoch: int, train_logs: Dict[str, float]) -> None:
+        """把分类头单独说清楚: 交叉熵 vs 均匀基线 ln(C), 以及框内像素准确率.
+
+        只有被框覆盖的样本才有 cls 梯度, 所以准确率只在有标注的 batch 上统计.
+        """
+        if "cls" not in train_logs:
+            return
+        proto = getattr(getattr(self.model, "classifier", None), "prototypes", None)
+        if proto is None:
+            return
+        num_classes = int(proto.shape[0])
+        baseline = math.log(max(2, num_classes))
+        acc = train_logs.get("cls_acc")
+        acc_text = "%.3f" % acc if acc is not None else "-"
+        tail = ""
+        if epoch + 1 <= int(self.train_cfg.get("warmup_epochs", 0)):
+            tail = " | 仍在 warmup, lr 未到峰值"
+        self.logger.info(
+            "  分类头 | cls %.3f (均匀基线 ln%d=%.3f, %s) | 框内准确率 %s%s",
+            float(train_logs["cls"]),
+            num_classes,
+            baseline,
+            "已低于基线" if float(train_logs["cls"]) < baseline else "仍高于基线",
+            acc_text,
+            tail,
+        )
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
-        meters = {k: AverageMeter() for k in ("loss_total", "anomaly", "cls", "supcon", "cloth", "edge")}
+        meters = {k: AverageMeter() for k in ("loss_total", "anomaly", "cls", "cls_acc", "supcon", "cloth", "edge")}
         timer = Timer()
         total = max(1, len(self.train_loader))
 
@@ -668,6 +696,7 @@ class Trainer:
                     loss, logs = self.criterion(outputs, targets, memory=self.model.memory)
 
                 self.optimizer.zero_grad(set_to_none=True)
+                scale_before = self.scaler.get_scale() if (self.scaler is not None and self.amp) else None
                 if self.scaler is not None and self.amp:
                     self.scaler.scale(loss).backward()
                     if float(self.train_cfg.get("grad_clip", 5.0)) > 0:
@@ -682,7 +711,10 @@ class Trainer:
                     self.optimizer.step()
             except torch.cuda.OutOfMemoryError:
                 raise self._oom_error() from None
-            self.scheduler.step()
+            # AMP: scaler 遇到 inf/nan 会跳过这一步的 optimizer.step(), 此时不能推进 lr
+            # (否则会报 "Detected call of lr_scheduler.step() before optimizer.step()")
+            if scale_before is None or self.scaler.get_scale() >= scale_before:
+                self.scheduler.step()
             self.global_step += 1
             if self.ema is not None:
                 self.ema.update(self.model)
@@ -694,13 +726,15 @@ class Trainer:
 
             if (step + 1) % int(self.train_cfg.get("log_interval", 10)) == 0 or step == total - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
+                acc_meter = meters["cls_acc"]
                 self.logger.info(
-                    "  iter %3d/%3d | loss %.4f (ano %.4f cls %.4f supcon %.4f) | lr %.2e | %.1fs",
+                    "  iter %3d/%3d | loss %.4f (ano %.4f cls %.4f acc %s supcon %.4f) | lr %.2e | %.1fs",
                     step + 1,
                     total,
                     meters["loss_total"].avg,
                     meters["anomaly"].avg,
                     meters["cls"].avg,
+                    "%.3f" % acc_meter.avg if acc_meter.count else "  -  ",
                     meters["supcon"].avg,
                     lr,
                     timer.elapsed,
@@ -813,7 +847,7 @@ class Trainer:
         path = self.output_dir / "history.csv"
         write_header = not path.exists()
         keys = [
-            "epoch", "loss_total", "anomaly", "cls", "supcon", "pixel_auroc", "pro",
+            "epoch", "loss_total", "anomaly", "cls", "cls_acc", "supcon", "pixel_auroc", "pro",
             "image_auroc", "map50", "acc", "f1_macro", "lr",
         ]
         with open(path, "a", newline="", encoding="utf-8") as f:
