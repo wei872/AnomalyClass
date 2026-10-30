@@ -189,6 +189,27 @@ python tools/train.py --no-pretrained              # 离线环境
 3. 每轮验证并记录像素 AUROC / PRO / F1、图像 AUROC / AP、mAP@0.5、分类 Acc / F1；
 4. 按综合分保存 `best.pt`，支持 EMA、早停、AMP、断点续训。
 
+### 6.2.1 推荐预设
+
+```bash
+# ① 默认（平衡）: 512 输入, MobileNetV3-Small, 1.11 M 参数 / 0.62 GMACs
+python tools/train.py --config configs/fabric19.yaml --set data.root=/data/fabric
+
+# ② 高精度: 768 输入 + MobileNetV3-Large（显存约 7–9 GB, batch 4）
+python tools/train.py --config configs/fabric19.yaml \
+    --set data.image_size=[768,768] --set data.batch_size=4 \
+    --set model.backbone.arch=mobilenet_v3_large --set model.heads.embed_dim=128
+
+# ③ 极速/端侧: 384 输入, 纯 PyTorch 主干（可完全离线, 便于与 ONNX 对齐）
+python tools/train.py --config configs/fabric19.yaml \
+    --set data.image_size=[384,384] --set model.backbone.arch=lite \
+    --set model.backbone.pretrained=false
+
+# ④ 只跑异常检测（先不做 19 类分类，用少量框快速验证数据质量）
+python tools/train.py --config configs/fabric19.yaml \
+    --set model.loss.cls.weight=0.0 --set model.loss.supcon.weight=0.0
+```
+
 ### 6.3 评估
 
 ```bash

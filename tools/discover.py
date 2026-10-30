@@ -85,6 +85,11 @@ def main() -> int:
         image = Image.open(path).convert("RGB")
         result = predictor.predict(image)
         maps = result["maps"]
+        if "embedding" not in maps:
+            raise RuntimeError(
+                "新类发现需要区域嵌入, 请关闭切块推理 (FabricPredictor(tile=False)); "
+                "切块模式目前只返回异常图与类别概率."
+            )
         thr = float(result["image"].get("threshold", 0.5))
         feats = _region_features(maps, result["regions"], thr)
         img_arr = np.asarray(image)
