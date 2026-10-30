@@ -1,12 +1,18 @@
 # =============================================================================
 # 布匹缺陷数据集 (19 类). 类别名与 dataset/dataset.yaml 完全一致。
-# TODO: 把下面四个路径改成你机器上的实际路径 (原 yaml 中是 Windows 路径:
-#   D:/tyhn/yolo/dataset/source5_augmented/... )
-# 推荐目录结构:
+#
+# 注意: 下面仍是原来的 Windows 路径。在 Linux 上不需要改这里, 用工具重映射即可:
+#   python tools/prepare_dataset.py --root /data/fabric/source5_augmenteds
+#   python tools/train.py --config configs/fabric19.yaml --set data.root=/data/fabric/source5_augmenteds
+#
+# 目录结构:
 #   DATASET_ROOT/
 #     images/train/  images/val/            <- YOLO 图片
-#     labels/train/  labels/val/            <- YOLO .txt (cls cx cy w h, 归一化)
-#     normal/images/train/  normal/images/val/  <- 纯正常图, 无标签
+#     labels/train/  labels/val/            <- YOLO .txt (cls cx cy w h, 归一化; 也支持多边形)
+#     normal/images/train/  normal/images/val/  <- 纯正常图, 无标签 (强烈建议)
+#
+# 可选: 若有布面/背景真实掩码, 在 configs/fabric19.yaml 里设 data.mask_dir,
+#       或先运行 python tools/prepare_dataset.py --root <root> --export-masks 生成。
 # =============================================================================
 path: D:/tyhn/yolo/dataset/source5_augmenteds/
 train: D:/tyhn/yolo/dataset/source5_augmenteds/images/train

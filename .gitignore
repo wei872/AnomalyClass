@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 训练产物
+runs/
+outputs/
+wandb/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+
+# 演示 / 本地数据
+data/demo_dataset/
+data/demo*/
+cloth_masks/
+dataset/*.resolved.yaml
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

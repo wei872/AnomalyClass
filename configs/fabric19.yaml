@@ -1,0 +1,111 @@
+# =============================================================================
+# FabricNCD 训练配置 — 布匹 19 类疵点
+#
+# 数据路径沿用 dataset/fabric19.yaml. 如果该 yaml 里仍是 Windows 绝对路径
+# (D:/tyhn/...), 把下面 data.root 设成本机数据集根目录即可自动重映射:
+#   data.root: /data/fabric/source5_augmenteds
+# =============================================================================
+experiment:
+  name: fabric19_fabricncd_s
+  output_dir: runs/fabric19_fabricncd_s
+  seed: 42
+  device: auto          # auto | cuda | cpu | mps
+  amp: true             # 仅 CUDA 生效
+
+data:
+  dataset_yaml: dataset/fabric19.yaml
+  root: null            # 覆盖/重映射数据集根目录
+  image_size: [512, 512]
+  batch_size: 8
+  eval_batch_size: 4
+  num_workers: 4
+  normal_ratio: 0.4     # 每个 batch 中正常图比例 (正常图越多, 记忆库越稳)
+  mask_dir: null        # 可选: 真实布面/背景掩码目录 (文件名与图片一致)
+  limit_train: null
+  limit_val: null
+
+  augment:
+    scale: [0.5, 1.0]       # 随机缩放裁剪
+    hflip: 0.5
+    vflip: 0.5
+    rot90: 0.25
+    rotate: 3.0             # 小角度旋转 (度)
+    color_jitter: 0.3
+    width_margin: 0.3       # 布幅增广: 最大边距比例
+    weave_norm: true        # 织造尺度归一化 (跨布种泛化关键)
+    target_period: 8.0
+    synth_prob: 0.5         # 合成疵点概率
+    synth_types: [scratch, stain, cutpaste, weave_shift, missing_yarn, foreign_fiber]
+    synth_max_ops: 2
+
+model:
+  backbone:
+    arch: mobilenet_v3_small   # 轻量首选; 精度优先可换 mobilenet_v3_large
+    pretrained: true
+    freeze_stages: 1           # 冻结浅层, 降低小数据过拟合
+  texture:
+    channels: 32
+    orientations: [0, 45, 90, 135]
+    wavelengths: [4.0, 8.0]
+    kernel_size: 15
+    use_imaginary: true        # 相位响应 -> 感知经纬错位
+    use_weave_norm: true
+  neck:
+    channels: 96
+    global_channels: 96
+    dilations: [2, 4]
+    attention_heads: 4
+    use_attention: true
+  fabric_mask:
+    enabled: true
+    pool_sizes: [3, 7, 15, 31, 63]
+    use_xy: false              # 用 "到布边距离" 而非绝对坐标
+  heads:
+    embed_dim: 64
+    num_classes: 19
+    proto_temperature: 0.1
+    anomaly_mid: 32
+  memory:
+    enabled: true
+    capacity: 2048
+    score_weight: 0.35
+    distance_scale: 0.08      # 正常 patch 到记忆库的典型余弦距离, 用于归一化
+  loss:
+    anomaly: {focal_weight: 1.0, dice_weight: 1.0, gamma: 2.0, alpha: 0.65}
+    fabric: {bce_weight: 0.5, dice_weight: 0.5, edge_weight: 0.5}
+    cls: {weight: 1.0, label_smoothing: 0.05, box_shrink: 0.9}
+    supcon: {weight: 0.5, temperature: 0.1}
+    compact: {weight: 0.1}
+
+train:
+  epochs: 60
+  warmup_epochs: 3
+  lr: 0.0005
+  backbone_lr: 0.0001
+  weight_decay: 0.05
+  grad_clip: 5.0
+  ema: 0.999
+  val_interval: 1
+  log_interval: 10
+  early_stop_patience: 15
+  memory_warmup_batches: 50
+  memory_refresh_interval: 5
+  score_weights: {pixel_auroc: 0.35, pro: 0.15, image_auroc: 0.20, map50: 0.10, map50_agnostic: 0.10, f1_macro: 0.10}
+
+eval:
+  threshold: null        # null = 自适应阈值
+  threshold_sigma: 3.0
+  min_area_ratio: 0.0004
+  merge_strategy: area_weighted   # area_weighted | top1 | max
+  calib_sigma: 6.0                # 阈值 = max(正常集999分位, 均值+kσ)
+  peak_ratio: 0.35                # 区域主元素筛选: 保留峰值 >= thr+ratio*(max-thr)
+  open_radius: 1
+  bbox_refine_ratio: 0.7          # 用高分核心收缩区域框
+  min_cls_score: 0.0
+  topk_ratio: 0.01
+
+infer:
+  tile: false
+  tile_size: 512
+  tile_overlap: 128
+  image_score_threshold: 0.5

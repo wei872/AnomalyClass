@@ -1,0 +1,13 @@
+# 核心依赖 (CPU 可运行)
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+pillow>=9.1
+PyYAML>=6.0
+
+# 可选: ONNX 导出与数值校验
+# onnx>=1.14
+# onnxruntime>=1.16
+
+# 可选: 开发/测试
+# pytest>=7.0

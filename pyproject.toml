@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fabric-ncd"
+version = "0.1.0"
+description = "轻量化布匹疵点检测 / 多类分类 / 新类发现 (AnomalyNCD 思想的布匹落地实现)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy>=1.24",
+    "pillow>=9.1",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+export = ["onnx>=1.14", "onnxruntime>=1.16"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["fabric_ncd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
