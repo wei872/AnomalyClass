@@ -74,9 +74,21 @@ def latency(model: nn.Module, input_size: Tuple[int, int], device: torch.device,
             "p95_ms": float(np.percentile(times_arr, 95)), "fps": float(1000.0 / times_arr.mean())}
 
 
+def _parse_hw(text) -> Tuple[int, int]:
+    """'512' -> (512, 512); '832x1600' -> (832, 1600) 即 (H, W)."""
+    text = str(text).lower()
+    for sep in ("x", "*", ","):
+        if sep in text:
+            a, b = text.split(sep)[:2]
+            return int(a), int(b)
+    value = int(text)
+    return value, value
+
+
 def main() -> int:
     parser = base_parser("FabricNCD 轻量化基准")
-    parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--size", default="512",
+                        help="输入尺寸: 整数 (正方形) 或 HxW, 如 832x1600")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -84,18 +96,19 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = load_config(args.config, args.overrides, args.root)
-    cfg.setdefault("data", {})["image_size"] = [args.size, args.size]
+    size_hw = _parse_hw(args.size)
+    cfg.setdefault("data", {})["image_size"] = [size_hw[0], size_hw[1]]
     device = resolve_device(args.device)
     model = FabricNCD(cfg).to(device).eval()
 
     total_params = sum(p.numel() for p in model.parameters())
     backbone_params = sum(p.numel() for p in model.backbone.parameters())
-    macs = count_macs(model, (args.size, args.size))
-    lat = latency(model, (args.size, args.size), device, args.iters)
+    macs = count_macs(model, size_hw)
+    lat = latency(model, size_hw, device, args.iters)
 
     report = {
         "device": str(device),
-        "input_size": [args.size, args.size],
+        "input_size": [size_hw[0], size_hw[1]],
         "params_M": round(total_params / 1e6, 2),
         "backbone_params_M": round(backbone_params / 1e6, 2),
         "macs_G": round(macs, 3),

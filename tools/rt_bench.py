@@ -46,7 +46,7 @@ def _parser():
     parser.add_argument("--frames", type=int, default=100, help="总帧数")
     parser.add_argument("--warmup", type=int, default=10, help="预热帧数 (不计入统计)")
     parser.add_argument("--mode", default="pipeline", choices=["pipeline", "sequential"])
-    parser.add_argument("--size", default=None, help="覆盖输入尺寸, 形如 1024x1728 或 768")
+    parser.add_argument("--size", default=None, help="覆盖输入尺寸, 形如 832x1600 或 768 (HxW)")
     parser.add_argument("--out-stride", type=int, default=None, help="分数图下采样倍数 (默认取配置)")
     parser.add_argument("--memory-stride", type=int, default=None, help="记忆库查询池化倍数")
     parser.add_argument("--weave-interval", type=int, default=None, help="每 N 帧重估一次织造周期")

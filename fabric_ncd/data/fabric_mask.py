@@ -454,7 +454,7 @@ def _clean_mask(candidate: np.ndarray, h: int, w: int) -> np.ndarray:
     """在**目标分辨率**上做形态学清理与连通块过滤.
 
     低分辨率估计只在低分辨率上做"打分 + 阈值", 几何清理必须回到输出分辨率:
-    否则 512 宽上半径为 1 的开运算, 换算到 1440 宽就是 3px 的边界偏差,
+    否则 512 宽上半径为 1 的开运算, 换算到 1600 宽就是 3px 的边界偏差,
     窄布条上会直接吃掉 IoU.
     """
     mask = np.ascontiguousarray(candidate, dtype=np.uint8)

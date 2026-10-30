@@ -70,7 +70,7 @@ def estimate_period(
     """返回 (period_x, period_y, confidence), 单位为输入图像像素.
 
     保持长宽比、只做整数倍池化: 两个方向分别用各自的真实尺寸把谱峰换算成周期
-    (``period = dim / k``), 因此 1440x2440 这类非正方形图像不会被压扁失真,
+    (``period = dim / k``), 因此 1600x846 这类非正方形图像不会被压扁失真,
     高分辨率下也不会因为过度抽取而丢失细密经纬.
     """
     gray = to_gray(image)

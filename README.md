@@ -192,16 +192,16 @@ python tools/prepare_dataset.py --root D:/tyhn/yolo/dataset/source5_augmenteds -
 # 然后在 configs/fabric19.yaml 里设 data.mask_dir: D:/tyhn/yolo/dataset/source5_augmenteds/cloth_masks
 ```
 
-布面掩码估计的实测（1440×2440，单进程 CPU）：
+布面掩码估计的实测（1600×846 原图，单进程 CPU）：
 
 | 场景 | `work_size="auto"` 落点 | auto 耗时 | 与全分辨率 IoU |
 |---|---|---|---|
-| 整幅是布，经纬 6 px | 1220 | 0.32 s | 1.000 |
-| 布幅两侧各 400 px 背景 | 1220 | 0.32 s | 0.998 |
-| 布幅两侧各 400 px 背景，经纬 20 px | 512 | 0.36 s | 0.998 |
-| 窄布条（布只占画面 16%） | 1220 | 0.28 s | 1.000 |
-| 极细经纬 3 px（不能降采样） | 不降采样 | 0.97 s | 1.000 |
-| 手滑 `--mask-size 512`（纹理被平均掉） | 512 | 0.29 s | 0.994 |
+| 整幅是布，经纬 6 px | 800 | 0.15 s | 1.000 |
+| 布幅两侧各 300 px 背景 | 800 | 0.17 s | 0.998 |
+| 窄布条（布只占画面 58%） | 800 | 0.15 s | 0.998 |
+| 经纬 20 px | 512 | 0.10 s | 1.000 |
+| 极细经纬 3 px（不能降采样） | 不降采样 | 0.32 s | 1.000 |
+| 手滑 `--mask-size 512`（纹理被平均掉） | 512 | 0.09 s | 0.99+ |
 
 `auto` 不是简单地"缩到 512"：它先在**原始分辨率**上找到布面纹理最旺的位置量出经纬周期，
 据此保证缩放后周期仍 ≥ 3 px；量不准就逐次放大 `work_size` 重试，实在量不到就退回全分辨率。
@@ -230,60 +230,60 @@ python tools/train.py --no-pretrained              # 离线环境
 
 ### 6.2.1 推荐预设
 
-> 下面按"原图 1440×2440（宽 2440）"给参数。分辨率一律**保持长宽比**、宽高各为 32 的倍数。
+> 你的原图是 **1600(宽) × 846(高)**，长宽比 1.89:1。`data.image_size` 的约定是 **[高, 宽]**。
+> 默认 `image_size: auto` 会读你数据的真实尺寸算出 `[832, 1600]`（短边缩到 1024 为止、**不放大**），
+> 因此不会再出现"宽高写反"。想换档位只调 `data.short_side`。
 
 ```bash
-# ① 默认（推荐起步）: 整图送进网络, 短边 1024, 4.17 GMACs / 1.11 M 参数
-#    CPU 约 0.75 s/张 (2 核), GPU 约 25–30 ms/张; 训练显存约 1.4 GB/张 (bs=4 约 5.5 GB)
+# ① 默认（推荐起步）: [832, 1600], 3.14 GMACs / 1.11 M 参数, 原图分辨率不丢细节
+#    本机 2 核 CPU 0.68 s/张; 1660 上预计 19–23 ms/张; 训练显存约 1.05 GB/张 (bs=4 约 4.2 GB)
 python tools/train.py --config configs/fabric19.yaml --root D:/tyhn/yolo/dataset/source5_augmenteds
 
-# ② 轻量/低显存: 短边 768, 2.32 GMACs, CPU 约 0.4 s/张
+# ② 轻量/低显存: 短边 640 -> [640, 1216], 1.84 GMACs, CPU 约 0.35 s/张
 python tools/train.py --config configs/fabric19.yaml \
-    --set data.image_size=[768,1280] --set data.batch_size=8
+    --set data.short_side=640 --set data.batch_size=8
 
-# ③ 高精度: 短边 1280, 6.57 GMACs, CPU 约 1.4 s/张 (bs 降到 2)
+# ③ 超采样（小疵点特别细时才值得）: 短边 1024 -> [1024, 1952], 算力 ×1.5, bs 降到 2
 python tools/train.py --config configs/fabric19.yaml \
-    --set data.image_size=[1280,2176] --set data.batch_size=2 \
-    --set model.backbone.arch=mobilenet_v3_large --set model.heads.embed_dim=128
+    --set data.max_scale=1.25 --set data.batch_size=2
 
 # ④ 只跑异常检测（先不做 19 类分类，用少量框快速验证数据质量）
 python tools/train.py --config configs/fabric19.yaml \
     --set model.loss.cls.weight=0.0 --set model.loss.supcon.weight=0.0
 ```
 
-### 6.2.2 输入分辨率怎么定（1440×2440）
+### 6.2.2 输入分辨率怎么定（1600×846）
 
-**结论：不要用 1024×1024 / 1280×1280 这种正方形，用 1024×1728 / 1280×2176。**
+**结论：保持 1.89:1，别用正方形，也别把宽高写反。** 默认 `[832, 1600]` 就是原图分辨率（846→832 取 32 的倍数）。
 
-原图长宽比 1440:2440 = 1:1.69。正方形输入会把经纬方向拉伸成 1:1：经纱间距和纬纱间距在像素上变得一样，
-`texture.py` 里的 FFT 周期估计和 Gabor 分支就失去了"经纬各向异性"这个最有效的线索，
-同时 42% 的像素被浪费在把图压扁上。等比例缩放则完全没有这个问题。
+正方形输入会把经纬方向拉成 1:1：经纱间距和纬纱间距在像素上变得一样，`texture.py` 的 FFT 周期估计
+和 Gabor 分支就失去了"经纬各向异性"这条最有效的线索，同时还浪费 40% 的像素。
 
-| 输入 (H×W) | 缩放 | GMACs | CPU 延迟 | 训练显存/张 | 适用 |
+| 输入 (H×W) | 短边 | GMACs | CPU 延迟(2核) | 训练显存/张 | 适用 |
 |---|---|---|---|---|---|
-| [512, 864] | 0.354 | 1.04 | 0.17 s | 0.35 GB | 只有 CPU、快速验证 |
-| [768, 1280] | 0.525 | 2.32 | 0.41 s | 0.78 GB | 轻量、低显存 |
-| **[1024, 1728]** | **0.711** | **4.17** | **0.75 s** | **1.40 GB** | **默认** |
-| [1280, 2176] | 0.889 | 6.57 | 1.20 s | 2.20 GB | 小疵点/高精度 |
-| [1440, 2464] | 1.000 | 8.36 | 1.80 s | 2.80 GB | 不缩放（右侧补 24 px 到 32 倍数） |
+| [416, 800] | 416 | 0.79 | 0.15 s | 0.26 GB | 只有 CPU、冒烟 |
+| [512, 960] | 512 | 1.16 | 0.27 s | 0.41 GB | 低配 |
+| [640, 1216] | 640 | 1.84 | 0.35 s | 0.62 GB | 轻量 |
+| **[832, 1600]** | **832** | **3.14** | **0.68 s** | **1.05 GB** | **默认 = 原图** |
+| [1024, 1952] | 1024 | 4.75 | 1.03 s | 1.60 GB | 超采样（`max_scale: 1.25`） |
 
-（以上为本机 CPU（2 核）实测 + 卷积乘加解析统计；显存含反向，GPU 上与 batch 近似线性。）
+（本机 CPU（2 核）实测 + 卷积乘加解析统计；显存含反向，GPU 上与 batch 近似线性。）
 
-**怎么选**：小疵点的可检出性由"缩放后还剩几个像素"决定，而织造纹理的可建模性由"缩放后的经纬周期"决定。
+**怎么选**：小疵点的可检出性由"缩放后还剩几个像素"决定，织造纹理的可建模性由"缩放后经纬周期"决定。
 
 ```bash
 # 先量一下你的布在原始分辨率下的经纬周期（像素）
-python tools/resolution.py --source /data/fabric/normal --native 1440x2440
+python tools/resolution.py --source D:/tyhn/yolo/dataset/source5_augmenteds/normal/images/train --native 846x1600
 ```
 
-该工具会给出建议：**缩放后周期 ≥ 4 px** 才能让 Gabor/FFT 稳定工作，**周期 ≥ 3 px** 时网络还能靠卷积纹理特征兜底；
-如果 1024×1728 下周期已经 < 3 px（说明布面很细密、原图里经纬只有 3–4 个像素），
-就把输入提到 [1280, 2176] 或干脆不缩放，并且把 `batch_size` 相应降到 2。
+该工具要求**缩放后周期 ≥ 4 px** 才能让 Gabor/FFT 稳定工作，周期 ≥ 3 px 时还能靠卷积纹理特征兜底。
+846 的原图短边本来就不大，所以默认已经是"不缩放"；只有当原图经纬周期 < 3 px（3–4 px 的极细密布）时
+才需要 `--set data.max_scale=1.25` 超采样，代价是算力 ×1.5。
 
 **整图输入 vs 切块**：本仓库默认整图缩放（`eval.tile: false`），一次前向出全图结果，不需要拼接。
 只有在"既要最高细节、又上不去分辨率"的情况下才需要切块：把 `data.augment.crop_mode` 设为 `native`
-（按原像素尺度裁块训练），推理时 `--tile`（切块尺寸默认等于输入尺寸，即 1:1 不缩放）。
-这条路径精度上限更高，但切块边界处需要重叠融合，部署更复杂，因此不作为默认。
+（按原像素尺度裁块训练），推理时 `--tile`。这条路径精度上限更高，但切块边界要重叠融合，部署更复杂，
+因此不作为默认。
 
 ### 6.3 评估
 
@@ -297,8 +297,8 @@ python tools/evaluate.py --ckpt best.pt --save-preds preds.json   # 逐图区域
 ```bash
 python tools/infer.py --ckpt best.pt --source a.jpg
 python tools/infer.py --ckpt best.pt --source /data/images --out outputs/pred
-python tools/infer.py --ckpt best.pt --source scan_1440x2440.png          # 默认整图, 一次前向 0.75 s (CPU)
-python tools/infer.py --ckpt best.pt --source huge_4096x1024.png --tile --tile-size 1024x1728 --tile-overlap 128
+python tools/infer.py --ckpt best.pt --source scan_1600x846.png            # 默认整图, 一次前向 0.68 s (2 核 CPU)
+python tools/infer.py --ckpt best.pt --source huge_4096x1024.png --tile --tile-size 832x1600 --tile-overlap 128
 ```
 
 输出 `*_pred.png`（热力图 + 框 + 类别 + 分数）与 `results.json`（每张图的区域、类别、到布边距离等）。
@@ -379,7 +379,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 整幅性缺陷（纬斜）漏检 | 用 `mobilenet_v3_large` 或 `efficientnet_b0`；提高 `neck.global_channels`、`neck.dilations` |
 | 正常图少量误报 | 提高 `eval.calib_sigma`（阈值更保守）；增大 `model.memory.capacity` 与训练集正常图数量 |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
-| CPU 端太慢 | 用 `--set data.image_size=[320,320]`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
+| CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |
 
 ---

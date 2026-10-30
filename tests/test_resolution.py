@@ -85,3 +85,97 @@ def test_evaluate_tiled_smoke(tmp_path):
     metrics = evaluate_tiled(model, cfg, torch.device("cpu"), split="val")
     assert metrics["num_samples"] == 5  # 3 张疵点 + 2 张正常
     assert np.isfinite(metrics.get("pixel_auroc", 0.5))
+
+
+def _portrait_dataset(root):
+    """2440x1440 的缩比版: 高 240, 宽 160 (竖图)."""
+    return make_dataset(root, n_train=2, n_val=1, n_normal=1, size=(240, 160))
+
+
+def _landscape_dataset(root):
+    return make_dataset(root, n_train=2, n_val=1, n_normal=1, size=(160, 240))
+
+
+def test_image_size_auto_keeps_portrait(tmp_path):
+    """input: (H, W) 顺序不能搞反 —— 竖图必须还给出竖的 (H, W), 且长宽比一致."""
+    from fabric_ncd.data.yolo import build_datasets, resolve_image_size
+
+    root = _portrait_dataset(tmp_path / "p")
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"dataset_yaml": str(root / "dataset.yaml"), "image_size": "auto", "short_side": 64})
+    h, w = resolve_image_size(cfg)
+    assert h > w, (h, w)  # 竖图: 高 > 宽
+    assert min(h, w) == 64
+    assert h % 32 == 0 and w % 32 == 0
+    assert abs((h / w) - (240 / 160)) < 0.06
+    # 解析后要写回配置, 下游 (模型/eval/infer) 才能看到具体数字
+    assert cfg["data"]["image_size"] == [h, w]
+    assert cfg["data"]["native_size"] == [240, 160]
+    build_datasets(cfg)  # 端到端构建不报错
+
+
+def test_image_size_auto_keeps_landscape(tmp_path):
+    from fabric_ncd.data.yolo import resolve_image_size
+
+    root = _landscape_dataset(tmp_path / "l")
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"dataset_yaml": str(root / "dataset.yaml"), "image_size": "auto", "short_side": 64})
+    h, w = resolve_image_size(cfg)
+    assert w > h, (h, w)
+    assert min(h, w) == 64
+
+
+def test_explicit_image_size_is_not_transposed(tmp_path):
+    """显式 [96, 64] 必须原样当成 (H=96, W=64), 不能被当成 (W, H)."""
+    from fabric_ncd.data.yolo import build_datasets
+
+    root = _portrait_dataset(tmp_path / "p")
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"dataset_yaml": str(root / "dataset.yaml"), "image_size": [96, 64], "batch_size": 1})
+    ds = build_datasets(cfg)
+    sample = ds["train"][0]
+    assert tuple(sample["image"].shape[-2:]) == (96, 64)
+
+
+def test_image_size_auto_never_upscales(tmp_path):
+    """原图短边已经小于 short_side 时不要放大 (白烧算力且不增加细节)."""
+    from fabric_ncd.data.yolo import resolve_image_size
+
+    root = _landscape_dataset(tmp_path / "l")  # 160 高 x 240 宽
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"dataset_yaml": str(root / "dataset.yaml"), "image_size": "auto",
+                        "short_side": 1024, "max_scale": 1.0})
+    h, w = resolve_image_size(cfg)
+    assert min(h, w) <= 160 + 31, (h, w)  # 最多因为取 32 倍数多一档, 不会放大到 1024
+    assert w > h
+
+
+def test_image_size_auto_can_upscale_when_allowed(tmp_path):
+    from fabric_ncd.data.yolo import resolve_image_size
+
+    root = _landscape_dataset(tmp_path / "l")
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"dataset_yaml": str(root / "dataset.yaml"), "image_size": "auto",
+                        "short_side": 1024, "max_scale": 2.0})
+    h, w = resolve_image_size(cfg)
+    assert min(h, w) >= 320, (h, w)
+
+
+def test_auto_on_real_1600x846(tmp_path):
+    """真实尺寸 1600(宽) x 846(高): auto 必须给出 [832, 1600] 且不放大."""
+    from PIL import Image
+
+    from fabric_ncd.data.yolo import native_image_size, resolve_image_size
+
+    d = tmp_path / "images" / "train"
+    d.mkdir(parents=True)
+    Image.new("RGB", (1600, 846), (128, 128, 128)).save(d / "a.jpg")
+
+    class _Spec:
+        splits = {"train": d}
+        normal_splits: dict = {}
+
+    assert native_image_size(_Spec) == (846, 1600)
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"image_size": "auto", "short_side": 1024, "max_scale": 1.0})
+    assert resolve_image_size(cfg, spec=_Spec) == (832, 1600)

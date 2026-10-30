@@ -48,6 +48,13 @@ class FabricNCD(nn.Module):
         model_cfg = cfg.get("model", {})
         data_cfg = cfg.get("data", {})
         image_size = data_cfg.get("image_size", [512, 512])
+        if isinstance(image_size, str):  # "auto": 按数据集原图比例推断 (H, W)
+            try:
+                from ..data.yolo import resolve_image_size
+
+                image_size = list(resolve_image_size(cfg))
+            except Exception:  # pragma: no cover - 数据集不可达时兜底
+                image_size = [1024, 576]
         if isinstance(image_size, int):
             image_size = [image_size, image_size]
         self.image_size = image_size

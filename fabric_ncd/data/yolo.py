@@ -32,11 +32,13 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 
-from ..utils import IMAGENET_MEAN, IMAGENET_STD, load_yaml
+from ..utils import IMAGENET_MEAN, IMAGENET_STD, get_logger, load_yaml
 from .augment import EvalTransform, Sample, TrainAugment
 from .fabric_mask import estimate_cloth_mask
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+
+logger = get_logger("fabric_ncd")
 
 
 # --------------------------------------------------------------------------- #
@@ -412,12 +414,85 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 构建
 # --------------------------------------------------------------------------- #
+
+def native_image_size(spec: "DatasetSpec", samples: int = 8) -> Optional[Tuple[int, int]]:
+    """读几张图的原尺寸 (H, W), 返回中位数; 读不到返回 None."""
+    sizes: List[Tuple[int, int]] = []
+    candidates: List[Path] = []
+    for split in ("train", "val"):
+        path = getattr(spec, "splits", {}).get(split)
+        if path:
+            try:
+                candidates.extend(list_images(path)[:samples])
+            except Exception:  # pragma: no cover
+                continue
+        if len(candidates) >= samples:
+            break
+    for path in getattr(spec, "normal_splits", {}).values() or []:
+        if path and len(candidates) < samples:
+            try:
+                candidates.extend(list_images(path)[:samples])
+            except Exception:  # pragma: no cover
+                continue
+    for path in candidates[:samples]:
+        try:
+            with Image.open(path) as im:
+                w, h = im.size
+            sizes.append((int(h), int(w)))
+        except Exception:  # pragma: no cover
+            continue
+    if not sizes:
+        return None
+    arr = np.asarray(sizes, dtype=np.float64)
+    h = int(np.median(arr[:, 0]))
+    w = int(np.median(arr[:, 1]))
+    return (h, w) if h > 0 and w > 0 else None
+
+
+def resolve_image_size(cfg: Dict[str, Any], spec: Optional["DatasetSpec"] = None) -> Tuple[int, int]:
+    """把 ``data.image_size`` 解析成 (H, W).
+
+    ``"auto"`` 时读数据集原图的真实 (H, W), 保持长宽比把**短边**缩到 ``data.short_side``
+    (默认 1024, 且默认不放大), 宽高各自取 32 的倍数. 写死的数值最容易犯的错就是宽高写反
+    (1600x846 的图写成 [1024, 1728] 会把 1.89:1 压成 1.69:1), auto 不会.
+    """
+    data_cfg = cfg.setdefault("data", {})
+    raw = data_cfg.get("image_size", "auto")
+    if isinstance(raw, str) and raw.lower() == "auto":
+        spec = spec or load_dataset_spec(cfg)
+        native = native_image_size(spec)
+        if native is None:
+            resolved = (1024, 576)  # 兜底: 16:9, 至少有确定值
+            logger.warning("无法读取原图尺寸, data.image_size=auto 回退为 %s", resolved)
+        else:
+            h0, w0 = native
+            short_side = int(data_cfg.get("short_side", 1024))
+            # 默认不放大: 原图短边比 short_side 还小时, 放大只会白烧算力, 不会多出细节
+            max_scale = float(data_cfg.get("max_scale", 1.0))
+            scale = min(float(short_side) / float(min(h0, w0)), max_scale)
+            h = max(64, int(round(h0 * scale / 32.0)) * 32)
+            w = max(64, int(round(w0 * scale / 32.0)) * 32)
+            resolved = (h, w)
+            data_cfg["native_size"] = [h0, w0]
+            logger.info(
+                "原图 %dx%d (高x宽) -> 输入 %dx%d (缩放 %.2f%s, 长宽比 %s)",
+                h0, w0, h, w, scale,
+                " 不放大" if scale >= 1.0 else "",
+                "一致" if abs((w / h) - (w0 / h0)) / (w0 / h0) < 0.03 else "偏离",
+            )
+    elif isinstance(raw, int):
+        resolved = (raw, raw)
+    else:
+        values = list(raw)
+        resolved = (int(values[0]), int(values[1]))
+    data_cfg["image_size"] = [resolved[0], resolved[1]]
+    return resolved
+
+
 def build_datasets(cfg: Dict[str, Any]) -> Dict[str, FabricDataset]:
     data_cfg = cfg.get("data", {})
     spec = load_dataset_spec(cfg)
-    image_size = data_cfg.get("image_size", [512, 512])
-    if isinstance(image_size, int):
-        image_size = [image_size, image_size]
+    image_size = resolve_image_size(cfg, spec)
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
     aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
@@ -470,9 +545,7 @@ def build_normal_dataset(cfg: Dict[str, Any], split: str = "train") -> Optional[
     """构建只含正常布面图的数据集 (用于训练前初始化记忆库)."""
     data_cfg = cfg.get("data", {})
     spec = load_dataset_spec(cfg)
-    image_size = data_cfg.get("image_size", [512, 512])
-    if isinstance(image_size, int):
-        image_size = [image_size, image_size]
+    image_size = resolve_image_size(cfg, spec)
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
     aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")

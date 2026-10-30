@@ -47,6 +47,20 @@ def _load_font(size: int = 14) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def _resolve_image_size(cfg: Dict[str, Any]) -> Tuple[int, int]:
+    """解析 ``data.image_size``; 值为 ``"auto"`` 时按数据集原图比例推断."""
+    raw = cfg.get("data", {}).get("image_size", [512, 512])
+    if isinstance(raw, str):
+        from .data.yolo import resolve_image_size
+
+        try:
+            return resolve_image_size(cfg)
+        except Exception as exc:  # pragma: no cover - 数据集不可达时的兜底
+            print(f"[warn] image_size=auto 解析失败 ({exc}), 回退 1024x576")
+            return 1024, 576
+    return as_hw(raw)
+
+
 def as_hw(value: Any, default: Tuple[int, int] = (512, 512)) -> Tuple[int, int]:
     """把 int / [h, w] / (h, w) 统一成 (h, w)."""
     if value is None:
@@ -84,7 +98,7 @@ def _prep_tensor_gpu(
 ) -> torch.Tensor:
     """在 GPU 上做 resize + 归一化.
 
-    1440x2440 的图在 CPU 上用 PIL 双线性缩放到 1024x1728 要 5~8 ms, 放到 GPU 上
+    1600x846 的图在 CPU 上用 PIL 双线性缩放要 2~3 ms, 放到 GPU 上
     只要 0.2 ms, 而且省掉一次 CPU 反量化/量化. 代价是一次 10 MB 的 H2D 传输.
     """
     tensor = torch.from_numpy(np.ascontiguousarray(rgb)).to(device, non_blocking=True)
@@ -311,6 +325,13 @@ class FabricPredictor:
             user_cfg = load_yaml(config) if isinstance(config, (str, Path)) else config
             cfg = deep_update(cfg, user_cfg)
 
+        # image_size=auto 时优先用 checkpoint 里记录的 (训练时已解析成具体数值),
+        # 免得推理端因为读不到数据集而回退到猜的尺寸
+        if isinstance(cfg.get("data", {}).get("image_size"), str):
+            saved = (state.get("config") or {}).get("data", {}).get("image_size")
+            if saved and not isinstance(saved, str):
+                cfg.setdefault("data", {})["image_size"] = list(saved)
+
         self.cfg = cfg
         self.calibration: Dict[str, float] = dict(state.get("calibration") or {})
         self.names: List[str] = list(state.get("names") or cfg.get("data", {}).get("names") or [])
@@ -332,7 +353,7 @@ class FabricPredictor:
             self.names = [f"class_{i}" for i in range(self.model.num_classes)]
 
         infer_cfg = cfg.get("infer", {})
-        self.image_size = as_hw(cfg.get("data", {}).get("image_size", [512, 512]))
+        self.image_size = _resolve_image_size(cfg)
         self.tile = bool(infer_cfg.get("tile", False) if tile is None else tile)
         # 默认切块尺寸 == 网络输入尺寸: 该尺寸下切块是 1:1 原像素, 不做二次缩放
         self.tile_size = as_hw(tile_size or infer_cfg.get("tile_size") or self.image_size)

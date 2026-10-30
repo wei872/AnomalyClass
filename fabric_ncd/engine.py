@@ -203,14 +203,14 @@ def evaluate_tiled(
 ) -> Dict[str, Any]:
     """大幅面切块评估 —— 与 ``FabricPredictor(tile=True)`` 完全一致的指标.
 
-    对于 1440x2440 这类整图缩放会丢细节的图像, 评估必须和推理走同一条路径:
+    整图缩放会丢细节时 (小疵点只有几像素), 评估必须和推理走同一条路径:
     按原始像素尺度切块 -> 融合异常图 -> 区域分析 -> 计算指标.
     仅有整图缩放的 ``evaluate`` 会低估小疵点的检出能力.
 
     像素级指标按 ``eval.max_pixels`` 下采样后再统计 (AUROC/PRO 对下采样不敏感),
     检测框/分类指标仍使用原始坐标, 因此与部署时的输出一致.
     """
-    from .inference import as_hw, forward_maps
+    from .inference import _resolve_image_size, as_hw, forward_maps
     from .data.yolo import boxes_to_mask, list_images, load_rgb, read_yolo_labels
 
     model.eval()
@@ -231,7 +231,7 @@ def evaluate_tiled(
     if analyzer.threshold is not None:
         acc.pixel_threshold = float(analyzer.threshold)
 
-    image_size = as_hw(cfg.get("data", {}).get("image_size", [512, 512]))
+    image_size = _resolve_image_size(cfg)
     tile_hw = as_hw(tile_size or eval_cfg.get("tile_size") or image_size)
     overlap = int(tile_overlap if tile_overlap is not None else eval_cfg.get("tile_overlap", 128))
     tile_batch = int(eval_cfg.get("tile_batch", 4))
@@ -713,9 +713,10 @@ class Trainer:
         data = self.cfg.get("data", {})
         return RuntimeError(
             "显存不足 (CUDA OOM). 当前 data.image_size=%s, data.batch_size=%s.\n"
-            "按这个顺序降: --set data.image_size=[768,1280] -> [640,1088] -> [512,864] "
-            "(保持长宽比, 宽高都是 32 的倍数), 或 --set data.batch_size=2.\n"
-            "不要用增大 tile 的方式省显存, 也不要靠减分辨率以外的改动硬凑."
+            "按这个顺序降 (image_size=auto 时改短边即可, 长宽比自动保持):\n"
+            "  --set data.short_side=768  ->  --set data.short_side=640  ->  --set data.short_side=512\n"
+            "  或 --set data.batch_size=2 (别低于 2)\n"
+            "不要用加大 tile 的方式省显存 (tile=true 反而更慢), 也不要靠打乱长宽比硬凑."
             % (data.get("image_size"), data.get("batch_size"))
         )
 

@@ -106,7 +106,7 @@ class RegionAnalyzer:
 
         ``probs_scale``: 类别概率图相对分数图的下采样倍数. 类别图只用于"区域平均",
         不需要和分数图同分辨率, 传更粗的图可以省掉一次 19x h x w 的上采样
-        (1440x2440 上这一步能吃掉 20~30 ms).
+        (全图分辨率上这一步能吃掉 20~30 ms).
         """
         score = np.asarray(score, dtype=np.float32)
         cloth = np.asarray(cloth, dtype=np.float32)

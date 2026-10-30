@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """按你的原始图像尺寸推荐网络输入分辨率.
 
-背景: 布匹原图常见 1440x2440 (长宽比 1:1.69). 网络输入必须保持长宽比,
+背景: 布匹原图常见 1600(宽) x 846(高), 长宽比 1.89:1. 网络输入必须保持长宽比,
 否则经纬方向被拉伸成正方形, 织造周期估计失效. 另一个约束是"缩放后织造周期
 还剩几个像素": 周期 < 3 px 时 Gabor/FFT 分支基本看不到经纬结构.
 
 用法::
 
-    python tools/resolution.py --source /data/fabric/normal --native 1440x2440
-    python tools/resolution.py --source a.jpg --native 1440x2440 --samples 20
+    python tools/resolution.py --source D:/tyhn/yolo/dataset/source5_augmenteds --native 846x1600
+    python tools/resolution.py --source a.jpg --native 846x1600 --samples 20
 """
 
 from __future__ import annotations
@@ -25,16 +25,14 @@ import numpy as np  # noqa: E402
 from fabric_ncd.data.weave import estimate_period  # noqa: E402
 from fabric_ncd.data.yolo import list_images, load_rgb  # noqa: E402
 
-# 候选输入尺寸 (H, W): 保持 1440:2440 比例, 宽高均为 32 的倍数
+# 候选输入尺寸 (H, W): 保持 1600:846 ≈ 1.89 比例, 宽高均为 32 的倍数
 CANDIDATES: List[Tuple[int, int, str]] = [
-    (512, 864, "极速 / 纯 CPU"),
-    (640, 1088, "轻量"),
-    (768, 1280, "轻量 (推荐低显存)"),
-    (896, 1536, "平衡"),
-    (1024, 1728, "默认"),
-    (1152, 1952, "高精度"),
-    (1280, 2176, "高精度 (推荐小疵点)"),
-    (1440, 2464, "不缩放 (补边到 32 倍数)"),
+    (416, 800, "极速 / 纯 CPU"),
+    (512, 960, "低配"),
+    (640, 1216, "轻量"),
+    (704, 1344, "平衡"),
+    (832, 1600, "默认 = 原图 (不缩放)"),
+    (1024, 1952, "超采样 (小疵点)"),
 ]
 
 BASELINE_MACS = 0.618  # 512x512 实测
@@ -54,7 +52,7 @@ def parse_size(text: str) -> Tuple[int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="推荐输入分辨率")
     parser.add_argument("--source", required=True, help="图片或目录 (最好是正常布面图)")
-    parser.add_argument("--native", default="1440x2440", help="原始尺寸, 形如 1440x2440 (高x宽)")
+    parser.add_argument("--native", default="846x1600", help="原始尺寸, 形如 846x1600 (高x宽)")
     parser.add_argument("--samples", type=int, default=20, help="最多采样多少张")
     parser.add_argument("--target-period", type=float, default=4.0, help="缩放后期望保留的周期像素")
     parser.add_argument("--defect-px", type=float, default=None,
@@ -116,7 +114,7 @@ def main() -> int:
         print("      这是'够用'的最小尺寸; 若仍漏检小疵点, 往上调一档 (显存与耗时近似按面积增长)")
     else:
         print(f"警告: 即使不缩放, 周期也只有 {period_native * 1.0:.2f} px, 布面过于细密。")
-        print("      建议改用 [1440, 2464] 并减少下采样, 或用更高倍率镜头重新采集。")
+        print("      建议改用 [1024, 1952] 超采样并减少下采样, 或用更高倍率镜头重新采集。")
     if min(px_med, py_med) > 0 and abs(px_med - py_med) / min(px_med, py_med) > 0.6:
         print(f"提示: 经纬周期差异较大 ({px_med:.1f} vs {py_med:.1f} px), 属于正常织物各向异性, "
               "模型已用 texture 分支显式建模, 无需额外处理。")
