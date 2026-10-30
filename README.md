@@ -101,6 +101,7 @@ AnomalyClass/
 │   │   ├── weave.py               # numpy 版织造周期估计（部署/数据侧）
 │   │   └── demo.py                # 合成演示数据
 │   ├── losses.py                  # Focal/Dice/SupCon/原型 CE/紧凑度
+│   ├── realtime.py                # 三线程实时流水线 (读图/前向/后处理重叠)
 │   ├── metrics.py                 # AUROC/PRO/F1/mAP/NMI/ARI/cluster-acc
 │   ├── ncd.py                     # 区域分析、区域合并、聚类、匈牙利匹配、新类发现
 │   ├── engine.py                  # 训练/验证/EMA/阈值校准/记忆库
@@ -111,7 +112,8 @@ AnomalyClass/
 │   ├── train.py  evaluate.py  infer.py  discover.py
 │   ├── export_onnx.py  bench.py  prepare_dataset.py  demo.py
 │   ├── resolution.py              # 按原图尺寸 + 实测经纬周期推荐输入分辨率
-├── tests/                         # 31 项单元 + 端到端冒烟测试
+│   ├── rt_bench.py                # 实时性基准: 逐段耗时 + FPS + 达标判定
+├── tests/                         # 36 项单元 + 端到端冒烟测试
 └── docs/DESIGN.md                 # 方案细节、消融实验计划、调参手册
 ```
 
@@ -264,6 +266,31 @@ python tools/infer.py --ckpt best.pt --source huge_4096x1024.png --tile --tile-s
 ```
 
 输出 `*_pred.png`（热力图 + 框 + 类别 + 分数）与 `results.json`（每张图的区域、类别、到布边距离等）。
+
+### 6.4.1 实时推理（1660 上冲 40 FPS）
+
+```bash
+# 先量一下: 逐段耗时 + 流水线 FPS, 会自动判断是否达到 40 FPS 并给降配建议
+python tools/rt_bench.py --ckpt runs/fabric19_fabricncd_s/best.pt \
+    --source /data/fabric/line/*.jpg --frames 300 --fp16
+```
+
+配置里已默认打开实时开关（`infer.out_stride: 4 / probs_mul: 2 / fp16 / prep_gpu /
+channels_last / weave_interval: 30 / memory_stride: 2`），常驻服务用三线程流水线：
+
+```python
+from fabric_ncd.inference import FabricPredictor
+from fabric_ncd.realtime import RealtimePipeline
+
+predictor = FabricPredictor("runs/fabric19_fabricncd_s/best.pt", device="cuda", fp16=True)
+pipe = RealtimePipeline(predictor, queue_size=2).start()
+for frame in camera:
+    pipe.submit(frame)
+for res in pipe.results():
+    print(res.index, res.latency_ms, [(r["name"], r["score"]) for r in res.regions])
+```
+
+细节（预算拆分、优化清单、降配顺序、精度代价）见 [docs/REALTIME.md](docs/REALTIME.md)。
 
 ### 6.5 新类发现（无标签疵点图）
 

@@ -126,6 +126,8 @@ def estimate_weave_period(
     """
     if images.dim() != 4:
         raise ValueError("images 需为 (B,3,H,W)")
+    if images.dtype == torch.float16:  # 半精度推理时 FFT 在 fp32 上做, 避免 cuFFT 精度/兼容问题
+        images = images.float()
     b, _, h, w = images.shape
     gray = (
         0.299 * images[:, :1]

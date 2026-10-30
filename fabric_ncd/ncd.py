@@ -100,10 +100,17 @@ class RegionAnalyzer:
         cloth: np.ndarray,
         class_probs: Optional[np.ndarray] = None,
         input_size: Optional[Tuple[int, int]] = None,
+        probs_scale: int = 1,
     ) -> Tuple[List[RegionInfo], Dict[str, Any]]:
-        """score/cloth: (h,w); class_probs: (C,h,w). input_size: (H,W) 用于归一化 bbox."""
+        """score/cloth: (h,w); class_probs: (C, h/ps, w/ps). input_size: (H,W) 用于归一化 bbox.
+
+        ``probs_scale``: 类别概率图相对分数图的下采样倍数. 类别图只用于"区域平均",
+        不需要和分数图同分辨率, 传更粗的图可以省掉一次 19x h x w 的上采样
+        (1440x2440 上这一步能吃掉 20~30 ms).
+        """
         score = np.asarray(score, dtype=np.float32)
         cloth = np.asarray(cloth, dtype=np.float32)
+        ps = max(1, int(probs_scale))
         if self.smooth > 1:
             score = box_filter(score, self.smooth // 2)
         masked = score * (cloth > 0.5)
@@ -141,9 +148,21 @@ class RegionAnalyzer:
             probs = None
             cls, cls_score = -1, 0.0
             if class_probs is not None:
-                patch = class_probs[:, y1:y2, x1:x2]
-                if sub_mask.any():
-                    probs = patch[:, sub_mask].mean(axis=1)
+                cy1, cy2 = max(0, y1 // ps), max(1, int(np.ceil(y2 / ps)))
+                cx1, cx2 = max(0, x1 // ps), max(1, int(np.ceil(x2 / ps)))
+                patch = class_probs[:, cy1:cy2, cx1:cx2]
+                mask_local = sub_mask
+                if ps > 1:  # 类别图更粗: 用步长采样把掩码对齐到类别图分辨率
+                    mask_local = sub_mask[::ps, ::ps]
+                hh = min(mask_local.shape[0], patch.shape[1])
+                ww = min(mask_local.shape[1], patch.shape[2])
+                if hh > 0 and ww > 0:
+                    sub = mask_local[:hh, :ww]
+                    pch = patch[:, :hh, :ww]
+                else:
+                    sub, pch = None, patch
+                if sub is not None and sub.any():
+                    probs = pch[:, sub].mean(axis=1)
                 else:
                     probs = patch.reshape(patch.shape[0], -1).mean(axis=1)
                 cls = int(np.argmax(probs))

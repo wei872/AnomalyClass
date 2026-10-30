@@ -123,8 +123,19 @@ eval:
   topk_ratio: 0.01
 
 infer:
-  tile: false              # 1440x2440 整图一次前向 (0.9 s/张 CPU, GPU 约 30 ms)
+  tile: false              # 1440x2440 整图一次前向
   tile_size: [1024, 1728]
   tile_overlap: 128
   tile_batch: 2
+
+  # ---------------- 实时推理 (1660 级显卡冲 40 FPS) ---------------- #
+  out_stride: 4            # 输出分数图下采样倍数: 4 => 1440x2440 只算到 360x610
+                           # 定位框最细量化到 4 px (0.3%), 但对区域检出没有影响
+  probs_mul: 2             # 类别概率图再降一档 (只用于区域平均, 不影响定位)
+  fp16: true               # CUDA 上 FP16 推理 (1660 无 Tensor Core 也有 ~1.5x)
+  prep_gpu: true           # resize + 归一化放到 GPU (省 5~8 ms/张 CPU)
+  channels_last: true      # NHWC + cudnn, 对 MobileNet 类深度可分离卷积更快
+  weave_interval: 30       # 每 N 帧重估一次织造周期 (FFT 不必每帧都做)
+  memory_stride: 2         # 记忆库查询前 2x 平均池化 (乘加量降 4 倍)
+
   image_score_threshold: 0.5

@@ -31,6 +31,10 @@ def main() -> int:
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--tile", action="store_true", help="大幅面图像切块推理")
     parser.add_argument("--tile-size", type=int, default=None)
+    parser.add_argument("--out-stride", type=int, default=None, help="分数图下采样倍数 (实时可设 4)")
+    parser.add_argument("--fp16", dest="fp16", action="store_true", default=None, help="CUDA 上开启 FP16")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false")
+    parser.add_argument("--no-heatmap", action="store_true", help="不画热力图 (只画框, 更快)")
     parser.add_argument("--tile-overlap", type=int, default=None)
     parser.add_argument("--no-overlay", action="store_true")
     args = parser.parse_args()
@@ -44,6 +48,8 @@ def main() -> int:
         threshold=args.threshold,
         tile=True if args.tile else None,
         tile_size=args.tile_size,
+        out_stride=args.out_stride,
+        fp16=args.fp16,
         tile_overlap=args.tile_overlap,
     )
     out_dir = ensure_dir(args.out)
@@ -66,7 +72,7 @@ def main() -> int:
         all_results[str(path)] = {"regions": result["regions"], "image": result["image"]}
         if not args.no_overlay:
             overlay_path = out_dir / f"{path.stem}_pred.png"
-            predictor.save_overlay(image, result, overlay_path)
+            predictor.save_overlay(image, result, overlay_path, draw_heatmap=not args.no_heatmap)
         logger.info(
             "%s | score=%.3f | %s(%s %.2f) | regions=%d",
             path.name,

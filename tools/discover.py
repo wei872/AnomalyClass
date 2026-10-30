@@ -83,7 +83,7 @@ def main() -> int:
     features, meta, crops = [], [], []
     for path in files:
         image = Image.open(path).convert("RGB")
-        result = predictor.predict(image)
+        result = predictor.predict(image, with_embedding=True)
         maps = result["maps"]
         if "embedding" not in maps:
             raise RuntimeError(

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -74,26 +75,83 @@ def _prep_tensor(rgb: np.ndarray, size: Tuple[int, int], device: torch.device) -
     return torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))[None].to(device)
 
 
+def _prep_tensor_gpu(
+    rgb: np.ndarray,
+    size: Tuple[int, int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+    channels_last: bool = False,
+) -> torch.Tensor:
+    """在 GPU 上做 resize + 归一化.
+
+    1440x2440 的图在 CPU 上用 PIL 双线性缩放到 1024x1728 要 5~8 ms, 放到 GPU 上
+    只要 0.2 ms, 而且省掉一次 CPU 反量化/量化. 代价是一次 10 MB 的 H2D 传输.
+    """
+    tensor = torch.from_numpy(np.ascontiguousarray(rgb)).to(device, non_blocking=True)
+    x = tensor.permute(2, 0, 1)[None].float().div_(255.0)
+    if tuple(x.shape[-2:]) != tuple(size):
+        x = F.interpolate(x, size=(int(size[0]), int(size[1])), mode="bilinear", align_corners=False)
+    mean = torch.tensor(IMAGENET_MEAN, device=device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device, dtype=x.dtype).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    if dtype is not None:
+        x = x.to(dtype)
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x
+
+
+def _out_hw(size: Tuple[int, int], stride: int) -> Tuple[int, int]:
+    stride = max(1, int(stride))
+    return max(8, int(math.ceil(size[0] / stride))), max(8, int(math.ceil(size[1] / stride)))
+
+
 @torch.no_grad()
-def _maps_single(model, rgb, device, input_size, want_embedding):
+def _maps_single(
+    model,
+    rgb,
+    device,
+    input_size,
+    want_embedding,
+    out_stride: int = 1,
+    prep: str = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    channels_last: bool = False,
+    weave_desc: Optional[torch.Tensor] = None,
+    probs_mul: int = 2,
+):
     h, w = rgb.shape[:2]
-    out = model(_prep_tensor(rgb, input_size, device))
-    score = F.interpolate(out["anomaly_score"], size=(h, w), mode="bilinear", align_corners=False)
-    cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
+    if prep == "gpu" and device.type == "cuda":
+        tensor = _prep_tensor_gpu(rgb, input_size, device, dtype, channels_last)
+    else:
+        tensor = _prep_tensor(rgb, input_size, device)
+        if dtype is not None:
+            tensor = tensor.to(dtype)
+        if channels_last:
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
+    out = model(tensor) if weave_desc is None else model(tensor, weave_desc=weave_desc)
+    sh, sw = _out_hw((h, w), out_stride)
+    score = F.interpolate(out["anomaly_score"], size=(sh, sw), mode="bilinear", align_corners=False)
+    cloth = F.interpolate(out["cloth_prob"], size=(sh, sw), mode="bilinear", align_corners=False)
     probs = None
+    pmul = max(1, int(probs_mul))
     if out.get("class_logits") is not None:
+        ph_, pw_ = _out_hw((h, w), out_stride * pmul)
         probs = torch.softmax(
-            F.interpolate(out["class_logits"], size=(h, w), mode="bilinear", align_corners=False), dim=1
+            F.interpolate(out["class_logits"], size=(ph_, pw_), mode="bilinear", align_corners=False), dim=1
         )
     maps = {
-        "score": score[0, 0].cpu().numpy(),
-        "cloth": cloth[0, 0].cpu().numpy(),
-        "probs": None if probs is None else probs[0].cpu().numpy(),
+        "score": score[0, 0].float().cpu().numpy(),
+        "cloth": cloth[0, 0].float().cpu().numpy(),
+        "probs": None if probs is None else probs[0].float().cpu().numpy(),
         "weave": {k: float(v[0]) for k, v in (out.get("weave") or {}).items()},
+        "stride": max(1, int(out_stride)),
+        "probs_scale": pmul,
+        "shape": (h, w),
     }
     if want_embedding:
-        emb = F.interpolate(out["embedding"], size=(h, w), mode="bilinear", align_corners=False)
-        maps["embedding"] = F.normalize(emb, dim=1)[0].cpu().numpy()
+        emb = F.interpolate(out["embedding"], size=(sh, sw), mode="bilinear", align_corners=False)
+        maps["embedding"] = F.normalize(emb.float(), dim=1)[0].cpu().numpy()
     return maps
 
 
@@ -107,11 +165,19 @@ def _maps_tiled(
     tile_overlap: int,
     tile_batch: int = 4,
     want_embedding: bool = False,
+    out_stride: int = 1,
+    prep: str = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    channels_last: bool = False,
+    probs_mul: int = 2,
 ):
     h, w = rgb.shape[:2]
-    score_map = np.zeros((h, w), dtype=np.float32)
-    cloth_map = np.zeros((h, w), dtype=np.float32)
-    probs_map = np.zeros((model.num_classes, h, w), dtype=np.float32)
+    sh, sw = _out_hw((h, w), out_stride)
+    pmul = max(1, int(probs_mul))
+    psh, psw = _out_hw((h, w), out_stride * pmul)
+    score_map = np.zeros((sh, sw), dtype=np.float32)
+    cloth_map = np.zeros((sh, sw), dtype=np.float32)
+    probs_map = np.zeros((model.num_classes, psh, psw), dtype=np.float32)
     emb_map = None
     tile_h, tile_w = int(tile_size[0]), int(tile_size[1])
     step_y = max(8, tile_h - tile_overlap)
@@ -122,34 +188,54 @@ def _maps_tiled(
         for x in range(0, max(1, w - tile_overlap), step_x):
             y2, x2 = min(y + tile_h, h), min(x + tile_w, w)
             y1, x1 = max(0, y2 - tile_h), max(0, x2 - tile_w)
-            tiles.append(_prep_tensor(rgb[y1:y2, x1:x2], input_size, device))
+            if prep == "gpu" and device.type == "cuda":
+                tiles.append(_prep_tensor_gpu(rgb[y1:y2, x1:x2], input_size, device, dtype, channels_last))
+            else:
+                tiles.append(_prep_tensor(rgb[y1:y2, x1:x2], input_size, device))
             positions.append((y1, x1, y2, x2))
     if not tiles:
-        return _maps_single(model, rgb, device, input_size, want_embedding)
+        return _maps_single(
+            model, rgb, device, input_size, want_embedding,
+            out_stride=out_stride, prep=prep, dtype=dtype, channels_last=channels_last,
+        )
 
     if want_embedding:
         emb_dim = int(model.classifier.dim)
-        emb_map = np.zeros((emb_dim, h, w), dtype=np.float32)
+        emb_map = np.zeros((emb_dim, sh, sw), dtype=np.float32)
 
+    s = max(1, int(out_stride))
     for start in range(0, len(tiles), max(1, tile_batch)):
         chunk = torch.cat(tiles[start : start + tile_batch], dim=0)
+        if dtype is not None:
+            chunk = chunk.to(dtype)
         out = model(chunk)
         for j, idx in enumerate(range(start, min(start + tile_batch, len(tiles)))):
             y1, x1, y2, x2 = positions[idx]
-            th, tw = y2 - y1, x2 - x1
+            dy1, dx1 = y1 // s, x1 // s
+            dy2 = min(sh, int(math.ceil(y2 / s)))
+            dx2 = min(sw, int(math.ceil(x2 / s)))
+            th, tw = max(1, dy2 - dy1), max(1, dx2 - dx1)
             score = F.interpolate(out["anomaly_score"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
             cloth = F.interpolate(out["cloth_prob"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
-            score_map[y1:y2, x1:x2] = np.maximum(score_map[y1:y2, x1:x2], score.cpu().numpy())
-            cloth_map[y1:y2, x1:x2] = np.maximum(cloth_map[y1:y2, x1:x2], cloth.cpu().numpy())
+            score_map[dy1:dy2, dx1:dx2] = np.maximum(score_map[dy1:dy2, dx1:dx2], score.float().cpu().numpy())
+            cloth_map[dy1:dy2, dx1:dx2] = np.maximum(cloth_map[dy1:dy2, dx1:dx2], cloth.float().cpu().numpy())
             if out.get("class_logits") is not None:
-                p = F.interpolate(out["class_logits"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
-                p = torch.softmax(p, dim=1)[0].cpu().numpy()
-                probs_map[:, y1:y2, x1:x2] = np.maximum(probs_map[:, y1:y2, x1:x2], p)
+                s2 = s * pmul
+                py1, px1 = y1 // s2, x1 // s2
+                py2 = min(psh, int(math.ceil(y2 / s2)))
+                px2 = min(psw, int(math.ceil(x2 / s2)))
+                pth, ptw = max(1, py2 - py1), max(1, px2 - px1)
+                p = F.interpolate(out["class_logits"][j : j + 1], size=(pth, ptw), mode="bilinear", align_corners=False)
+                p = torch.softmax(p.float(), dim=1)[0].cpu().numpy()
+                probs_map[:, py1:py2, px1:px2] = np.maximum(probs_map[:, py1:py2, px1:px2], p)
             if emb_map is not None:
                 e = F.interpolate(out["embedding"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
-                e = F.normalize(e, dim=1)[0].cpu().numpy()
-                emb_map[:, y1:y2, x1:x2] = np.maximum(emb_map[:, y1:y2, x1:x2], e)
-    maps = {"score": score_map, "cloth": cloth_map, "probs": probs_map, "weave": {}}
+                e = F.normalize(e.float(), dim=1)[0].cpu().numpy()
+                emb_map[:, dy1:dy2, dx1:dx2] = np.maximum(emb_map[:, dy1:dy2, dx1:dx2], e)
+    maps = {
+        "score": score_map, "cloth": cloth_map, "probs": probs_map, "weave": {},
+        "stride": s, "probs_scale": pmul, "shape": (h, w),
+    }
     if emb_map is not None:
         maps["embedding"] = emb_map
     return maps
@@ -166,6 +252,12 @@ def forward_maps(
     tile_overlap: int = 128,
     tile_batch: int = 4,
     want_embedding: bool = False,
+    out_stride: int = 1,
+    prep: str = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    channels_last: bool = False,
+    weave_desc: Optional[torch.Tensor] = None,
+    probs_mul: int = 2,
 ) -> Dict[str, np.ndarray]:
     """统一的前向入口: 整图缩放或切块, 输出原图分辨率下的 score/cloth/probs.
 
@@ -175,8 +267,15 @@ def forward_maps(
     h, w = rgb.shape[:2]
     tile_hw = as_hw(tile_size, tuple(input_size))
     if tile and (h > tile_hw[0] or w > tile_hw[1]):
-        return _maps_tiled(model, rgb, device, input_size, tile_hw, tile_overlap, tile_batch, want_embedding)
-    return _maps_single(model, rgb, device, input_size, want_embedding)
+        return _maps_tiled(
+            model, rgb, device, input_size, tile_hw, tile_overlap, tile_batch, want_embedding,
+            out_stride=out_stride, prep=prep, dtype=dtype, channels_last=channels_last, probs_mul=probs_mul,
+        )
+    return _maps_single(
+        model, rgb, device, input_size, want_embedding,
+        out_stride=out_stride, prep=prep, dtype=dtype, channels_last=channels_last,
+        weave_desc=weave_desc, probs_mul=probs_mul,
+    )
 
 
 class FabricPredictor:
@@ -189,6 +288,12 @@ class FabricPredictor:
         tile: Optional[bool] = None,
         tile_size: Optional[int | Tuple[int, int]] = None,
         tile_overlap: Optional[int] = None,
+        out_stride: Optional[int] = None,
+        fp16: Optional[bool] = None,
+        prep_gpu: Optional[bool] = None,
+        weave_interval: Optional[int] = None,
+        memory_stride: Optional[int] = None,
+        channels_last: Optional[bool] = None,
     ) -> None:
         self.device = resolve_device(device)
         state: Dict[str, Any] = {}
@@ -225,6 +330,37 @@ class FabricPredictor:
         self.tile_overlap = int(tile_overlap if tile_overlap is not None else infer_cfg.get("tile_overlap", 128))
         self.tile_batch = int(infer_cfg.get("tile_batch", 4))
 
+        # ---------------- 实时推理相关开关 ---------------- #
+        # out_stride: 输出分数图的下采样倍数 (加速的主要手段, 不改变网络计算量)
+        self.out_stride = max(1, int(out_stride if out_stride is not None else infer_cfg.get("out_stride", 1)))
+        # 类别概率图再降一档 (只影响区域平均, 不影响定位) —— 省掉 19 通道上采样
+        self.probs_mul = max(1, int(infer_cfg.get("probs_mul", 2)))
+        # fp16: 1660/20 系等无 Tensor Core 的卡也能吃到 ~1.5-2x (FP16 双发射)
+        want_fp16 = bool(infer_cfg.get("fp16", False) if fp16 is None else fp16)
+        self.fp16 = bool(want_fp16 and self.device.type == "cuda")
+        self.prep_gpu = bool(
+            (infer_cfg.get("prep_gpu", True) if prep_gpu is None else prep_gpu) and self.device.type == "cuda"
+        )
+        self.channels_last = bool(
+            (infer_cfg.get("channels_last", True) if channels_last is None else channels_last)
+            and self.device.type == "cuda"
+        )
+        self.weave_interval = max(1, int(weave_interval if weave_interval is not None else infer_cfg.get("weave_interval", 1)))
+        self._weave_desc: Optional[torch.Tensor] = None
+        self._frame_idx = 0
+        stride = memory_stride if memory_stride is not None else infer_cfg.get("memory_stride")
+        if stride is not None and getattr(self.model, "memory", None) is not None:
+            self.model.memory.query_stride = max(1, int(stride))
+        self.memory_stride = int(getattr(self.model.memory, "query_stride", 1))
+
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.dtype = torch.float16 if self.fp16 else None
+        if self.dtype is not None:
+            self.model = self.model.half()
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+
         eval_cfg = cfg.get("eval", {})
         # 阈值优先级: 命令行 > 配置 > 正常集校准值 (checkpoint 内) > 自适应
         calib_thr = self.calibration.get("pixel_threshold")
@@ -245,24 +381,60 @@ class FabricPredictor:
         rgb = to_rgb_uint8(image)
         return _prep_tensor(rgb, self.image_size, self.device), rgb.shape[:2]
 
-    def _forward_single(self, image: Image.Image | np.ndarray) -> Dict[str, np.ndarray]:
+    def _forward_single(self, image: Image.Image | np.ndarray, want_embedding: bool = False) -> Dict[str, np.ndarray]:
         return forward_maps(
             self.model, image, self.device, self.image_size,
-            tile=False, want_embedding=True,
+            tile=False, want_embedding=want_embedding,
+            out_stride=self.out_stride, prep="gpu" if self.prep_gpu else "cpu",
+            dtype=self.dtype, channels_last=self.channels_last,
+            weave_desc=self._weave_desc, probs_mul=self.probs_mul,
         )
 
-    def _forward_tiled(self, image: Image.Image | np.ndarray) -> Dict[str, np.ndarray]:
+    def _forward_tiled(self, image: Image.Image | np.ndarray, want_embedding: bool = False) -> Dict[str, np.ndarray]:
         return forward_maps(
             self.model, image, self.device, self.image_size,
             tile=True, tile_size=self.tile_size, tile_overlap=self.tile_overlap,
-            tile_batch=self.tile_batch, want_embedding=True,
+            tile_batch=self.tile_batch, want_embedding=want_embedding,
+            out_stride=self.out_stride, prep="gpu" if self.prep_gpu else "cpu",
+            dtype=self.dtype, channels_last=self.channels_last, probs_mul=self.probs_mul,
         )
 
     # ------------------------------------------------------------------ #
-    def predict(self, image: Image.Image | np.ndarray) -> Dict[str, Any]:
-        maps = self._forward_tiled(image) if self.tile else self._forward_single(image)
+    def _should_refresh_weave(self) -> bool:
+        if self.weave_interval <= 1:
+            return True
+        return self._weave_desc is None or (self._frame_idx % self.weave_interval == 0)
+
+    def _cache_weave(self, maps: Dict[str, np.ndarray]) -> None:
+        stats = maps.get("weave") or {}
+        if not stats:
+            return
+        from .models.texture import descriptor_from_stats
+
+        desc = descriptor_from_stats(
+            {k: torch.tensor([float(v)], device=self.device) for k, v in stats.items()}
+        )
+        # 半精度模型要求描述子也是 half, 否则第一层 Linear 会 dtype 不匹配
+        self._weave_desc = desc.to(dtype=self.dtype) if self.dtype is not None else desc
+
+    def predict_maps(self, image: Image.Image | np.ndarray, with_embedding: bool = False) -> Dict[str, np.ndarray]:
+        """第一阶段: 网络前向, 返回原图坐标系下的分数图/布面图/类别概率 (GPU 段)."""
+        refresh = self._should_refresh_weave()
+        if refresh:
+            self._weave_desc = None
+        forward = self._forward_tiled if self.tile else self._forward_single
+        maps = forward(image, want_embedding=with_embedding)
+        if refresh:
+            self._cache_weave(maps)
+        self._frame_idx += 1
+        return maps
+
+    def analyze_maps(self, maps: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """第二阶段: 区域分析 + 图像级判定 (纯 CPU, 可与下一帧的 GPU 计算重叠)."""
         score = maps["score"] * (maps["cloth"] > 0.5)
-        infos, image_level = self.analyzer.analyze(score, maps["cloth"], maps["probs"])
+        infos, image_level = self.analyzer.analyze(
+            score, maps["cloth"], maps["probs"], probs_scale=int(maps.get("probs_scale", 1))
+        )
         image_score = topk_mean(score)
         image_level["image_score"] = image_score
         if self.calibration:
@@ -294,6 +466,9 @@ class FabricPredictor:
             },
             "maps": maps,
         }
+
+    def predict(self, image: Image.Image | np.ndarray, with_embedding: bool = False) -> Dict[str, Any]:
+        return self.analyze_maps(self.predict_maps(image, with_embedding=with_embedding))
 
     # ------------------------------------------------------------------ #
     def save_overlay(

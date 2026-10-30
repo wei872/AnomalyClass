@@ -18,11 +18,14 @@ import torch.nn.functional as F
 
 
 class MemoryBank(nn.Module):
-    def __init__(self, capacity: int = 2048, dim: int = 64, eps: float = 1e-6) -> None:
+    def __init__(self, capacity: int = 2048, dim: int = 64, eps: float = 1e-6, query_stride: int = 1) -> None:
         super().__init__()
         self.capacity = capacity
         self.dim = dim
         self.eps = eps
+        # >1 时先把 query 特征平均池化再算相似度: 4 倍减少乘加, 分数图上采样回去,
+        # 对区域级检测几乎无损, 是实时推理里最划算的一档.
+        self.query_stride = int(query_stride)
         self.register_buffer("features", torch.zeros(capacity, dim), persistent=True)
         self.register_buffer("size", torch.zeros(1, dtype=torch.long), persistent=True)
 
@@ -80,6 +83,13 @@ class MemoryBank(nn.Module):
     @torch.no_grad()
     def similarity(self, embeddings: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
         """返回每个位置与库的最大余弦相似度 (B,1,H,W) 或 (B,P)."""
+        stride = max(1, int(getattr(self, "query_stride", 1)))
+        if stride > 1 and embeddings.dim() == 4 and min(embeddings.shape[-2:]) >= stride:
+            full = embeddings.shape[-2:]
+            small = F.avg_pool2d(embeddings, stride, stride, ceil_mode=True)
+            small = F.normalize(small, dim=1)
+            sims = self.similarity(small, chunk=chunk)
+            return F.interpolate(sims, size=full, mode="bilinear", align_corners=False)
         squeeze = embeddings.dim() == 4
         if squeeze:
             b, d, h, w = embeddings.shape

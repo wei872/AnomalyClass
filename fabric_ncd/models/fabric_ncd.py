@@ -133,6 +133,7 @@ class FabricNCD(nn.Module):
         self.memory = MemoryBank(
             capacity=int(mem_cfg.get("capacity", 2048)),
             dim=embed_dim,
+            query_stride=int(mem_cfg.get("query_stride", 1)),
         )
 
         self._init_weights()
