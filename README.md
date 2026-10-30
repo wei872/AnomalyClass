@@ -404,6 +404,9 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 - **`cls` 对比 `ln(C)`**：`ln(19)=2.944` 是"瞎猜"的交叉熵。`cls` 高于它说明分类头还没学到东西，
   通常出现在 warmup 阶段（`train.warmup_epochs` 个 epoch）；低于它才算真的在学。
   `框内准确率` 的分母是框内像素，随机基线是 `1/19≈0.05`。
+- **`记忆项尺度`**（校准行末尾）：正常像素到记忆库的中位余弦距离。健康值在 0.02~0.15 量级并随训练平缓变化；
+  接近 1.0 说明库和当前嵌入已经脱节（余弦相似度≈0），记忆分支等于常数偏置，必须重建记忆库
+  （`memory_refresh_interval: 1`）。默认每轮重建一次。
 - **`检出率`**：验证集疵点图中**至少检出一个区域**的比例。它是 0 而 `pixelAUROC` 正常（>0.6）时，
   说明是**阈值/后处理**问题，不是模型问题——优先看 `thr` 与 `正常最大值`（见 `阈值校准` 那行），
   再把 `eval.calib_sigma` 调小或 `eval.normal_quantile` 调到 0.99。
@@ -424,6 +427,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 小疵点（断经、飞花）漏检 | 提高输入分辨率（`data.image_size` 640/768）；`loss.anomaly.alpha` 调高到 0.7–0.75；`eval.min_area_ratio` 调小 |
 | 整幅性缺陷（纬斜）漏检 | 用 `mobilenet_v3_large` 或 `efficientnet_b0`；提高 `neck.global_channels`、`neck.dilations` |
 | 正常图少量误报 | 提高 `eval.calib_sigma`（阈值更保守）；增大 `model.memory.capacity` 与训练集正常图数量 |
+| 记忆库与当前嵌入脱节（`记忆项尺度` 接近 1.0） | 把 `train.memory_refresh_interval` 设为 1，并适当降低 `memory_warmup_batches`（24 ≈ 15 s/轮），否则记忆分支退化成常数、检出率被拖到 0 |
 | 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
 | 图像级 AUROC < 0.5 | 检查 `eval.topk_pixels`（小疵点用 128~256）；不要把 `topk_ratio` 设大 |

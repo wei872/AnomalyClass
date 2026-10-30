@@ -451,6 +451,7 @@ class Trainer:
 
         self.start_epoch = 0
         self.calibration: Dict[str, float] = {}
+        self._memory_stale = False
         self.best_score = -float("inf")
         self.history: List[Dict[str, Any]] = []
         self.global_step = 0
@@ -483,7 +484,7 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     # ------------------------------------------------------------------ #
-    def warmup_memory(self, max_batches: Optional[int] = None) -> None:
+    def warmup_memory(self, max_batches: Optional[int] = None, calibrate: bool = True) -> None:
         if self.normal_loader is None or not self.model.memory_enabled:
             self.logger.warning("没有可用的正常图, 跳过记忆库预热 (将仅使用学习式异常头)")
             return
@@ -502,7 +503,8 @@ class Trainer:
         # 得到的阈值会系统性偏高.
         if self.ema is not None:
             self.ema.update(self.model)
-        self.calibrate()
+        if calibrate:
+            self.calibrate()
 
     @torch.no_grad()
     def scale_sweep(
@@ -654,8 +656,22 @@ class Trainer:
         scale = float(self.calibration.get("memory_distance_scale", self.model.memory_distance_scale))
         use_memory = bool(self.model.memory_enabled) and bool(np.any(dist_all[mask_all] > 0))
         if use_memory:
-            scale = max(float(np.median(dist_all[mask_all])), 1e-3)
+            median_dist = float(np.median(dist_all[mask_all]))
+            scale = max(median_dist, 1e-3)
             self._set_memory_scale(scale)
+            # 中位距离 ~1.0 意味着"每个正常像素在记忆库里都找不到相似的特征"
+            # (余弦相似度≈0), 此时记忆分支退化成常数, 只剩学习式分数在起作用.
+            # 原因通常是记忆库建好之后嵌入又变了, 需要重建 (memory_refresh_interval).
+            self._memory_stale = median_dist > float(
+                self.cfg.get("train", {}).get("memory_stale_distance", 0.5)
+            )
+            if self._memory_stale:
+                self.logger.warning(
+                    "记忆库与当前嵌入脱节: 正常像素到库的中位距离 %.3f (余弦相似度≈%.2f), "
+                    "记忆分支此刻基本无区分度 -> 建议把 train.memory_refresh_interval 设为 1",
+                    median_dist,
+                    1.0 - median_dist,
+                )
 
         weight = float(self.model.memory_weight)
         scores: List[np.ndarray] = []
@@ -733,7 +749,10 @@ class Trainer:
                     self.model.memory.reset()
                     if self.ema is not None:
                         self.ema.ema.memory.reset()
-                    self.warmup_memory(int(self.train_cfg.get("memory_warmup_batches", 50)))
+                    # 紧随其后还会按 eval.calib_interval 校准一次, 这里不再重复校准
+                    self.warmup_memory(
+                        int(self.train_cfg.get("memory_warmup_batches", 24)), calibrate=False
+                    )
 
             metrics: Dict[str, Any] = {}
             if (epoch + 1) % int(self.train_cfg.get("val_interval", 1)) == 0 or epoch == self.epochs - 1:
@@ -770,12 +789,19 @@ class Trainer:
                     metrics.get("regions_per_image", 0.0),
                     float(self.analyzer.threshold or 0.0),
                 )
-                if metrics.get("det_rate", 1.0) <= 0.0 and int(metrics.get("num_defect_images", 0)) > 0:
+                if (
+                    metrics.get("det_rate", 1.0) <= 0.0
+                    and int(metrics.get("num_defect_images", 0)) > 0
+                    and epoch + 1 > int(self.train_cfg.get("warmup_epochs", 0))
+                ):
                     self.logger.warning(
-                        "验证集检出率为 0: 阈值 %.4f 高于所有像素分数 (正常最大值 %.4f), "
-                        "可调 eval.calib_sigma 或 eval.normal_quantile",
+                        "验证集没有检出任何区域: 阈值 %.4f = 正常图 %.1f 分位 (正常最大值 %.4f). "
+                        "如果 pixelAUROC 尚可, 说明正/负分数分不开, 优先查 %s; "
+                        "否则调 eval.calib_sigma / eval.normal_quantile",
                         float(self.analyzer.threshold or 0.0),
+                        float(self.calibration.get("quantile", 0.999)) * 100.0,
                         float(self.calibration.get("pixel_max", 0.0)),
+                        "记忆库是否脱节" if self._memory_stale else "异常头是否学到东西",
                     )
                 if score > self.best_score:
                     self.best_score = score

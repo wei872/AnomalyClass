@@ -124,8 +124,12 @@ train:
   val_interval: 1
   log_interval: 10
   early_stop_patience: 15
-  memory_warmup_batches: 50
-  memory_refresh_interval: 5
+  memory_warmup_batches: 24
+  # 记忆库必须跟当前嵌入一致: 只在第 5/10/15... 轮重建时, 前几轮嵌入变化最快,
+  # 库会迅速脱节 (实测正常像素到库的中位距离 1.03, 余弦相似度≈0, 记忆分支退化成常数).
+  # 每轮重建 24 个 batch 约 15 s (4 分钟一轮的 6%), 换来记忆分支始终有效.
+  memory_refresh_interval: 1
+  memory_stale_distance: 0.5   # 中位距离超过它就告警"记忆库与当前嵌入脱节"
   score_weights: {pixel_auroc: 0.35, pro: 0.15, image_auroc: 0.20, map50: 0.10, map50_agnostic: 0.10, f1_macro: 0.10}
   # 训练结束后用当前权重扫一遍输入尺度 (像素级指标与阈值无关, 不需要留 checkpoint).
   # 目的: 直接回答"pixelAUROC 上不去是不是因为看不清". 约多花 5~8 分钟; 留空 [] 可关闭.
