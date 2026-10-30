@@ -793,7 +793,38 @@ class Trainer:
         return self.calibration
 
     # ------------------------------------------------------------------ #
+    def audit_cloth_coverage(self, batches: int = 4) -> None:
+        """开工前量一次布面掩码覆盖率 = anomaly 损失真正监督到的像素比例.
+
+        ``region = cloth_mask > 0.5`` 是异常损失的取样区域: 覆盖率 5% 就意味着
+        95% 的像素**没有任何负样本约束**, 异常头在那里会自由漂移 (实测正常图的
+        learned_max 会打满 1.0, 图级分数整体反向). 所以这里在训练开始时就报出来.
+        """
+        if self.train_loader is None:
+            return
+        mode = str(self.cfg.get("data", {}).get("cloth_mask", "estimate")).lower()
+        covers: List[float] = []
+        with torch.no_grad():
+            for i, batch in enumerate(self.train_loader):
+                cloth = batch.get("cloth_mask")
+                if cloth is not None:
+                    covers.append(float((cloth > 0.5).float().mean()))
+                if i + 1 >= batches:
+                    break
+        if not covers:
+            return
+        mean_cov = float(np.mean(covers))
+        self.logger.info("布面掩码覆盖率 %.3f (data.cloth_mask=%s) = 异常损失监督到的像素比例", mean_cov, mode)
+        if mean_cov < 0.90 and mode != "full":
+            self.logger.warning(
+                "覆盖率只有 %.0f%%: 其余像素的异常头输出完全没有约束 (会漂移到 1.0, 让正常图分数反而更高). "
+                "整幅都是布的产线图应设 data.cloth_mask: full",
+                mean_cov * 100.0,
+            )
+
+    # ------------------------------------------------------------------ #
     def fit(self) -> Dict[str, Any]:
+        self.audit_cloth_coverage()
         self.warmup_memory(int(self.train_cfg.get("memory_warmup_batches", 50)))
         refresh = int(self.train_cfg.get("memory_refresh_interval", 5))
         best_path = self.output_dir / "best.pt"

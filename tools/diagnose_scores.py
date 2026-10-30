@@ -472,6 +472,7 @@ def _probe(args) -> int:
     def _load(ckpt: str, device):
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
+        LOGGER.info("配置来自 checkpoint 里保存的那一份 (训练时的配置), 可用 --set 覆盖")
         if args.overrides:
             cfg = apply_overrides(cfg, args.overrides)
         if args.root:
