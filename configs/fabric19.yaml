@@ -127,6 +127,11 @@ train:
   memory_warmup_batches: 50
   memory_refresh_interval: 5
   score_weights: {pixel_auroc: 0.35, pro: 0.15, image_auroc: 0.20, map50: 0.10, map50_agnostic: 0.10, f1_macro: 0.10}
+  # 训练结束后用当前权重扫一遍输入尺度 (像素级指标与阈值无关, 不需要留 checkpoint).
+  # 目的: 直接回答"pixelAUROC 上不去是不是因为看不清". 约多花 5~8 分钟; 留空 [] 可关闭.
+  scale_sweep: [0.5, 0.65, 0.8, 1.0]
+  scale_sweep_samples: 60
+  scale_sweep_memory_batches: 12
 
 eval:
   # 整图输入 (1600x846, 宽x高) 保持 tile=false: 与训练一致; 仅在显存/耗时受限

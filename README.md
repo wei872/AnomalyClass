@@ -433,9 +433,18 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 
 ### 8.1 分辨率瓶颈怎么判定（不重训也能判）
 
-```bash
-python tools/eval_scales.py --checkpoint runs/fabric19_fabricncd_s/best.pt --scales 0.5,0.65,0.8,1.0
+**训练结束会自动跑**（`train.scale_sweep`，默认 `[0.5, 0.65, 0.8, 1.0]`，约 3~5 分钟），
+日志里直接给出表格与结论；不需要保留 checkpoint，也不影响已保存的权重：
+
 ```
+分辨率体检: 用当前权重扫 [0.5, 0.65, 0.8, 1.0]
+  尺度 0.80 | 输入 800x1952 | pixelAUROC 0.7012 | imageAUROC 0.8341 | 41s
+  尺度 1.00 | 输入 1012x2448 | pixelAUROC 0.7623 | imageAUROC 0.8802 | 63s
+  分辨率判读: 提高尺度 pixelAUROC +0.061 -> 分辨率是瓶颈 ...
+```
+
+若想单独对某个已有的 checkpoint 复测：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.8,1.0`。
+想关掉自动体检就把 `train.scale_sweep` 设为 `[]`。
 
 同一个权重在不同输入尺度上跑一遍验证集，输出 `pixelAUROC / imageAUROC / 相对耗时` 表格：
 

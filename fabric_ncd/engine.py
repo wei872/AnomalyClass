@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import csv
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -503,6 +504,86 @@ class Trainer:
             self.ema.update(self.model)
         self.calibrate()
 
+    @torch.no_grad()
+    def scale_sweep(
+        self,
+        scales,
+        memory_batches: int = 12,
+        max_samples: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """用**当前权重**扫不同输入尺度, 判断"看不清"是不是瓶颈.
+
+        训练结束时自动跑一次: 不需要留 checkpoint, 也不用重训就能回答"要不要提分辨率".
+        pixelAUROC 与阈值无关, 所以早期 checkpoint 也能看出趋势.
+        记忆库在这其中会被临时重建, 结束后原样恢复.
+        """
+        model = self.ema.ema if self.ema is not None else self.model
+        was_training = model.training
+        model.eval()
+        saved_features = model.memory.features.detach().clone()
+        saved_size = model.memory.size.detach().clone()
+        base_cfg = copy.deepcopy(self.cfg)
+        results: List[Dict[str, Any]] = []
+        base_time = 0.0
+        try:
+            for scale in scales:
+                cfg_s = copy.deepcopy(base_cfg)
+                data_cfg = cfg_s.setdefault("data", {})
+                data_cfg["image_size"] = "auto"
+                data_cfg["short_side"] = 8192  # 交给 max_scale 决定缩放, 允许 >1 放大
+                data_cfg["max_scale"] = float(scale)
+                datasets = build_dataloaders(cfg_s)
+                val_loader = datasets["val"]
+                resolved = tuple(cfg_s["data"]["image_size"])
+                normal_loader = build_normal_loader(cfg_s, "train")
+                model.memory.reset()
+                if normal_loader is not None:
+                    for i, batch in enumerate(normal_loader):
+                        model.update_memory(
+                            batch["image"].to(self.device), mask=batch["cloth_mask"].to(self.device)
+                        )
+                        if i + 1 >= memory_batches:
+                            break
+                started = time.time()
+                metrics = evaluate(
+                    model, val_loader, cfg_s, self.device, criterion=None,
+                    analyzer=RegionAnalyzer(names=None, threshold=None),
+                    max_samples=max_samples or None,
+                )
+                elapsed = time.time() - started
+                base_time = base_time or elapsed
+                row = {
+                    "scale": float(scale),
+                    "input_hw": resolved,
+                    "pixel_auroc": float(metrics.get("pixel_auroc", float("nan"))),
+                    "image_auroc": float(metrics.get("image_auroc", float("nan"))),
+                    "seconds": elapsed,
+                }
+                results.append(row)
+                self.logger.info(
+                    "  尺度 %.2f | 输入 %dx%d | pixelAUROC %.4f | imageAUROC %.4f | %.0fs",
+                    row["scale"], resolved[0], resolved[1],
+                    row["pixel_auroc"], row["image_auroc"], elapsed,
+                )
+        finally:
+            model.memory.features.copy_(saved_features)
+            model.memory.size.copy_(saved_size)
+            model.train(was_training)
+
+        if len(results) >= 2:
+            delta = results[-1]["pixel_auroc"] - results[0]["pixel_auroc"]
+            if delta > 0.05:
+                self.logger.info(
+                    "  分辨率判读: 提高尺度 pixelAUROC +%.3f -> **分辨率是瓶颈**, 建议粗到细 (整图粗筛 + 候选区复检) 或切块推理",
+                    delta,
+                )
+            else:
+                self.logger.info(
+                    "  分辨率判读: 提高尺度 pixelAUROC %+.3f -> 分辨率不是主要瓶颈, 别再吃显存, 去调损失/增广/标注",
+                    delta,
+                )
+        return results
+
     def _set_memory_scale(self, scale: float) -> None:
         """记忆项尺度同步给训练模型与 EMA (两者都会被用于评估/推理)."""
         for m in (self.model, self.ema.ema if self.ema is not None else None):
@@ -720,6 +801,17 @@ class Trainer:
                 break
 
         self.save_checkpoint(self.output_dir / "last.pt", epoch, {}, best=False)
+        sweep = self.train_cfg.get("scale_sweep") or []
+        if sweep:
+            self.logger.info("分辨率体检: 用当前权重扫 %s (不落盘, 不影响已保存的 checkpoint)", list(sweep))
+            try:
+                self.scale_sweep(
+                    [float(x) for x in sweep],
+                    memory_batches=int(self.train_cfg.get("scale_sweep_memory_batches", 12)),
+                    max_samples=int(self.train_cfg.get("scale_sweep_samples", 60)),
+                )
+            except Exception as exc:  # pragma: no cover - 体检失败不该影响训练结果
+                self.logger.warning("分辨率体检失败: %s", exc)
         summary = {
             "best_score": self.best_score,
             "history": self.history,
