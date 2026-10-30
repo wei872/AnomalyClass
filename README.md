@@ -477,7 +477,8 @@ python tools/diagnose_scores.py --from-csv scores_last.csv
    max_minus_med / learned_max`, 每行给 `疵点均值 / 正常均值 / AUROC / 同源内 / 跨源`。
    `同源内` = 只用同一批次(文件名前缀)里的 (疵点, 正常) 对, `跨源` = 只用不同批次之间的对。
 2. **批次表** — 每个批次的疵点数/正常数/平均分/组内 AUROC/布面覆盖。
-3. **外观秩相关** — 各分数与 `brightness / contrast / saturation / sharpness` 的 Spearman $ho$。
+3. **外观秩相关** — 各分数与 `brightness / contrast / saturation / sharpness` 的 Spearman $
+ho$。
 
 判读顺序(前一条命中就停):
 
@@ -489,6 +490,16 @@ python tools/diagnose_scores.py --from-csv scores_last.csv
 | `topk_minus_med` 明显高于 `topk_raw` | 逐图底色偏移主导 | `eval.image_score_mode: contrast` |
 | `topk_raw` 远高于 `topk_gated` | 布面掩码在裁掉疵点 | `eval.cloth_gate: false` |
 | 只有 peak 类高 | top-k 稀释 | 调小 `eval.topk_pixels` |
+
+**秒级体检（不加载模型）**:
+
+```bash
+python tools/diagnose_scores.py --dataset-only
+```
+
+打印四个目录各自的批次构成、`normal/images/val` 里哪些批次**不在** `normal/images/train`、
+以及"按文件名排序后的前 48 张"都是哪些批次——后者正是 `train.memory_warmup_batches: 24`
+（`eval_batch_size: 2`）在不洗牌时实际抽到的正常图。
 
 探针还会打印 **批次覆盖**: 训练正常图的批次 vs 验证集的批次、交集、以及"验证集里训练
 正常图从未出现过的批次"。批次覆盖率低 + 记忆库抽样不洗牌, 是 imageAUROC 反向最常见的原因

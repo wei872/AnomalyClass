@@ -27,7 +27,6 @@
 
 from __future__ import annotations
 
-import argparse
 import copy
 import csv
 import sys
@@ -114,6 +113,38 @@ def _pair_auc(rows: List[Dict], key: str, same_src: bool) -> Tuple[float, int]:
             elif pv == nv:
                 num += 0.5
     return ((num / den) if den else float("nan")), den
+
+
+def _bank_report(bank_src: Dict[str, int], bank_images: int, total_normals: int,
+                 val_src: Dict[str, int]) -> None:
+    """记忆库到底覆盖了哪些批次 —— 只取前若干批 + 不洗牌时, 这里会非常偏.
+
+    ``list_images`` 是**按文件名排序**的, 所以"前 N 批"= 字典序最前面的那些文件
+    (例如所有 ``DA...`` 排在所有 ``KBA...`` 之前). 一旦记忆库只装了一种批次,
+    另一种批次的正常图在库里找不到近邻, 记忆分支分数就会整片虚高 ->
+    imageAUROC 反向, 而 pixelAUROC 看起来还正常.
+    """
+    if not bank_src:
+        return
+    LOGGER.info(
+        "记忆库构成: %d 张 / %d 个来源 (训练正常图共 %d 张)",
+        bank_images, len(bank_src), total_normals,
+    )
+    top = sorted(bank_src.items(), key=lambda kv: -kv[1])[:5]
+    LOGGER.info("  最多的几个来源: %s", " | ".join(f"{k} {v} 张" for k, v in top))
+    if val_src:
+        missing = sorted(set(val_src) - set(bank_src))
+        need = [s for s in missing if val_src.get(s)]
+        LOGGER.info(
+            "  验证集的 %d 个来源里有 %d 个**完全不在记忆库里**%s",
+            len(val_src), len(need),
+            (": " + ", ".join(need[:8]) + (" ..." if len(need) > 8 else "")) if need else "",
+        )
+        if len(need) >= max(1, len(val_src) // 2):
+            LOGGER.info(
+                "  -> 记忆库严重偏科: 这些批次的正常图会被当作'没见过'而分数虚高. "
+                "用 --memory-batches 0 (全部正常图) 复测, 训练侧用 train.memory_shuffle: true"
+            )
 
 
 def _group_table(rows: List[Dict], key: str) -> None:
@@ -298,6 +329,71 @@ def _read_csv(path: str, depth: int) -> List[Dict]:
     return rows
 
 
+def _dataset_report(args) -> int:
+    """不加载模型, 只审数据集目录: 各 split 的批次构成 / 排序后的前 N 张是什么 / 覆盖率.
+
+    用来回答两个问题:
+      1. 验证集的正常图, 在 ``normal/images/train`` 里存在吗?
+      2. ``memory_warmup_batches`` 不洗牌时取的"前 N 批", 里面都是哪些批次?
+    """
+    from fabric_ncd.data.yolo import list_images, load_dataset_spec
+    from tools._common import load_config
+
+    cfg = load_config(args.config, args.overrides, root=args.root)
+    spec = load_dataset_spec(cfg)
+
+    dirs = {
+        "images/train (疵点)": spec.splits.get("train"),
+        "images/val (疵点)": spec.splits.get("val"),
+        "normal/train (正常)": spec.normal_splits.get("train"),
+        "normal/val (正常)": spec.normal_splits.get("val"),
+    }
+    hist: Dict[str, Dict[str, int]] = {}
+    for title, directory in dirs.items():
+        files = list_images(directory)
+        counts: Dict[str, int] = defaultdict(int)
+        for f in files:
+            counts[source_of(f.name, args.group_depth)] += 1
+        hist[title] = dict(counts)
+        LOGGER.info("%-22s %5d 张 / %3d 个来源", title, len(files), len(counts))
+        if counts:
+            top = sorted(counts.items(), key=lambda kv: -kv[1])[:6]
+            LOGGER.info("    最多: %s", " | ".join(f"{k} {v}" for k, v in top))
+
+    normal_train = hist.get("normal/train (正常)", {})
+    normal_val = hist.get("normal/val (正常)", {})
+    if normal_val:
+        need = sorted(set(normal_val) - set(normal_train))
+        LOGGER.info(
+            "验证集正常图: %d 个来源, 其中 %d 个不在 normal/images/train 里%s",
+            len(normal_val), len(need),
+            (": " + ", ".join(need) + "") if need else "",
+        )
+        if need:
+            LOGGER.info(
+                "  -> 这些批次对模型来说从没当过'正常', 在它们上面算 imgAUROC 没有意义; "
+                "把它们补进 normal/images/train (它们本来就是正常图)"
+            )
+    # 不洗牌时 "前 N 批" 的构成: 文件按名字排序, 这里按同样顺序取前 48 张
+    n_first = 48
+    for title, directory in dirs.items():
+        if "normal" not in title or not directory:
+            continue
+        files = list_images(directory)[:n_first]
+        counts: Dict[str, int] = defaultdict(int)
+        for f in files:
+            counts[source_of(f.name, args.group_depth)] += 1
+        if counts:
+            top = sorted(counts.items(), key=lambda kv: -kv[1])[:6]
+            LOGGER.info(
+                "%s 排序后的前 %d 张 (bs2 时 = memory_warmup_batches 24 实际抽到的), 共 %d 个来源: %s%s",
+                title, len(files), len(counts),
+                " | ".join(f"{k} {v}" for k, v in top),
+                " ..." if len(counts) > len(top) else "",
+            )
+    return 0
+
+
 def _probe(args) -> int:
     import torch  # 只有完整探针才需要
     from torch.nn import functional as F
@@ -307,9 +403,15 @@ def _probe(args) -> int:
     from fabric_ncd.ops import topk_mean
     from fabric_ncd.utils import load_yaml, resolve_device
 
+    from tools._common import apply_overrides
+
     def _load(ckpt: str, device):
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
+        if args.overrides:
+            cfg = apply_overrides(cfg, args.overrides)
+        if args.root:
+            cfg.setdefault("data", {})["root"] = args.root
         LOGGER.info("checkpoint: %s (epoch %s)", ckpt, state.get("epoch", "?"))
         model = FabricNCD(cfg)
         model.load_state_dict(state["ema" if "ema" in state else "model"])
@@ -333,15 +435,20 @@ def _probe(args) -> int:
 
     normal_loader = build_normal_loader(cfg, "train")
     bank_images = 0
+    bank_src: Dict[str, int] = defaultdict(int)
     if normal_loader is not None:
         model.memory.reset()
         with torch.no_grad():
             for i, batch in enumerate(normal_loader):
                 model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
                 bank_images += int(batch["image"].shape[0])
+                for path in batch["path"]:
+                    key = source_of(path, args.group_depth)
+                    bank_src[key] += 1
                 if args.memory_batches and i + 1 >= args.memory_batches:
                     break
-        LOGGER.info("记忆库: 用 %d 张训练正常图建立 (共 %d 张可用)", bank_images, len(train_ds) if train_ds else 0)
+        LOGGER.info("记忆库: 用 %d 张训练正常图建立 (共 %d 张可用)",
+                    bank_images, len(train_ds) if train_ds else 0)
 
     topk = int(cfg.get("eval", {}).get("topk_pixels", 256) or 256)
     gate = bool(cfg.get("eval", {}).get("cloth_gate", True))
@@ -390,6 +497,7 @@ def _probe(args) -> int:
     for r in rows:
         val_src[r["src"]] += 1
     _coverage(train_src, val_src)
+    _bank_report(bank_src, bank_images, len(train_ds) if train_ds else 0, val_src)
     if args.csv:
         _write_csv(rows, args.csv)
     _group_table(rows, "topk_raw")
@@ -397,17 +505,23 @@ def _probe(args) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="图级分数诊断: 分数到底在跟踪什么")
+    from tools._common import base_parser
+
+    ap = base_parser("图级分数诊断: 分数到底在跟踪什么")
     ap.add_argument("--checkpoint", default="", help="完整探针需要; 用 --from-csv 时可省")
     ap.add_argument("--from-csv", default="", help="只分析已导出的逐图 csv, 不加载模型")
     ap.add_argument("--samples", type=int, default=0, help="最多多少张 (0 = 全部)")
     ap.add_argument("--memory-batches", type=int, default=0,
                     help="建立记忆库用多少批正常图 (0 = 全部; 小于全部会让部分批次变成'没见过'而虚高)")
     ap.add_argument("--group-depth", type=int, default=1, help="按文件名前几段分组 (默认 1 = 批次号)")
+    ap.add_argument("--dataset-only", action="store_true",
+                    help="不加载模型, 只审数据集目录 (批次构成 / 前 N 张 / 覆盖率), 秒级")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--csv", default="", help="把逐图明细写到 csv")
     args = ap.parse_args()
 
+    if args.dataset_only:
+        return _dataset_report(args)
     if args.from_csv:
         rows = _read_csv(args.from_csv, args.group_depth)
         if not rows:
