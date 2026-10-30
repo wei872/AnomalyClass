@@ -413,6 +413,9 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 - **`阈值校准`** 每 `eval.calib_interval` 轮执行一次（默认每轮，`eval.calib_batches` 张正常图），
   日志会给出 `q0.999` / `mean+kσ` / `正常最大值` 三个分量。阈值一定 ≤ 正常最大值：
   否则训练后分数分布一变尖，`mean+6σ` 会超过 1.0，任何像素都超不过阈值，验证集区域数直接归零。
+- **`参照集` 这一行**（训练开头）：打印记忆库/阈值校准用的是什么图。`疵点图框外布面 N 张`
+  表示 `train.memory_source: defect_outside` 生效——没有同批次良品图时这是唯一可信的参照，
+  因为 `normal/images/train` 里的良品图常常是另一种布。
 - **`learned_max` 在正常图上打满 1.0**：这是异常头在"没有监督"的像素上自由漂移的结果。
   查 `data.cloth_mask`：估计模式在"整幅都是布"的图上常给出 5%~60% 的覆盖率，
   而 `region = cloth_mask > 0.5` 是异常损失的取样区域——覆盖率低于 50% 的图，
@@ -438,6 +441,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
 | 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint runs/.../last.pt`（**`best.pt` 常是早期轮次**）。`同源内` 高而 `AUROC` 低 → 跨批次采集差异（按批次切分/补正常图）；`topk_minus_med` > `topk_raw` → 逐图底色偏移，设 `eval.image_score_mode: contrast`；`topk_raw` > `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false` |
+| 良品图与出疵点的图不是同一种布（甚至不同机台） | 用良品图建记忆库/定阈值等于拿另一种材料当参照，记忆项与阈值都会系统性偏。设 `train.memory_source: defect_outside`：用**疵点图的框外布面**建库与校准（同一台机器、同一批布） |
 | 正常图分数比疵点图还高，且集中在某几批图 | 先跑探针看 `批次覆盖`：这些批次在 `normal/images/train` 里可能从未出现；同时确认 `train.memory_shuffle: true`（否则每轮记忆库都只看最前面那几十张正常图） |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |

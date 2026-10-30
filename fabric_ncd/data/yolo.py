@@ -32,6 +32,7 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 
+from ..ops import binary_dilate
 from ..utils import IMAGENET_MEAN, IMAGENET_STD, get_logger, load_yaml
 from .augment import EvalTransform, Sample, TrainAugment
 from .fabric_mask import estimate_cloth_mask
@@ -401,6 +402,97 @@ def _to_tensor(image: np.ndarray) -> torch.Tensor:
     arr = image.astype(np.float32) / 255.0
     arr = (arr - np.asarray(IMAGENET_MEAN, dtype=np.float32)) / np.asarray(IMAGENET_STD, dtype=np.float32)
     return torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))
+
+
+class DefectBackgroundDataset(Dataset):
+    """没有同批次正常图时, 用**疵点图的框外布面**当正常参照.
+
+    真实产线里"良品图"往往只有别的布种 (甚至另一台机器), 用它建记忆库/定阈值,
+    得到的参照与推理时的布料根本不是一种材料: 记忆项距离、阈值都会系统性地偏.
+    疵点图的**框外区域**恰恰是同一台机器、同一批布的正常纹理, 是这种情况下唯一
+    可信的参照.
+
+    返回的样本:
+      * ``cloth_mask``  被替换成"框外布面"掩码 (框外 AND 布面), 记忆库/校准只用这些像素;
+      * ``defect_mask`` / ``anomaly_mask`` 置零, ``normal`` 为 True (它只用于建库/校准);
+      * ``boxes`` 清空, 避免任何损失把它当成有标注的样本.
+    """
+
+    def __init__(
+        self,
+        spec: DatasetSpec,
+        split: str = "train",
+        image_size: Tuple[int, int] = (512, 512),
+        augment_cfg: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+        train: bool = True,
+        box_pad: int = 6,
+    ) -> None:
+        aug_cfg = dict(augment_cfg or {})
+        aug_cfg["image_size"] = tuple(image_size)
+        # 合成疵点会把"正常"像素变成疵点, 绝对不能叠加到参照集里
+        aug_cfg["synth_prob"] = 0.0
+        self.base = FabricDataset(
+            spec, split, tuple(image_size), train=train, augment_cfg=aug_cfg,
+            normal_ratio=0.0, limit=None, cache_masks=True,
+        )
+        self.base.entries = [e for e in self.base.entries if not e.normal]
+        if limit:
+            self.base.entries = self.base.entries[: max(1, int(limit))]
+        self.box_pad = int(box_pad)
+
+    def __len__(self) -> int:
+        return len(self.base.entries)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        sample = self.base[index]
+        cloth = (sample["cloth_mask"] > 0.5).numpy()[0]
+        defect = (sample["defect_mask"] > 0.5).numpy()[0]
+        if defect.any():
+            # 框是弱标注, 边界常比真实疵点大/小, 先膨胀再挖掉, 免得把疵点边缘当正常
+            defect = binary_dilate(defect.astype(np.uint8), self.box_pad) > 0
+        bg = (cloth & ~defect).astype(np.float32)
+        if bg.sum() < 0.02 * bg.size:  # 框太大/布面太小: 这张图没有可信的框外区域
+            bg = np.zeros_like(bg)
+        out = dict(sample)
+        out["cloth_mask"] = torch.from_numpy(bg[None])
+        out["defect_mask"] = torch.zeros_like(sample["defect_mask"])
+        out["anomaly_mask"] = torch.zeros_like(sample["anomaly_mask"])
+        out["boxes"] = torch.zeros((0, 5), dtype=torch.float32)
+        out["labels"] = torch.zeros(0, dtype=torch.long)
+        out["image_label"] = -1
+        out["normal"] = True
+        return out
+
+
+def build_background_loader(
+    cfg: Dict[str, Any], split: str = "train", shuffle: bool = True
+) -> Optional[DataLoader]:
+    """疵点图框外布面的 loader (见 :class:`DefectBackgroundDataset`)."""
+    data_cfg = cfg.get("data", {})
+    spec = load_dataset_spec(cfg)
+    image_size = resolve_image_size(cfg, spec)
+    aug_cfg = dict(data_cfg.get("augment", {}))
+    aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
+    aug_cfg["cloth_mask"] = data_cfg.get("cloth_mask", "estimate")
+    try:
+        dataset = DefectBackgroundDataset(
+            spec, split, tuple(image_size), augment_cfg=aug_cfg, train=True,
+            limit=data_cfg.get("limit_train"),
+        )
+    except FileNotFoundError:
+        return None
+    if len(dataset) == 0:
+        return None
+    workers = int(data_cfg.get("num_workers", 4))
+    return DataLoader(
+        dataset,
+        batch_size=int(data_cfg.get("eval_batch_size", 4)),
+        shuffle=shuffle,
+        num_workers=max(0, workers // 2),
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:

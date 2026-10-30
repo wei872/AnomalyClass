@@ -26,7 +26,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .data.yolo import build_dataloaders, build_normal_loader, load_dataset_spec
+from .data.yolo import (
+    DefectBackgroundDataset,
+    build_background_loader,
+    build_dataloaders,
+    build_normal_loader,
+    load_dataset_spec,
+)
 from .losses import FabricCriterion
 from .metrics import MetricAccumulator, auroc
 from .models.fabric_ncd import FabricNCD
@@ -82,6 +88,16 @@ class ModelEMA:
 # 验证
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def _reshuffled(cfg: Dict[str, Any], loader) -> Optional[Any]:
+    """按 loader 的种类重新建一个**洗牌版** (只取前 N 批时用, 避免每轮都抽同一批图)."""
+    dataset = getattr(loader, "dataset", None)
+    if isinstance(dataset, DefectBackgroundDataset):
+        return build_background_loader(cfg, "train", shuffle=True)
+    if dataset is not None:
+        return build_normal_loader(cfg, "train", shuffle=True)
+    return None
+
+
 def gate_by_cloth(score, cloth, enabled: bool = True):
     """按布面掩码裁剪异常分数. 整幅都是布时应关闭, 否则会把疵点本身裁掉."""
     if not enabled:
@@ -466,7 +482,33 @@ class Trainer:
         self._warn_memory(data_cfg)
         self.train_loader = self.datasets["train"]
         self.val_loader = self.datasets["val"]
+        # 参照集 (记忆库 + 阈值校准) 的来源:
+        #   normal         = normal/images/train 里的良品图;
+        #   defect_outside = 疵点图的**框外布面** (没有同批次良品图时唯一可信的参照);
+        #   both           = 两者都用.
+        self.memory_source = str(self.train_cfg.get("memory_source", "both")).lower()
         self.normal_loader = build_normal_loader(cfg, "train")
+        self.background_loader = (
+            build_background_loader(cfg, "train")
+            if "defect" in self.memory_source or "both" in self.memory_source
+            else None
+        )
+        self.memory_loaders = []
+        if "defect" in self.memory_source and self.background_loader is not None:
+            self.memory_loaders.append(self.background_loader)
+        if self.normal_loader is not None and (("normal" in self.memory_source) or not self.memory_loaders):
+            self.memory_loaders.append(self.normal_loader)
+        if not self.memory_loaders:
+            self.logger.warning(
+                "参照集为空 (memory_source=%s): 记忆分支将退化为常数", self.memory_source
+            )
+        else:
+            kinds = []
+            if self.background_loader is not None and self.background_loader in self.memory_loaders:
+                kinds.append(f"疵点图框外布面 {len(self.background_loader.dataset)} 张")
+            if self.normal_loader is not None and self.normal_loader in self.memory_loaders:
+                kinds.append(f"良品图 {len(self.normal_loader.dataset)} 张")
+            self.logger.info("参照集 (记忆库/阈值校准): %s", " + ".join(kinds) or "无")
 
         self.model = FabricNCD(cfg).to(self.device)
         self.criterion = FabricCriterion(cfg).to(self.device)
@@ -517,25 +559,32 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     # ------------------------------------------------------------------ #
+    def _reference_batches(self):
+        """参照集批次 (良品图 + / 或 疵点图框外布面). 记忆库与阈值校准共用同一套来源."""
+        for loader in getattr(self, "memory_loaders", []) or []:
+            for batch in loader:
+                yield batch
+
     def warmup_memory(self, max_batches: Optional[int] = None, calibrate: bool = True) -> None:
-        if self.normal_loader is None or not self.model.memory_enabled:
+        if not self.memory_loaders or not self.model.memory_enabled:
             self.logger.warning("没有可用的正常图, 跳过记忆库预热 (将仅使用学习式异常头)")
             return
         self.model.eval()
-        loader = self.normal_loader
-        # 只取前 max_batches 批时, 不洗牌 = 每轮都只看最前面那几十张正常图;
-        # 若这些图与验证集正常图的批次/曝光不同, 记忆库会系统性漏掉某些正常外观.
+        loaders = list(self.memory_loaders)
+        # 只取前 max_batches 批时, 不洗牌 = 每轮都只看最前面那几十张;
+        # 若这些图与验证图的布料批次/曝光不同, 记忆库会系统性漏掉某些正常外观.
         # 洗牌后每个 epoch 抽到的子集不同, 覆盖率随训练累积.
         if max_batches and bool(self.train_cfg.get("memory_shuffle", True)):
-            shuffled = build_normal_loader(self.cfg, "train", shuffle=True)
-            if shuffled is not None:
-                loader = shuffled
+            loaders = [_reshuffled(self.cfg, loader) or loader for loader in loaders]
         batches = 0
         with torch.no_grad():
-            for batch in loader:
-                batch = move_to(batch, self.device)
-                self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
-                batches += 1
+            for loader in loaders:
+                for batch in loader:
+                    batch = move_to(batch, self.device)
+                    self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
+                    batches += 1
+                    if max_batches and batches >= max_batches:
+                        break
                 if max_batches and batches >= max_batches:
                     break
         self.model.train()
@@ -578,15 +627,26 @@ class Trainer:
                 datasets = build_dataloaders(cfg_s)
                 val_loader = datasets["val"]
                 resolved = tuple(cfg_s["data"]["image_size"])
-                normal_loader = build_normal_loader(cfg_s, "train")
                 model.memory.reset()
-                if normal_loader is not None:
-                    for i, batch in enumerate(normal_loader):
+                sweep_loaders = []
+                if "defect" in self.memory_source or "both" in self.memory_source:
+                    bg = build_background_loader(cfg_s, "train", shuffle=False)
+                    if bg is not None:
+                        sweep_loaders.append(bg)
+                nl = build_normal_loader(cfg_s, "train")
+                if nl is not None:
+                    sweep_loaders.append(nl)
+                built = 0
+                for loader in sweep_loaders:
+                    for batch in loader:
                         model.update_memory(
                             batch["image"].to(self.device), mask=batch["cloth_mask"].to(self.device)
                         )
-                        if i + 1 >= memory_batches:
+                        built += 1
+                        if built >= memory_batches:
                             break
+                    if built >= memory_batches:
+                        break
                 started = time.time()
                 metrics = evaluate(
                     model, val_loader, cfg_s, self.device, criterion=None,
@@ -647,7 +707,7 @@ class Trainer:
         这里统计正常图的像素级/图像级异常分数分布, 取高分位作为固定阈值, 使
         异常分数具有跨图可比性. 校准结果随 checkpoint 一起保存.
         """
-        if self.normal_loader is None:
+        if not getattr(self, "memory_loaders", None):
             return self.calibration
         eval_cfg = self.cfg.get("eval", {})
         q = float(quantile if quantile is not None else eval_cfg.get("normal_quantile", 0.999))
@@ -660,7 +720,7 @@ class Trainer:
         dist_parts: List[np.ndarray] = []
         mask_parts: List[np.ndarray] = []
         seen = 0
-        for batch in self.normal_loader:
+        for batch in self._reference_batches():
             batch = move_to(batch, self.device)
             out = model(batch["image"])
             h, w = batch["image"].shape[-2:]
@@ -673,6 +733,10 @@ class Trainer:
                 if bool(eval_cfg.get("cloth_gate", True))
                 else np.ones_like(cloth.squeeze(1).cpu().numpy(), dtype=bool)
             )
+            # 只用"真的是布"的像素: 框外布面样本的 cloth_mask 就是它的取样区域,
+            # 良品图则是真实布面掩码. 不乘这一项, 校准会把背景/疵点像素也算进正常分布.
+            if batch.get("cloth_mask") is not None:
+                keep = keep & (batch["cloth_mask"].squeeze(1).cpu().numpy() > 0.5)
             dist = out.get("memory_distance")
             if dist is None:
                 dist_np = np.zeros_like(learned)

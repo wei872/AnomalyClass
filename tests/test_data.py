@@ -12,7 +12,12 @@ from fabric_ncd.data.augment import (
 )
 from fabric_ncd.data.fabric_mask import estimate_cloth_mask
 from fabric_ncd.data.synth import SYNTH_TYPES, apply_random_anomaly
-from fabric_ncd.data.yolo import FabricDataset, build_datasets, load_dataset_spec
+from fabric_ncd.data.yolo import (
+    DefectBackgroundDataset,
+    FabricDataset,
+    build_datasets,
+    load_dataset_spec,
+)
 from fabric_ncd.data.demo import make_dataset
 
 
@@ -245,3 +250,33 @@ def test_cloth_mask_full_mode(tmp_path):
     # 估计模式保持原行为 (不一定全 1), 但必须仍是 0/1 掩码
     m = est[0]["cloth_mask"]
     assert set(m.unique().tolist()) <= {0.0, 1.0}
+
+
+def test_defect_background_dataset_excludes_boxes(tmp_path):
+    """没有同批次良品图时, 疵点图的框外布面就是唯一可信的参照集.
+
+    取样区域必须 = 布面 AND NOT(框, 膨胀后); 且这些样本不能被当成有标注的正样本.
+    """
+    root = make_dataset(tmp_path, n_train=4, n_val=2, n_normal=1, size=(64, 96))
+    spec = load_dataset_spec({"data": {"dataset_yaml": str(root / "dataset.yaml")}})
+    ds = DefectBackgroundDataset(
+        spec, "train", (64, 64),
+        augment_cfg={"image_size": (64, 64), "cloth_mask": "full"}, train=False,
+    )
+    assert len(ds) > 0
+
+    checked = 0
+    for i in range(len(ds)):
+        base = ds.base[i]
+        defect = (base["defect_mask"] > 0.5).numpy()[0]
+        if not defect.any():
+            continue
+        sample = ds[i]
+        taken = sample["cloth_mask"][0].numpy() > 0.5
+        assert not taken[defect].any(), "框内像素不能进参照集"
+        assert taken.sum() > 0, "框外还应该有布面像素"
+        assert sample["normal"] is True
+        assert sample["boxes"].numel() == 0
+        assert float(sample["defect_mask"].sum()) == 0.0
+        checked += 1
+    assert checked > 0
