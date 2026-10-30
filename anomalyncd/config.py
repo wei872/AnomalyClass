@@ -108,6 +108,19 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("device 必须是 auto/cpu/cuda")
     if not isinstance(cfg["experiment"]["seed"], int) or not 0 <= cfg["experiment"]["seed"] < 2**32:
         raise ValueError("seed 必须是 0..2^32-1 的整数")
+    detector = cfg.get("detector")
+    if detector is not None:
+        if not isinstance(detector, dict):
+            raise ValueError("detector 必须是映射")
+        for key in ("image_size", "epochs", "batch_size"):
+            if not isinstance(detector.get(key), int) or detector[key] <= 0:
+                raise ValueError(f"detector.{key} 必须是正整数")
+        for key in ("conf_threshold", "iou_threshold", "anomaly_threshold"):
+            _number(detector.get(key), f"detector.{key}", 0, 1)
+        if not isinstance(detector.get("class_agnostic", True), bool):
+            raise ValueError("detector.class_agnostic 必须是布尔值")
+        if cfg["mode"] == "discovery" and not detector.get("class_agnostic", True):
+            raise ValueError("NCD 模式要求 detector.class_agnostic=true，避免使用新类 ID")
 
 
 def load_class_names(path: str | Path) -> list[str]:

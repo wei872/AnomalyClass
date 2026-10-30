@@ -1,4 +1,4 @@
-extends: fabric19.yaml
+extends: fabric19.yaml       # 继承轻量默认 dino_vits8 / dino_deitsmall8_pretrain.pth
 mode: discovery
 # 示例划分：前 10 类已知，后 9 类作为新类。
 # 请按实际业务修改，ID 是 dataset/fabric19.yaml 的 0-based 顺序。

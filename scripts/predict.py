@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
-"""Classify one fabric image using YOLO detector proposals or an explicit whole-image fallback."""
+"""End-to-end FabricNCD inference: one raw image -> detection/localization/classification/score."""
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 from _cli import base_parser
 
-from anomalyncd.inference import predict_image
+from anomalyncd.end_to_end import predict_fabricncd
 
 
 def main() -> None:
     parser = base_parser(__doc__, config_option=False)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="训练得到的 best.pt 或 last.pt")
-    parser.add_argument("--image", type=Path, required=True)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--boxes", type=Path, help="YOLO 预测 txt 或像素 XYXY JSON；输入类别 ID 被忽略")
-    source.add_argument("--whole-image", action="store_true", help="无候选框时整图分类；假设图中确有缺陷")
-    parser.add_argument("--conf-threshold", type=float, default=0.25)
+    parser.add_argument("--bundle", type=Path, required=True, help="train_fabricncd.py 输出的端到端 bundle 目录")
+    parser.add_argument("--image", type=Path, required=True, help="原始图片；不需要框、标签或异常图")
+    parser.add_argument("--output-dir", type=Path, help="结果目录；默认 outputs/predictions/<图片名>")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--novel-only", action="store_true", help="NCD 专用：明确假设输入是新类，仅在新增类中分类")
-    parser.add_argument("--save-crops", type=Path)
-    parser.add_argument("--output", type=Path, help="结果 JSON；默认打印到终端")
+    parser.add_argument("--conf-threshold", type=float, help="检测器置信度阈值")
+    parser.add_argument("--iou-threshold", type=float, help="检测器 NMS IoU 阈值")
+    parser.add_argument("--anomaly-threshold", type=float, help="图像异常分数阈值")
+    parser.add_argument("--novel-only", action="store_true", help="NCD 专用：只在新增类中分类")
     decisions = parser.add_mutually_exclusive_group()
-    decisions.add_argument("--image-threshold", type=float)
-    decisions.add_argument("--top1", action="store_true")
+    decisions.add_argument("--image-threshold", type=float, help="图像多标签分类阈值")
+    decisions.add_argument("--top1", action="store_true", help="每图只输出最高概率缺陷类")
     args = parser.parse_args()
-    result = predict_image(args.checkpoint, args.image, args.boxes, args.whole_image, args.device,
-                           args.conf_threshold, args.image_threshold, args.top1, args.novel_only, args.save_crops)
-    text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(text, encoding="utf-8")
-        print(f"预测已保存: {args.output.resolve()}")
-    else:
-        print(text)
+    output_dir = args.output_dir or Path("outputs/predictions") / args.image.stem
+    result = predict_fabricncd(args.bundle, args.image, output_dir, args.device,
+                               args.conf_threshold, args.iou_threshold, args.anomaly_threshold,
+                               args.image_threshold, args.top1, args.novel_only)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

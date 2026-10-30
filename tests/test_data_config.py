@@ -105,3 +105,34 @@ def test_preprocess_refuses_to_overwrite_inputs(synthetic):
         prepare_dataset(synthetic["yaml"], synthetic["raw"], synthetic["raw"], progress=lambda _: None)
     with pytest.raises(ValueError, match="输出目录"):
         prepare_dataset(synthetic["yaml"], synthetic["raw"] / "images/train/crops", synthetic["raw"], progress=lambda _: None)
+
+
+def test_default_configs_use_lightweight_deitsmall8():
+    from anomalyncd.config import load_config
+    from anomalyncd.model import backbone_spec
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("fabric19.yaml", "fabric19_ncd.yaml"):
+        cfg = load_config(root / "configs" / name)
+        assert cfg["model"]["backbone"] == "dino_vits8"
+        assert cfg["model"]["pretrained_path"] is None
+    spec = backbone_spec("dino_vits8")
+    assert spec["embed_dim"] == 384 and spec["patch_size"] == 8
+    assert spec["weights"] == "dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth"
+
+
+def test_detector_config_validation(smoke_config):
+    import copy
+
+    from anomalyncd.config import validate_config
+
+    cfg = copy.deepcopy(smoke_config)
+    cfg["detector"]["anomaly_threshold"] = 1.5
+    with pytest.raises(ValueError, match="anomaly_threshold"):
+        validate_config(cfg)
+    cfg = copy.deepcopy(smoke_config)
+    cfg["mode"] = "discovery"
+    cfg["discovery"]["known_class_ids"] = list(range(10))
+    cfg["detector"]["class_agnostic"] = False
+    with pytest.raises(ValueError, match="class_agnostic"):
+        validate_config(cfg)

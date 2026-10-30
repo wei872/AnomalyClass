@@ -36,8 +36,17 @@ def test_prepare_train_evaluate_predict_cli(smoke_config, synthetic, tmp_path):
     assert metrics["config"]["inference"]["image_threshold"] is None
     image = sorted((synthetic["raw"] / "images/val").rglob("*.png"))[0]
     output = tmp_path / "prediction.json"
-    run_cli("predict.py", "--checkpoint", checkpoint, "--image", image, "--whole-image",
+    run_cli("predict_region.py", "--checkpoint", checkpoint, "--image", image, "--whole-image",
             "--device", "cpu", "--top1", "--output", output)
     prediction = json.loads(output.read_text(encoding="utf-8"))
     assert prediction["class_order"] == list(range(19))
     assert len(prediction["regions"]) == 1
+
+
+def test_train_fabricncd_dry_run_cli(smoke_config, synthetic, tmp_path):
+    config_path = tmp_path / "fabricncd.yaml"
+    smoke_config["experiment"]["output_dir"] = str(tmp_path / "fabricncd_run")
+    config_path.write_text(yaml.safe_dump(smoke_config, allow_unicode=True), encoding="utf-8")
+    output = run_cli("train_fabricncd.py", "--config", config_path, "--data-root", synthetic["raw"], "--dry-run")
+    assert "end-to-end FabricNCD" in output
+    assert not (tmp_path / "fabricncd_run").exists()

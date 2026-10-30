@@ -70,7 +70,8 @@ def add_training_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prepared-root", type=Path)
     parser.add_argument("--dataset-config", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--backbone", choices=("dino_vitb8", "dino_vitb16", "dino_vits8", "dino_vits16", "tiny_vit"))
+    parser.add_argument("--backbone", choices=("dino_vitb8", "dino_vitb16", "dino_vits8", "dino_vits16", "tiny_vit"),
+                        help="默认从配置读取；仓库默认 dino_vits8（dino_deitsmall8_pretrain.pth）")
     parser.add_argument("--backbone-weights", type=Path, help="本地 DINO 原始预训练 state_dict，不是分类 checkpoint")
     parser.add_argument("--image-size", type=int)
     parser.add_argument("--batch-size", type=int)

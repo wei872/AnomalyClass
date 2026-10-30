@@ -8,8 +8,8 @@ data:
 
 mode: supervised
 model:
-  backbone: dino_vitb8
-  pretrained_path: null       # 本地 DINO .pth；null 时从官方地址下载
+  backbone: dino_vits8         # 默认轻量版 DINO DeiT-S/8
+  pretrained_path: null       # null 自动下载 dino_deitsmall8_pretrain.pth；也可填本地同名权重路径
   image_size: 224
   grad_from_block: 11
   mask_layers: 9
@@ -42,6 +42,18 @@ loss:
   teacher_temp: 0.04
   warmup_teacher_temp: 0.07
   warmup_teacher_temp_epochs: 40
+
+detector:
+  model: yolov8n.pt              # 轻量 YOLO 检测器；离线可用 --detector-weights
+  model_yaml: yolov8n.yaml       # 仅 --allow-random-init 测试用
+  weights: null
+  image_size: 640
+  epochs: 100
+  batch_size: 16
+  class_agnostic: true           # 只检测 defect/normal，不读取新类 ID
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  anomaly_threshold: 0.25        # 图像异常分数阈值
 
 inference:
   area_temperature: 50.0
