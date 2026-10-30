@@ -64,3 +64,24 @@ def test_region_analyzer_cloth_gate_switch():
 
     assert len(infos_gated) == 0                   # 被蒙版裁掉 -> 检不出
     assert len(infos_ungated) == 1                 # 关闭蒙版 -> 正常检出
+
+
+def test_image_score_mode_contrast_removes_global_offset():
+    """整图底色偏移不该影响图像级判据: contrast 口径要能把叠加的常数消掉."""
+    import numpy as np
+
+    from fabric_ncd.engine import image_score_of
+
+    base = np.full((64, 64), 0.2, dtype=np.float32)
+    defect = base.copy()
+    defect[10:20, 10:20] = 0.6
+    topk_cfg = {"topk_pixels": 16}
+    contrast_cfg = {"topk_pixels": 16, "image_score_mode": "contrast"}
+
+    # 给"异常图"整体叠一个负偏移 (模拟底色更暗)
+    defect_shifted = defect - 0.1
+    normal_shifted = base.copy()
+
+    assert image_score_of(defect, topk_cfg) > image_score_of(base, topk_cfg)
+    # 叠加偏移后 topk 失效, contrast 仍然分得开
+    assert image_score_of(defect_shifted, contrast_cfg) > image_score_of(normal_shifted, contrast_cfg)

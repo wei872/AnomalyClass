@@ -40,6 +40,7 @@ LOGGER = get_logger("diagnose")
 def _load(ckpt: str, device: torch.device, cfg_override: Dict) -> tuple:
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
+    LOGGER.info("checkpoint: %s (epoch %s)", ckpt, state.get("epoch", "?"))
     cfg.update(cfg_override or {})
     model = FabricNCD(cfg)
     key = "ema" if "ema" in state else "model"
@@ -107,6 +108,9 @@ def main() -> int:
                         "top16_raw": topk_mean(raw, k_pixels=16),
                         "max_raw": float(raw.max()),
                         "mean1pct_raw": float(np.sort(raw.ravel())[-max(1, raw.size // 100):].mean()),
+                        "topk_minus_med": float(topk_mean(raw, k_pixels=topk) - np.median(raw)),
+                        "max_minus_med": float(raw.max() - np.median(raw)),
+                        "median": float(np.median(raw)),
                         "cloth_cov": float(cl.mean()),
                         "learned_max": float(lr.max()),
                     }
@@ -117,14 +121,18 @@ def main() -> int:
     labels = np.array([r["defect"] for r in rows])
     LOGGER.info("验证集样本: 疵点 %d 张 / 正常 %d 张", int((labels == 1).sum()), int((labels == 0).sum()))
 
-    keys = ["topk_gated", "topk_raw", "top16_raw", "max_raw", "mean1pct_raw", "learned_max", "cloth_cov"]
-    LOGGER.info("%-14s %-10s %-10s %-10s", "聚合方式", "疵点图均值", "正常图均值", "AUROC")
+    keys = [
+        "topk_gated", "topk_raw", "top16_raw", "max_raw", "mean1pct_raw",
+        "topk_minus_med", "max_minus_med", "median", "learned_max", "cloth_cov",
+    ]
+    LOGGER.info("%-15s %-10s %-10s %-10s %-10s", "聚合方式", "疵点图均值", "正常图均值", "AUROC", "组内标准差")
     for key in keys:
         vals = np.array([r[key] for r in rows], dtype=np.float64)
         d_mean = float(vals[labels == 1].mean()) if (labels == 1).any() else float("nan")
         n_mean = float(vals[labels == 0].mean()) if (labels == 0).any() else float("nan")
         score = auroc(labels, vals) if key != "cloth_cov" else float("nan")
-        LOGGER.info("%-14s %-10.4f %-10.4f %-10.4f", key, d_mean, n_mean, score)
+        spread = float(vals.std()) if key != "cloth_cov" else float("nan")
+        LOGGER.info("%-15s %-10.4f %-10.4f %-10.4f %-10.4f", key, d_mean, n_mean, score, spread)
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
@@ -134,12 +142,22 @@ def main() -> int:
         LOGGER.info("逐图明细已写入 %s", args.csv)
 
     # ------- 自动判读 -------
-    best = max(keys[:-1], key=lambda k: auroc(labels, np.array([r[k] for r in rows], dtype=np.float64)))
+    scored = [k for k in keys if k not in ("cloth_cov", "median")]
+    best = max(scored, key=lambda k: auroc(labels, np.array([r[k] for r in rows], dtype=np.float64)))
     best_auc = auroc(labels, np.array([r[best] for r in rows], dtype=np.float64))
     LOGGER.info("最佳聚合方式: %s (AUROC %.4f)", best, best_auc)
+    if best_auc >= 0.90:
+        LOGGER.info("判读: 该 checkpoint 上所有口径都分得开, 无需处理 (换 last.pt 再看当前轮次)")
+        return 0
     auc_gated = auroc(labels, np.array([r["topk_gated"] for r in rows]))
     auc_raw = auroc(labels, np.array([r["topk_raw"] for r in rows]))
-    if auc_raw - auc_gated > 0.10:
+    auc_contrast = auroc(labels, np.array([r["topk_minus_med"] for r in rows]))
+    if auc_contrast - auc_raw > 0.10:
+        LOGGER.info(
+            "判读: 绝对分数被逐图底色偏移带偏 (topk %.3f -> 去中位数 %.3f) -> 设 eval.image_score_mode: contrast",
+            auc_raw, auc_contrast,
+        )
+    elif auc_raw - auc_gated > 0.10:
         LOGGER.info(
             "判读: 布面蒙版在裁掉疵点 (关闭 %s -> %s) -> 把 eval.cloth_gate 设为 false",
             f"{auc_gated:.3f}", f"{auc_raw:.3f}",
@@ -152,8 +170,8 @@ def main() -> int:
         LOGGER.info("判读: 学习式异常头本身能分开, 融合后的分数反而被记忆项拖累 -> 调 model.memory.score_weight")
     else:
         LOGGER.info(
-            "判读: 各口径都分不开 -> 检查两组图是否同源 (正常验证图与训练正常图是否同种布), "
-            "以及布面掩码是否把疵点裁掉 (对比 raw_max 与 topk)"
+            "判读: 各口径都分不开 -> 先确认这是不是早期 checkpoint; 若确认是多轮之后的权重, "
+            "则检查两组图是否同源 (正常验证图与训练正常图是否同种布)"
         )
     return 0
 

@@ -432,7 +432,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 | 记忆库与当前嵌入脱节（`记忆项尺度` 接近 1.0） | 把 `train.memory_refresh_interval` 设为 1，并适当降低 `memory_warmup_batches`（24 ≈ 15 s/轮），否则记忆分支退化成常数、检出率被拖到 0 |
 | 检测很弱，`pixelAUROC` 卡在 0.6~0.7 上不去 | **先别重训**：`python tools/eval_scales.py --checkpoint runs/.../best.pt --scales 0.5,0.65,0.8,1.0`。曲线随尺度明显上升 → 分辨率是瓶颈；平坦 → 分辨率不是瓶颈，回去改损失/增广/标注 |
 | 验证集一个框都检不出（检出率 0） | 看 `阈值校准` 行的 `正常最大值`；降 `eval.calib_sigma`（如 3.0）、`eval.normal_quantile=0.99`、`eval.min_area_ratio` 调小 |
-| 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint best.pt`：`topk_raw` 明显高于 `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false`（整幅都是布时必须关） |
+| 图像级 AUROC < 0.5 / 检出率忽高忽低 | 先跑 `python tools/diagnose_scores.py --checkpoint runs/.../last.pt`（**`best.pt` 常是早期轮次**）：`topk_raw` 明显高于 `topk_gated` → 布面蒙版在裁掉疵点，设 `eval.cloth_gate: false`；`topk_minus_med` 明显高于 `topk_raw` → 逐图**底色偏移**把绝对分数带反了，设 `eval.image_score_mode: contrast` |
 | 分类混淆（相似类） | 提高 `loss.supcon.weight`、降低 `heads.proto_temperature`；对稀有类重采样；增加 `loss.cls.box_shrink`（更干净的框内样本） |
 | CPU 端太慢 | 用 `--set data.short_side=512`；`arch=lite` + 导出 ONNX/INT8；开启 `infer.tile` 只跑可疑区域 |
 | 显存不足 | 减小 `data.batch_size`；`data.image_size=384`；`model.memory.capacity=1024` |
@@ -463,12 +463,18 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
 python tools/diagnose_scores.py --checkpoint runs/fabric19_fabricncd_s/best.pt --csv scores.csv
 ```
 
-逐图打印 `topk_gated / topk_raw / top16_raw / max_raw / mean1pct_raw / learned_max / cloth_cov`，
-并给出"疵点图均值 vs 正常图均值 vs AUROC"表格，最后自动判读属于哪一类：
+逐图打印 `topk_gated / topk_raw / top16_raw / max_raw / mean1pct_raw / topk_minus_med / max_minus_med /
+median / learned_max / cloth_cov`，给出"疵点图均值 vs 正常图均值 vs AUROC vs 组内标准差"表格，
+最后自动判读属于哪一类：
 
 - `topk_raw` 远高于 `topk_gated` → 布面蒙版在裁掉疵点 → `eval.cloth_gate: false`；
-- 只有 peak 类高 → top-k 稀释 → 调小 `eval.topk_pixels`；
-- 全部分不开 → 两组图可能不同源（验证集正常图与训练不是同一种布），或异常头没学到东西。
+- `topk_minus_med` 远高于 `topk_raw` → **逐图底色偏移**在主导图像级分数（疵点图与正常图的 `median`
+  差得比峰值还多）→ `eval.image_score_mode: contrast`，峰值减去本图中位数后再比；
+- 全部口径都远低于 0.5 → 分数**反向**：先确认 checkpoint 的轮次（工具会打印 `epoch`），
+  早期轮次的权重没有任何判据可用；确认是多轮之后仍如此，再怀疑两组图不同源。
+
+> `eval.image_score_mode` 默认 `topk`（与历史行为一致），校准阈值与推理共用同一口径，
+> 切换后必须**重新校准**（训练每轮会自动校准，或推理加载时用验证集正常图校准）。
 
 ### 8.2 两个已经做过 A/B、证明**无效**的方向（别再试）
 

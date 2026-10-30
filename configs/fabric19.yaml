@@ -161,6 +161,9 @@ eval:
   # 图像级分数: 优先用固定像素数 (k_pixels), 而非比例. 1% 在 800x1952 上等于
   # 一万五千像素, 而小疵点常常只有一两千像素 -> 均值被正常像素稀释, 图像级
   # AUROC 会掉到 0.5 以下. 256 个像素与疵点尺度无关, 更适合小疵点.
+  # 图像级分数的聚合口径: topk = 最高若干像素均值; contrast = 该均值减去本图中位数
+  # (抹掉逐图底色偏移; 异常图整体偏暗/偏亮、峰值又接近时, topk 会给出 imageAUROC < 0.5)
+  image_score_mode: topk
   topk_pixels: 256
   topk_ratio: 0.01        # 仅在 topk_pixels 未设置时生效
   calib_interval: 1       # 每几轮用正常图重新校准阈值; 设成 >= epochs 即等于只在启动时校准

@@ -90,9 +90,20 @@ def gate_by_cloth(score, cloth, enabled: bool = True):
 
 
 def image_score_of(score: np.ndarray, eval_cfg: dict) -> float:
-    """图像级异常分数 (评估 / 校准 / 推理共用一套口径)."""
+    """图像级异常分数 (评估 / 校准 / 推理共用一套口径).
+
+    ``eval.image_score_mode``:
+      - ``topk``   (默认) 最高若干像素的均值;
+      - ``contrast`` 上述峰值**减去本图中位数**: 抹掉"整图底色"级别的逐图偏移.
+        异常图的亮度/纹理整体偏低时, 绝对分数会被整图偏移主导, 表现为
+        imageAUROC < 0.5 (正常图反而更高), 而局部对比度仍然是对的.
+    """
     k_pixels = int(eval_cfg.get("topk_pixels", 0) or 0)
-    return topk_mean(score, float(eval_cfg.get("topk_ratio", 0.01)), k_pixels=k_pixels or None)
+    peak = topk_mean(score, float(eval_cfg.get("topk_ratio", 0.01)), k_pixels=k_pixels or None)
+    mode = str(eval_cfg.get("image_score_mode", "topk")).lower()
+    if mode == "contrast":
+        return float(peak - float(np.median(score)))
+    return float(peak)
 
 
 def evaluate(
