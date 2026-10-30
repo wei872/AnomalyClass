@@ -69,7 +69,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides, args.root)
     predictor = FabricPredictor(checkpoint=args.ckpt, config=cfg, device=args.device)
     out_dir = ensure_dir(args.out)
     crops_dir = ensure_dir(out_dir / "cluster_samples")

@@ -60,7 +60,7 @@ def _parser():
 
 def main() -> int:
     args = _parser().parse_args()
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.root)
     if args.size:
         raw = [int(v) for v in str(args.size).replace("*", "x").split("x")]
         cfg.setdefault("data", {})["image_size"] = raw if len(raw) == 2 else [raw[0], raw[0]]

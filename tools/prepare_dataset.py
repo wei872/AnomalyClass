@@ -113,7 +113,6 @@ def _export_defect_one(image_path: str, label_path: str, out_dir: str, mask_size
 
 def main() -> int:
     parser = base_parser("数据集检查 / 预处理")
-    parser.add_argument("--root", default=None, help="本机数据集根目录 (用于重映射 Windows 路径)")
     parser.add_argument("--write-yaml", default=None, help="输出路径已解析的 yaml")
     parser.add_argument("--export-masks", action="store_true", help="导出无监督布面(前景)掩码")
     parser.add_argument("--export-defect-masks", action="store_true",
@@ -129,9 +128,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides)
-    if args.root:
-        cfg.setdefault("data", {})["root"] = args.root
+    cfg = load_config(args.config, args.overrides, args.root)
     spec = load_dataset_spec(cfg)
 
     if args.root and not Path(args.root).exists():

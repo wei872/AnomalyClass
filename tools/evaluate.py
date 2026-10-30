@@ -38,7 +38,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides, args.root)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg = deep_update(state.get("config", {}), cfg)
     if args.device:

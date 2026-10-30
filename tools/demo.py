@@ -39,7 +39,7 @@ def main() -> int:
         logger.info("生成合成数据集 -> %s", root)
         make_dataset(root, n_train=64, n_val=20, n_normal=24, size=(args.size, args.size))
 
-    cfg = load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides, args.root)
     cfg["experiment"].update({"output_dir": str(out_dir), "device": "cpu", "amp": False, "seed": 0})
     cfg["data"].update(
         {

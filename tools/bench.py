@@ -83,7 +83,7 @@ def main() -> int:
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
-    cfg = load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides, args.root)
     cfg.setdefault("data", {})["image_size"] = [args.size, args.size]
     device = resolve_device(args.device)
     model = FabricNCD(cfg).to(device).eval()

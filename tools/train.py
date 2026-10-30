@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只构建模型与数据, 不训练")
     args = parser.parse_args()
 
-    cfg = load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides, args.root)
     if args.device:
         cfg.setdefault("experiment", {})["device"] = args.device
     if args.epochs:

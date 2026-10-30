@@ -210,8 +210,10 @@ python tools/prepare_dataset.py --root D:/tyhn/yolo/dataset/source5_augmenteds -
 ### 6.2 训练
 
 ```bash
+# --root 所有工具都支持 (train/evaluate/infer/discover/rt_bench/prepare_dataset...),
+# 等价于 --set data.root=...; Windows 上必须写完整盘符
 python tools/train.py --config configs/fabric19.yaml \
-    --set data.root=/data/fabric/source5_augmenteds
+    --root D:/tyhn/yolo/dataset/source5_augmenteds
 
 # 常用覆盖
 python tools/train.py --set train.epochs=100 --set model.backbone.arch=mobilenet_v3_large
@@ -233,7 +235,7 @@ python tools/train.py --no-pretrained              # 离线环境
 ```bash
 # ① 默认（推荐起步）: 整图送进网络, 短边 1024, 4.17 GMACs / 1.11 M 参数
 #    CPU 约 0.75 s/张 (2 核), GPU 约 25–30 ms/张; 训练显存约 1.4 GB/张 (bs=4 约 5.5 GB)
-python tools/train.py --config configs/fabric19.yaml --set data.root=/data/fabric
+python tools/train.py --config configs/fabric19.yaml --root D:/tyhn/yolo/dataset/source5_augmenteds
 
 # ② 轻量/低显存: 短边 768, 2.32 GMACs, CPU 约 0.4 s/张
 python tools/train.py --config configs/fabric19.yaml \
