@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,9 +32,31 @@ from PIL import Image  # noqa: E402
 
 from _common import base_parser, load_config  # noqa: E402
 
-from fabric_ncd.data.fabric_mask import estimate_cloth_mask  # noqa: E402
+from fabric_ncd.data.fabric_mask import auto_work_size, estimate_cloth_mask  # noqa: E402
 from fabric_ncd.data.yolo import list_images, load_dataset_spec, read_yolo_labels  # noqa: E402
 from fabric_ncd.utils import ensure_dir, get_logger  # noqa: E402
+
+
+def _parse_mask_size(value):
+    if value is None:
+        return "auto"
+    text = str(value).strip().lower()
+    if text in ("auto", "0", "none"):
+        return "auto"
+    return int(text)
+
+
+def _export_one(image_path: str, out_dir: str, mask_size) -> tuple:
+    """子进程: 估计一张图的布面掩码并写出 (顶层函数, Windows 下可 pickle)."""
+    t0 = time.perf_counter()
+    with Image.open(image_path) as im:
+        rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+    size = auto_work_size(rgb) if mask_size == "auto" else mask_size
+    mask, _ = estimate_cloth_mask(rgb, work_size=size)
+    # 掩码本身是大块区域, 按估计尺寸保存即可: dataloader 会用最近邻还原到原图
+    out_path = Path(out_dir) / f"{Path(image_path).stem}.png"
+    Image.fromarray((mask * 255).astype(np.uint8)).save(out_path)
+    return str(out_path), time.perf_counter() - t0
 
 
 def main() -> int:
@@ -40,6 +65,11 @@ def main() -> int:
     parser.add_argument("--write-yaml", default=None, help="输出路径已解析的 yaml")
     parser.add_argument("--export-masks", action="store_true", help="导出无监督布面掩码")
     parser.add_argument("--mask-out", default=None, help="掩码输出根目录 (默认 <root>/cloth_masks)")
+    parser.add_argument("--mask-size", default="auto",
+                        help="掩码估计/保存的长边尺寸: auto (按实测经纬周期自动决定) 或整数, 如 1024")
+    parser.add_argument("--workers", type=int, default=None, help="并行进程数 (默认 min(8, CPU 核数))")
+    parser.add_argument("--limit", type=int, default=None, help="每类最多处理多少张 (先小规模试跑)")
+    parser.add_argument("--force", action="store_true", help="覆盖已存在的掩码 (默认跳过, 支持断点续跑)")
     parser.add_argument("--check-images", action="store_true", help="逐张打开图片, 检测损坏文件 (较慢)")
     args = parser.parse_args()
 
@@ -123,17 +153,41 @@ def main() -> int:
         if not spec.root:
             raise ValueError("导出掩码需要知道数据集根目录, 请指定 --root")
         out_root = Path(args.mask_out or Path(spec.root) / "cloth_masks")
+        workers = args.workers or min(8, os.cpu_count() or 1)
+        mask_size = _parse_mask_size(args.mask_size)
         for split in ("train", "val"):
             images = list_images(spec.splits.get(split))
+            if args.limit:
+                images = images[: args.limit]
             target = ensure_dir(out_root / split)
-            for i, img in enumerate(images):
-                with Image.open(img) as im:
-                    rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
-                mask, _ = estimate_cloth_mask(rgb)
-                Image.fromarray((mask * 255).astype(np.uint8)).save(target / f"{img.stem}.png")
-                if (i + 1) % 500 == 0:
-                    logger.info("  %s: %d/%d", split, i + 1, len(images))
-            logger.info("掩码导出完成: %s (%d 张)", target, len(images))
+            todo = [img for img in images if args.force or not (target / f"{img.stem}.png").exists()]
+            skipped = len(images) - len(todo)
+            logger.info("%s: 待处理 %d 张 (已存在跳过 %d 张, workers=%d, mask_size=%s)",
+                        split, len(todo), skipped, workers, mask_size)
+            if not todo:
+                continue
+            t_start = time.perf_counter()
+            done = 0
+            failed = 0
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_export_one, str(img), str(target), mask_size): img for img in todo}
+                for future in as_completed(futures):
+                    img = futures[future]
+                    done += 1
+                    try:
+                        out_path, cost = future.result()
+                        if out_path is None:
+                            failed += 1
+                    except Exception as exc:  # pragma: no cover
+                        failed += 1
+                        logger.warning("失败: %s (%s)", img.name, exc)
+                        continue
+                    if done % 50 == 0 or done == len(todo):
+                        elapsed = time.perf_counter() - t_start
+                        eta = elapsed / max(done, 1) * (len(todo) - done)
+                        logger.info("  %s: %d/%d | %.1f 张/s | 剩余约 %.0f s | 失败 %d",
+                                    split, done, len(todo), done / max(elapsed, 1e-6), eta, failed)
+            logger.info("掩码导出完成: %s (%d 张, 失败 %d)", target, len(todo) - failed, failed)
         logger.info("把配置中的 data.mask_dir 设为: %s", out_root)
     return 0
 

@@ -158,6 +158,10 @@ DATASET_ROOT/
 你的 yaml 里目前是 Windows 绝对路径（`D:/tyhn/...`），两种方式二选一：
 
 ```bash
+# 可选：预计算布面掩码（多进程 + 按经纬周期自动降采样，550 张约 1–2 分钟）
+python tools/prepare_dataset.py --root /data/fabric --export-masks --workers 8
+# 支持断点续跑（已存在的掩码自动跳过）与试跑：--limit 20 --mask-size 1024
+
 # 方式 A：不改 yaml，直接用 data.root 重映射
 python tools/prepare_dataset.py --root /data/fabric/source5_augmenteds
 

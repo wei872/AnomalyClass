@@ -87,6 +87,28 @@ def test_cloth_mask_estimation():
     assert mask[0, 0] == 0
 
 
+def test_cloth_mask_work_size_matches_full():
+    """降分辨率估计的掩码应与全分辨率基本一致 (auto 会按经纬周期定降采样倍数)."""
+    from fabric_ncd.data.demo import weave_image
+    from fabric_ncd.data.fabric_mask import auto_work_size, estimate_cloth_mask
+
+    rng = np.random.default_rng(4)
+    cloth = weave_image((320, 480), rng)
+    canvas = np.full((400, 640, 3), 35, dtype=np.uint8)
+    canvas[40:360, 80:560] = cloth
+
+    full, _ = estimate_cloth_mask(canvas)
+    ws = auto_work_size(canvas)
+    assert ws is None or ws >= 64
+    fast, _ = estimate_cloth_mask(canvas, work_size="auto")
+
+    inter = np.logical_and(full, fast).sum()
+    union = np.logical_or(full, fast).sum()
+    assert union > 0
+    assert inter / union > 0.90
+    assert full[0, 0] == 0 and full[200, 320] == 1
+
+
 def test_yolo_dataset(tmp_path):
     root = make_dataset(tmp_path, n_train=4, n_val=2, n_normal=2)
     spec = load_dataset_spec({"data": {"dataset_yaml": str(root / "dataset.yaml")}})

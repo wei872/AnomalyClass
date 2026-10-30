@@ -237,6 +237,8 @@ class FabricDataset(Dataset):
         aug_cfg.setdefault("image_size", self.image_size)
         self.transform = TrainAugment(aug_cfg) if train else EvalTransform(aug_cfg)
 
+        cfg_data = (augment_cfg or {})
+        self.mask_work_size = cfg_data.get("mask_work_size", "auto")
         self.defect_entries = self._collect(spec.splits.get(split), spec.labels.get(split), spec.mask_dir, normal=False, split=split)
         self.normal_entries = self._collect(spec.normal_splits.get(split), None, spec.mask_dir, normal=True, split=split)
         # 空标注的图也算正常图
@@ -336,11 +338,11 @@ class FabricDataset(Dataset):
         key = str(entry.image)
         if self.cache_masks and key in self._cloth_cache:
             return self._cloth_cache[key]
-        mask, confidence = estimate_cloth_mask(image)
+        mask, confidence = estimate_cloth_mask(image, work_size=self.mask_work_size)
         if confidence <= 0:
             mask = np.ones((h, w), dtype=np.uint8)
         if self.cache_masks:
-            if len(self._cloth_cache) > 512:
+            if len(self._cloth_cache) > 4096:
                 self._cloth_cache.clear()
             self._cloth_cache[key] = mask
         return mask
@@ -418,6 +420,7 @@ def build_datasets(cfg: Dict[str, Any]) -> Dict[str, FabricDataset]:
         image_size = [image_size, image_size]
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
+    aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
     normal_ratio = float(data_cfg.get("normal_ratio", 0.4))
     datasets: Dict[str, FabricDataset] = {
         "train": FabricDataset(
@@ -472,6 +475,7 @@ def build_normal_dataset(cfg: Dict[str, Any], split: str = "train") -> Optional[
         image_size = [image_size, image_size]
     aug_cfg = dict(data_cfg.get("augment", {}))
     aug_cfg["image_size"] = tuple(image_size)
+    aug_cfg["mask_work_size"] = data_cfg.get("mask_work_size", "auto")
     # 原尺度裁块训练时, 记忆库也必须用原尺度块建立, 否则分数尺度与推理时不一致
     native = str(aug_cfg.get("crop_mode", "scale")).lower() == "native"
     if native:

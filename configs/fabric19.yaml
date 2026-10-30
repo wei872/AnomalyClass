@@ -29,6 +29,8 @@ data:
   num_workers: 4
   normal_ratio: 0.4     # 每个 batch 中正常图比例 (正常图越多, 记忆库越稳)
   mask_dir: null        # 可选: 真实布面/背景掩码目录 (文件名与图片一致)
+  mask_work_size: auto  # 布面掩码估计的长边尺寸: auto = 按实测经纬周期自动定
+                        # (周期 6 px 的细密布只能缩到 ~1/2, 周期 20 px 可缩到 1/5)
   limit_train: null
   limit_val: null
 
