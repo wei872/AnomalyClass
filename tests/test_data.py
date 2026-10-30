@@ -151,3 +151,53 @@ def test_yolo_dataset(tmp_path):
     }
     datasets = build_datasets(loader_cfg)
     assert "train" in datasets and "val" in datasets
+
+def _strip_canvas(h, w, left, right, period=6, bg=35, seed=0):
+    """窄布条画布: 背景占大半画面, 用来复现"周期被台阶边缘带偏"的场景."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cloth = 128 + 30 * np.sin(2 * np.pi * xx / period) + 30 * np.sin(2 * np.pi * yy / period)
+    cloth = np.clip(cloth + rng.normal(0, 4, (h, w)), 0, 255)
+    canvas = np.full((h, w, 3), bg, dtype=np.float32)
+    canvas[:, left : w - right] = np.stack([cloth] * 3, -1)[:, left : w - right]
+    return canvas.astype(np.uint8)
+
+
+def test_period_not_fooled_by_cloth_edge():
+    """窄布条上多数窗口压在背景/交界, 周期不能被台阶边缘估成几十像素."""
+    from fabric_ncd.data.fabric_mask import _period_pixels
+
+    img = _strip_canvas(1220, 720, left=600, right=0, period=6)
+    gray = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
+    px, py = _period_pixels(gray)
+    assert 3.0 <= px <= 10.0 and 3.0 <= py <= 10.0, (px, py)
+
+
+def test_cloth_mask_narrow_strip_auto_matches_full():
+    """窄布条 (布只占画面 16%) 上 auto 降采样掩码仍要与全分辨率一致."""
+    from fabric_ncd.data.fabric_mask import auto_work_size, estimate_cloth_mask
+
+    img = _strip_canvas(1220, 720, left=600, right=0, period=6)
+    full, _ = estimate_cloth_mask(img)
+    ws = auto_work_size(img)
+    assert ws is None or ws >= 64
+    fast, _ = estimate_cloth_mask(img, work_size="auto")
+    inter = np.logical_and(full, fast).sum()
+    union = np.logical_or(full, fast).sum()
+    assert union > 0
+    assert inter / union > 0.95
+    # 覆盖率应贴近真实的布面占比 (120/720), 不能糊到背景里
+    assert abs(float(fast.mean()) - 120.0 / 720.0) < 0.02
+
+
+def test_cloth_mask_small_work_size_falls_back_to_color():
+    """强行给过小的 work_size (纹理被平均掉) 时, 应改用颜色线索而不是退化."""
+    from fabric_ncd.data.fabric_mask import estimate_cloth_mask
+
+    img = _strip_canvas(610, 360, left=100, right=100, period=6)
+    full, _ = estimate_cloth_mask(img)
+    fast, _ = estimate_cloth_mask(img, work_size=128)  # 约等于 2440 -> 512 的压缩比
+    inter = np.logical_and(full, fast).sum()
+    union = np.logical_or(full, fast).sum()
+    assert inter / union > 0.95
+    assert abs(float(fast.mean()) - float(full.mean())) < 0.03

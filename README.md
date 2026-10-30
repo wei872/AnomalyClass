@@ -173,7 +173,8 @@ DATASET_ROOT/
 python tools/prepare_dataset.py --root D:/data/fabric --export-defect-masks --workers 8
 
 # 可选：预计算布面掩码（多进程 + 按经纬周期自动降采样，550 张约 1–2 分钟）
-python tools/prepare_dataset.py --root /data/fabric --export-masks --workers 8
+# 会先抽 8 张判断是不是"整幅都是布"，是的话直接告警跳过（加 --force 可强导）
+python tools/prepare_dataset.py --root D:/data/fabric --export-masks --workers 8
 # 支持断点续跑（已存在的掩码自动跳过）与试跑：--limit 20 --mask-size 1024
 
 # 方式 A：不改 yaml，直接用 data.root 重映射
@@ -187,9 +188,24 @@ python tools/prepare_dataset.py --root /data/fabric --write-yaml dataset/fabric1
 并可选 `--export-masks` 预计算布面掩码（训练更快、前景监督更稳）：
 
 ```bash
-python tools/prepare_dataset.py --root /data/fabric --export-masks
-# 然后在 configs/fabric19.yaml 里设 data.mask_dir: /data/fabric/cloth_masks
+python tools/prepare_dataset.py --root D:/tyhn/yolo/dataset/source5_augmenteds --export-masks
+# 然后在 configs/fabric19.yaml 里设 data.mask_dir: D:/tyhn/yolo/dataset/source5_augmenteds/cloth_masks
 ```
+
+布面掩码估计的实测（1440×2440，单进程 CPU）：
+
+| 场景 | `work_size="auto"` 落点 | auto 耗时 | 与全分辨率 IoU |
+|---|---|---|---|
+| 整幅是布，经纬 6 px | 1220 | 0.32 s | 1.000 |
+| 布幅两侧各 400 px 背景 | 1220 | 0.32 s | 0.998 |
+| 布幅两侧各 400 px 背景，经纬 20 px | 512 | 0.36 s | 0.998 |
+| 窄布条（布只占画面 16%） | 1220 | 0.28 s | 1.000 |
+| 极细经纬 3 px（不能降采样） | 不降采样 | 0.97 s | 1.000 |
+| 手滑 `--mask-size 512`（纹理被平均掉） | 512 | 0.29 s | 0.994 |
+
+`auto` 不是简单地"缩到 512"：它先在**原始分辨率**上找到布面纹理最旺的位置量出经纬周期，
+据此保证缩放后周期仍 ≥ 3 px；量不准就逐次放大 `work_size` 重试，实在量不到就退回全分辨率。
+几何清理（开/闭/填洞/连通块）在回放分辨率上按同一物理尺度做，所以掩码边界不会因为降采样而变糊。
 
 ### 6.2 训练
 
