@@ -76,6 +76,18 @@ def resolve_device(device: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
+def describe_device(device: torch.device) -> str:
+    """设备的人话描述 (CUDA 时带显卡型号与显存), 便于确认真的用上了 GPU."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            props = torch.cuda.get_device_properties(index)
+            return f"cuda:{index} {props.name} ({props.total_memory / 2**30:.1f} GB)"
+        except Exception:  # pragma: no cover
+            return f"cuda:{index}"
+    return str(device)
+
+
 def set_seed(seed: int = 42, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)

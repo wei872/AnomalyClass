@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .utils import move_to
+
 
 # --------------------------------------------------------------------------- #
 # 基础损失
@@ -98,6 +100,7 @@ def build_label_map(
     size: tuple[int, int],
     ignore_index: int = -100,
     shrink: float = 1.0,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """把检测框转成特征尺度上的逐像素类别图.
 
@@ -106,7 +109,9 @@ def build_label_map(
     边缘的标签噪声 (尤其适用于经纬线类细长疵点).
     """
     h, w = size
-    labels = torch.full((len(boxes), h, w), ignore_index, dtype=torch.long)
+    # 必须建在 logits 所在的设备上: 否则 CUDA 训练时 cross_entropy 会报
+    # "Expected all tensors to be on the same device"
+    labels = torch.full((len(boxes), h, w), ignore_index, dtype=torch.long, device=device)
     for b, box in enumerate(boxes):
         if box.numel() == 0:
             continue
@@ -179,6 +184,9 @@ class FabricCriterion(nn.Module):
         memory=None,
     ) -> tuple[torch.Tensor, Dict[str, float]]:
         device = outputs["anomaly_logit"].device
+        # 目标可能停在 CPU 上 (例如自定义 collate / 单测手工喂数据): 统一搬到输出设备,
+        # 避免 "Expected all tensors to be on the same device" 这类只在 GPU 上出现的报错
+        targets = move_to(dict(targets), device)
         logs: Dict[str, float] = {}
         total = torch.zeros((), device=device)
 
@@ -223,7 +231,9 @@ class FabricCriterion(nn.Module):
             logs.update(cloth=loss_cloth.item(), edge=loss_edge.item(), loss_fabric=loss_fab.item())
 
         # ---------- 3. 疵点分类 (弱监督, 仅框内) ----------
-        label_map = build_label_map(targets["boxes"], (h, w), self.ignore_index, self.cls_shrink)
+        label_map = build_label_map(
+            targets["boxes"], (h, w), self.ignore_index, self.cls_shrink, device=device
+        )
         class_logits = outputs["class_logits"]  # (B,C,h,w)
         loss_cls, acc = masked_ce(class_logits, label_map, self.ignore_index, self.cls_smoothing)
         if loss_cls is not None:
@@ -268,6 +278,7 @@ def masked_ce(
     smoothing: float = 0.0,
 ) -> tuple[Optional[torch.Tensor], float]:
     """仅在有效标签处计算 CE, 返回 (loss, acc)."""
+    labels = labels.to(logits.device)  # 防御: 调用方漏搬设备时也只在这里修正
     valid = labels != ignore_index
     if not valid.any():
         return None, 0.0

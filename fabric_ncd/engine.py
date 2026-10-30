@@ -34,6 +34,7 @@ from .ops import topk_mean
 from .utils import (
     AverageMeter,
     Timer,
+    describe_device,
     ensure_dir,
     format_seconds,
     get_logger,
@@ -398,6 +399,19 @@ class Trainer:
             self.logger.warning("读取数据集类别信息失败: %s", exc)
 
         self.datasets = build_dataloaders(cfg)
+        data_cfg = cfg.get("data", {})
+        self.logger.info(
+            "训练设备: %s | AMP: %s | num_workers: %s",
+            describe_device(self.device),
+            "on" if self.amp else "off",
+            data_cfg.get("num_workers"),
+        )
+        self.logger.info(
+            "输入尺寸: %s | batch_size: %s | epochs: %s",
+            data_cfg.get("image_size"),
+            data_cfg.get("batch_size"),
+            self.epochs,
+        )
         self.train_loader = self.datasets["train"]
         self.val_loader = self.datasets["val"]
         self.normal_loader = build_normal_loader(cfg, "train")
@@ -642,28 +656,31 @@ class Trainer:
         for step, batch in enumerate(self.train_loader):
             batch = move_to(batch, self.device)
             images = batch["image"]
-            with torch.autocast(device_type=self.device.type, enabled=self.amp):
-                outputs = self.model(images)
-                targets = {
-                    "defect_mask": batch["anomaly_mask"],
-                    "cloth_mask": batch["cloth_mask"],
-                    "boxes": batch["boxes"],
-                }
-                loss, logs = self.criterion(outputs, targets, memory=self.model.memory)
+            try:
+                with torch.autocast(device_type=self.device.type, enabled=self.amp):
+                    outputs = self.model(images)
+                    targets = {
+                        "defect_mask": batch["anomaly_mask"],
+                        "cloth_mask": batch["cloth_mask"],
+                        "boxes": batch["boxes"],
+                    }
+                    loss, logs = self.criterion(outputs, targets, memory=self.model.memory)
 
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.scaler is not None and self.amp:
-                self.scaler.scale(loss).backward()
-                if float(self.train_cfg.get("grad_clip", 5.0)) > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.train_cfg["grad_clip"]))
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                if float(self.train_cfg.get("grad_clip", 5.0)) > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.train_cfg["grad_clip"]))
-                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.scaler is not None and self.amp:
+                    self.scaler.scale(loss).backward()
+                    if float(self.train_cfg.get("grad_clip", 5.0)) > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.train_cfg["grad_clip"]))
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    if float(self.train_cfg.get("grad_clip", 5.0)) > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.train_cfg["grad_clip"]))
+                    self.optimizer.step()
+            except torch.cuda.OutOfMemoryError:
+                raise self._oom_error() from None
             self.scheduler.step()
             self.global_step += 1
             if self.ema is not None:
@@ -688,6 +705,19 @@ class Trainer:
                     timer.elapsed,
                 )
         return {k: v.avg for k, v in meters.items() if v.count > 0}
+
+    def _oom_error(self) -> RuntimeError:
+        """把 CUDA OOM 变成可以照着做的提示 (6GB 卡上最常见)."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        data = self.cfg.get("data", {})
+        return RuntimeError(
+            "显存不足 (CUDA OOM). 当前 data.image_size=%s, data.batch_size=%s.\n"
+            "按这个顺序降: --set data.image_size=[768,1280] -> [640,1088] -> [512,864] "
+            "(保持长宽比, 宽高都是 32 的倍数), 或 --set data.batch_size=2.\n"
+            "不要用增大 tile 的方式省显存, 也不要靠减分辨率以外的改动硬凑."
+            % (data.get("image_size"), data.get("batch_size"))
+        )
 
     # ------------------------------------------------------------------ #
     def _composite_score(self, metrics: Dict[str, float]) -> float:

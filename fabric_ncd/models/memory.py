@@ -100,7 +100,9 @@ class MemoryBank(nn.Module):
         if not self.is_ready:
             sims = torch.zeros(b, flat.shape[1], device=embeddings.device)
         else:
-            bank = F.normalize(self.features[: int(self.size.item())], dim=1)
+            # 与查询同一 dtype: eval 时模型可能是半精度, 库是 fp32 buffer,
+            # einsum 混精度会直接报错
+            bank = F.normalize(self.features[: int(self.size.item())].to(embeddings.dtype), dim=1)
             outputs = []
             for start in range(0, flat.shape[1], chunk):
                 part = flat[:, start : start + chunk]
@@ -125,6 +127,9 @@ def compact_loss(bank: MemoryBank, embeddings: torch.Tensor) -> torch.Tensor:
     """可微的 "正常嵌入靠近记忆库" 正则项."""
     if not bank.is_ready:
         return embeddings.new_zeros(())
-    bank_feat = F.normalize(bank.features[: int(bank.size.item())].detach(), dim=1)
+    # 同样要对齐 dtype: autocast(fp16/bf16) 下 embedding 是半精度, 库是 fp32
+    bank_feat = F.normalize(
+        bank.features[: int(bank.size.item())].detach().to(embeddings.dtype), dim=1
+    )
     sim = torch.einsum("bdhw,nd->bnhw", F.normalize(embeddings, dim=1), bank_feat)
     return (1.0 - sim.max(dim=1).values).mean()
