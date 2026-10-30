@@ -112,3 +112,24 @@ def test_spearman_and_pair_auc():
     ]
     assert _pair_auc(rows, "s", same_src=True) == (1.0, 2)
     assert _pair_auc(rows, "s", same_src=False) == (0.5, 2)
+
+
+def test_grouped_auroc_ignores_between_group_shift():
+    """跨批次偏移不该影响"同批次内是否分得开"这个指标."""
+    import numpy as np
+
+    from fabric_ncd.metrics import grouped_auroc
+
+    # A 批: 疵点 0.9 / 正常 0.8;  B 批: 疵点 0.3 / 正常 0.2
+    labels = [1, 0, 1, 0]
+    scores = [0.9, 0.8, 0.3, 0.2]
+    groups = ["A", "A", "B", "B"]
+    auc, pairs = grouped_auroc(labels, scores, groups)
+    assert pairs == 2 and auc == 1.0
+    # 全局 AUROC 只有 0.75: 批次偏移把 B 批的两张图整体压到 A 批下面, 顺序被搅乱
+    from fabric_ncd.metrics import auroc
+
+    assert abs(auroc(np.asarray(labels), np.asarray(scores)) - 0.75) < 1e-9
+    # 没有任何组同时含两类 -> nan
+    auc2, pairs2 = grouped_auroc([1, 1, 0, 0], scores, groups)
+    assert np.isnan(auc2) and pairs2 == 0

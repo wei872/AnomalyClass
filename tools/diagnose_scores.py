@@ -462,7 +462,12 @@ def _probe(args) -> int:
     import torch  # 只有完整探针才需要
     from torch.nn import functional as F
 
-    from fabric_ncd.data.yolo import build_dataloaders, build_normal_dataset, build_normal_loader
+    from fabric_ncd.data.yolo import (
+        build_background_loader,
+        build_dataloaders,
+        build_normal_dataset,
+        build_normal_loader,
+    )
     from fabric_ncd.models.fabric_ncd import FabricNCD
     from fabric_ncd.ops import topk_mean
     from fabric_ncd.utils import load_yaml, resolve_device
@@ -498,22 +503,37 @@ def _probe(args) -> int:
             key = source_of(entry.image.name, args.group_depth)
             train_src[key] = train_src.get(key, 0) + 1
 
-    normal_loader = build_normal_loader(cfg, "train")
+    # 参照集必须和训练时一致 (train.memory_source): 否则探针里的记忆项和引擎里的不是
+    # 同一个东西, 分数就不可比 —— 这是最容易把人带偏的地方.
+    memory_source = str(cfg.get("train", {}).get("memory_source", "both")).lower()
+    bank_loaders = []
+    if "defect" in memory_source:
+        bg = build_background_loader(cfg, "train", shuffle=False)
+        if bg is not None:
+            bank_loaders.append(("疵点图框外布面", bg))
+    nl = build_normal_loader(cfg, "train")
+    if nl is not None and ("normal" in memory_source or not bank_loaders):
+        bank_loaders.append(("良品图", nl))
     bank_images = 0
     bank_src: Dict[str, int] = defaultdict(int)
-    if normal_loader is not None:
+    if bank_loaders:
         model.memory.reset()
         with torch.no_grad():
-            for i, batch in enumerate(normal_loader):
-                model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
-                bank_images += int(batch["image"].shape[0])
-                for path in batch["path"]:
-                    key = source_of(path, args.group_depth)
-                    bank_src[key] += 1
-                if args.memory_batches and i + 1 >= args.memory_batches:
+            for kind, bank_loader in bank_loaders:
+                LOGGER.info("记忆库来源: %s (%d 张)", kind, len(bank_loader.dataset))
+                for i, batch in enumerate(bank_loader):
+                    model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
+                    bank_images += int(batch["image"].shape[0])
+                    for path in batch["path"]:
+                        key = source_of(path, args.group_depth)
+                        bank_src[key] += 1
+                    if args.memory_batches and i + 1 >= args.memory_batches:
+                        break
+                if args.memory_batches and bank_images >= args.memory_batches * int(
+                    cfg.get("data", {}).get("eval_batch_size", 2)
+                ):
                     break
-        LOGGER.info("记忆库: 用 %d 张训练正常图建立 (共 %d 张可用)",
-                    bank_images, len(train_ds) if train_ds else 0)
+        LOGGER.info("记忆库: 用 %d 张参照图建立", bank_images)
 
     topk = int(cfg.get("eval", {}).get("topk_pixels", 256) or 256)
     gate = bool(cfg.get("eval", {}).get("cloth_gate", True))

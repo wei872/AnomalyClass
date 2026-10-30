@@ -426,7 +426,7 @@ class DefectBackgroundDataset(Dataset):
         augment_cfg: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
         train: bool = True,
-        box_pad: int = 6,
+        box_pad: int = 12,
     ) -> None:
         aug_cfg = dict(augment_cfg or {})
         aug_cfg["image_size"] = tuple(image_size)
@@ -449,7 +449,9 @@ class DefectBackgroundDataset(Dataset):
         cloth = (sample["cloth_mask"] > 0.5).numpy()[0]
         defect = (sample["defect_mask"] > 0.5).numpy()[0]
         if defect.any():
-            # 框是弱标注, 边界常比真实疵点大/小, 先膨胀再挖掉, 免得把疵点边缘当正常
+            # 框是弱标注, 边界常比真实疵点大/小, 先膨胀再挖掉, 免得把疵点边缘当正常.
+            # 漏进来的少量疵点像素会污染参照分布的长尾, 把校准阈值顶到疵点分数上
+            # (表现为"正常最大值"远离 q0.999), 所以默认留 12 px 余量.
             defect = binary_dilate(defect.astype(np.uint8), self.box_pad) > 0
         bg = (cloth & ~defect).astype(np.float32)
         if bg.sum() < 0.02 * bg.size:  # 框太大/布面太小: 这张图没有可信的框外区域
@@ -468,8 +470,14 @@ class DefectBackgroundDataset(Dataset):
 def build_background_loader(
     cfg: Dict[str, Any], split: str = "train", shuffle: bool = True
 ) -> Optional[DataLoader]:
-    """疵点图框外布面的 loader (见 :class:`DefectBackgroundDataset`)."""
+    """疵点图框外布面的 loader (见 :class:`DefectBackgroundDataset`).
+
+    ``train.memory_augment`` 决定参照集是否做训练增广. **默认关闭**: 参照集的分数
+    统计要直接和推理时对齐 (推理是整图缩放, 没有随机裁块), 否则用参照集定的阈值
+    拿到整图上会整体偏移, 表现为"pixelAUROC 正常但检出率 0".
+    """
     data_cfg = cfg.get("data", {})
+    augment = bool(cfg.get("train", {}).get("memory_augment", False))
     spec = load_dataset_spec(cfg)
     image_size = resolve_image_size(cfg, spec)
     aug_cfg = dict(data_cfg.get("augment", {}))
@@ -477,7 +485,7 @@ def build_background_loader(
     aug_cfg["cloth_mask"] = data_cfg.get("cloth_mask", "estimate")
     try:
         dataset = DefectBackgroundDataset(
-            spec, split, tuple(image_size), augment_cfg=aug_cfg, train=True,
+            spec, split, tuple(image_size), augment_cfg=aug_cfg, train=augment,
             limit=data_cfg.get("limit_train"),
         )
     except FileNotFoundError:

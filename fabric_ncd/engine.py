@@ -34,7 +34,7 @@ from .data.yolo import (
     load_dataset_spec,
 )
 from .losses import FabricCriterion
-from .metrics import MetricAccumulator, auroc
+from .metrics import MetricAccumulator, auroc, grouped_auroc
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer, postprocess_outputs
 from .ops import bbox_iou, threshold_from_normal_pixels, topk_mean
@@ -96,6 +96,12 @@ def _reshuffled(cfg: Dict[str, Any], loader) -> Optional[Any]:
     if dataset is not None:
         return build_normal_loader(cfg, "train", shuffle=True)
     return None
+
+
+def _source_of(path: str, depth: int = 1) -> str:
+    """文件名前缀 = 布料批次号 (DA9670287_... -> DA9670287)."""
+    parts = [p for p in Path(str(path)).stem.split("_") if p]
+    return "_".join(parts[:depth]) if parts else Path(str(path)).stem
 
 
 def gate_by_cloth(score, cloth, enabled: bool = True):
@@ -161,9 +167,12 @@ def evaluate(
     # 图上真正的"假阳"——每张疵点图的框外区域就是这块布的正常纹理.
     outside_fp = 0
     outside_fp_images = 0
+    normal_region_total = 0
+    normal_images = 0
     # 图像级聚合方式对比: 小疵点用 top-k 均值容易被稀释, 这里同时统计 peak 与小 top-k
     agg = {"topk": [], "top16": [], "max": []}
     agg_labels: List[int] = []
+    agg_src: List[str] = []
 
     for batch in loader:
         batch = move_to(batch, device)
@@ -191,8 +200,12 @@ def evaluate(
             agg["top16"].append(topk_mean(score_np[i], k_pixels=16))
             agg["max"].append(float(score_np[i].max()))
             agg_labels.append(0 if normal else 1)
+            agg_src.append(_source_of(str(batch["path"][i])))
             infos, image_level = region_results[i]
             region_total += len(infos)
+            if normal:
+                normal_images += 1
+                normal_region_total += len(infos)
             if not normal:
                 defect_images += 1
                 if infos:
@@ -206,7 +219,7 @@ def evaluate(
                 "labels": gt_labels,
             }
             pred_boxes, pred_scores, pred_labels = _regions_to_boxes(infos, w, h, cfg)
-            if infos:
+            if infos and not normal:  # 只统计"这块布"上的假阳 (正常图属于别的布种)
                 gt_xyxy = gt_dict["boxes"]
                 outside_fp_images += 1
                 for box in pred_boxes:
@@ -261,8 +274,13 @@ def evaluate(
     # 框外误报密度 = 每张图的假阳区域数 (与任何 GT 框 IoU<0.1 的区域).
     # 没有同批次良品图时, 这是唯一能在"这块布"上量化假阳的指标.
     metrics["outside_fp_per_image"] = outside_fp / max(1, outside_fp_images)
+    metrics["normal_regions_per_image"] = normal_region_total / max(1, normal_images)
     if agg_labels and 0 < sum(agg_labels) < len(agg_labels):
         for key, values in agg.items():
+            lot_auc, lot_pairs = grouped_auroc(agg_labels, values, agg_src)
+            if key == "topk":
+                metrics["image_auroc_same_lot"] = lot_auc
+                metrics["image_auroc_same_lot_pairs"] = lot_pairs
             metrics[f"image_auroc_{key}"] = auroc(np.asarray(agg_labels), np.asarray(values))
     if collect_predictions:
         metrics["predictions"] = predictions
@@ -533,6 +551,9 @@ class Trainer:
         self.ema = ModelEMA(self.model, float(self.train_cfg.get("ema", 0.999))) if self.train_cfg.get("ema", 0.999) > 0 else None
         self.analyzer = RegionAnalyzer(
             names=_class_names(cfg),
+            # 必须把 eval.cloth_gate 传下去: 漏掉这一项时 RegionAnalyzer 默认 True,
+            # 配置里的 cloth_gate: false 会被静默忽略, 区域提取仍然被布面掩码裁一刀.
+            use_cloth=bool(cfg.get("eval", {}).get("cloth_gate", True)),
             threshold=cfg.get("eval", {}).get("threshold"),
             sigma=float(cfg.get("eval", {}).get("threshold_sigma", 3.0)),
             min_area_ratio=float(cfg.get("eval", {}).get("min_area_ratio", 4e-4)),
@@ -666,7 +687,10 @@ class Trainer:
                 started = time.time()
                 metrics = evaluate(
                     model, val_loader, cfg_s, self.device, criterion=None,
-                    analyzer=RegionAnalyzer(names=None, threshold=None),
+                    analyzer=RegionAnalyzer(
+                        names=None, threshold=None,
+                        use_cloth=bool(cfg_s.get("eval", {}).get("cloth_gate", True)),
+                    ),
                     max_samples=max_samples or None,
                 )
                 elapsed = time.time() - started
@@ -950,17 +974,20 @@ class Trainer:
                     format_seconds(timer.elapsed),
                 )
                 self.logger.info(
-                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f (top16 %.3f / max %.3f) | mAP50 %.4f | "
-                    "检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图, 框外误报 %.2f/图) | thr %.4f",
+                    "  检测 | pixelAUROC %.4f | imgAUROC %.4f (top16 %.3f / max %.3f) | 同批次AUROC %.3f | "
+                    "mAP50 %.4f | 检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图, 框外误报 %.2f/图) | "
+                    "正常图 %.2f 区域/图 | thr %.4f",
                     metrics.get("pixel_auroc", float("nan")),
                     metrics.get("image_auroc", float("nan")),
                     metrics.get("image_auroc_top16", float("nan")),
                     metrics.get("image_auroc_max", float("nan")),
+                    metrics.get("image_auroc_same_lot", float("nan")),
                     metrics.get("map50", float("nan")),
                     metrics.get("det_rate", 0.0),
                     int(metrics.get("num_defect_images", 0)),
                     metrics.get("regions_per_image", 0.0),
                     metrics.get("outside_fp_per_image", 0.0),
+                    metrics.get("normal_regions_per_image", 0.0),
                     float(self.analyzer.threshold or 0.0),
                 )
                 if (

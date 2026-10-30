@@ -61,6 +61,36 @@ def spearman(a: Sequence[float], b: Sequence[float]) -> float:
     return float((ra * rb).sum() / denom)
 
 
+def grouped_auroc(
+    y_true: Sequence[float], y_score: Sequence[float], groups: Sequence[str]
+) -> Tuple[float, int]:
+    """同组内 AUROC (按正负样本对数量加权平均), 只用同时含两类的组.
+
+    跨组比较会被"组"本身的差异污染 (不同布料批次/机台/曝光): 分数可能完美区分
+    "这是哪一批布", 而同组内一点都分不开. 这个指标把组间偏移去掉, 只看同组内
+    是否分得开. 返回 (AUROC, 有效对数); 没有任何组同时含两类时返回 (nan, 0).
+    """
+    y_true = np.asarray(y_true).astype(bool).ravel()
+    y_score = np.asarray(y_score, dtype=np.float64).ravel()
+    groups = np.asarray(groups).ravel()
+    total_w = 0.0
+    acc = 0.0
+    for name in np.unique(groups):
+        sel = groups == name
+        lab, val = y_true[sel], y_score[sel]
+        if lab.min() == lab.max():
+            continue
+        auc = auroc(lab, val)
+        if not np.isfinite(auc):
+            continue
+        w = int(lab.sum()) * int((~lab).sum())
+        acc += auc * w
+        total_w += w
+    if total_w <= 0:
+        return float("nan"), 0
+    return acc / total_w, int(total_w)
+
+
 def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y_true = np.asarray(y_true).astype(bool).ravel()
     y_score = np.asarray(y_score, dtype=np.float64).ravel()

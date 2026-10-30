@@ -141,6 +141,9 @@ train:
   #   用良品图建库等于拿另一种材料当参照: 记忆项距离、阈值都会系统性偏, 图级分数可以整体反向.
   #   这时必须用 defect_outside.
   memory_source: defect_outside
+  # 参照集(框外布面)是否做训练增广. 默认关闭: 参照集的分数统计必须与推理对齐
+  # (推理是整图缩放, 没有随机裁块), 否则阈值在整图上整体偏移 -> 检出率变 0.
+  memory_augment: false
   memory_shuffle: true
   memory_warmup_batches: 24
   # 记忆库必须跟当前嵌入一致: 只在第 5/10/15... 轮重建时, 前几轮嵌入变化最快,
@@ -185,7 +188,9 @@ eval:
   topk_pixels: 256
   topk_ratio: 0.01        # 仅在 topk_pixels 未设置时生效
   calib_interval: 1       # 每几轮用正常图重新校准阈值; 设成 >= epochs 即等于只在启动时校准
-  calib_batches: 12       # 重新校准时用几个 batch 的正常图 (越多越稳, 越慢)
+  # 阈值校准用的参照图批次数. memory_source: defect_outside 时参照图是**框外布面裁剪**,
+  # 单张的信息量比整张良品图小, 所以取 24 批 (48 张) 让阈值稳一点.
+  calib_batches: 24       # 重新校准时用几个 batch 的正常图 (越多越稳, 越慢)
   calib_smooth: 0.5       # 阈值的指数滑动平均系数: 0 = 完全跟随当轮, 越大越平滑
                           # 8 张图估 99.9 分位会在 0.50~0.61 之间乱跳, 检出率随之翻来覆去
 
