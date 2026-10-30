@@ -412,6 +412,7 @@ class Trainer:
             data_cfg.get("batch_size"),
             self.epochs,
         )
+        self._warn_memory(data_cfg)
         self.train_loader = self.datasets["train"]
         self.val_loader = self.datasets["val"]
         self.normal_loader = build_normal_loader(cfg, "train")
@@ -705,6 +706,33 @@ class Trainer:
                     timer.elapsed,
                 )
         return {k: v.avg for k, v in meters.items() if v.count > 0}
+
+    # 实测系数: 1024x1728 (1.77 Mpx) 训练含反向约 1.40 GB -> 0.79 GB/百万像素
+    MEM_GB_PER_MPX = 0.79
+
+    def _warn_memory(self, data_cfg: Dict[str, Any]) -> None:
+        """按输入尺寸 × batch 粗估训练显存, 超卡就提前说, 别等 OOM."""
+        try:
+            size = data_cfg.get("image_size")
+            if isinstance(size, str) or not size:
+                return
+            h, w = int(size[0]), int(size[1])
+            batch = int(data_cfg.get("batch_size", 1))
+        except Exception:  # pragma: no cover
+            return
+        est = self.MEM_GB_PER_MPX * (h * w) / 1e6 * max(batch, 1)
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            self.logger.info("预计训练显存 (估算): %.1f GB (非 CUDA 设备, 仅供参考)", est)
+            return
+        total = torch.cuda.get_device_properties(self.device).total_memory / 2**30
+        self.logger.info("预计训练显存 (估算): %.1f GB / 显卡 %.1f GB", est, total)
+        if est > 0.85 * total:
+            self.logger.warning(
+                "按 %.0fx%d x batch %d 估算要 %.1f GB, 超过 %.1f GB 显存的 85%%, 很可能 OOM. "
+                "把 batch_size 减半, 或 --set data.short_side=%d",
+                h, w, batch, est, total,
+                max(256, int(min(h, w) * 0.75) // 32 * 32),
+            )
 
     def _oom_error(self) -> RuntimeError:
         """把 CUDA OOM 变成可以照着做的提示 (6GB 卡上最常见)."""

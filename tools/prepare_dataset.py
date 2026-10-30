@@ -125,6 +125,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="每类最多处理多少张 (先小规模试跑)")
     parser.add_argument("--force", action="store_true", help="覆盖已存在的掩码 (默认跳过, 支持断点续跑)")
     parser.add_argument("--check-images", action="store_true", help="逐张打开图片, 检测损坏文件 (较慢)")
+    parser.add_argument("--size-scan", type=int, default=400, help="每个 split 统计多少张图的尺寸")
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
@@ -169,6 +170,20 @@ def main() -> int:
             "%-5s | 图像 %5d | 标注 %6d | 空标注 %4d | 无标注文件 %4d | 正常图 %5d",
             split, len(images), labels, empty, missing, len(normals),
         )
+        # 原图尺寸分布: 尺寸不统一会直接影响 image_size=auto 的推导与训练时的缩放变形
+        sizes = Counter()
+        for img in (images + normals)[: args.size_scan]:
+            try:
+                with Image.open(img) as im:
+                    w, h = im.size
+            except Exception:
+                continue
+            sizes[(h, w)] += 1
+        if sizes:
+            top = ", ".join(f"{h}x{w} x{n}" for (h, w), n in sizes.most_common(3))
+            logger.info("      | 尺寸(高x宽): %s%s", top, "" if len(sizes) == 1 else f"  <-- 共 {len(sizes)} 种")
+            if len(sizes) > 1:
+                logger.warning("      | 该 split 内尺寸不统一, 不同长宽比的图会被拉伸变形")
         if args.check_images:
             bad = []
             for img in images[: 5000]:

@@ -179,3 +179,31 @@ def test_auto_on_real_1600x846(tmp_path):
     cfg = load_yaml("configs/fabric19.yaml")
     cfg["data"].update({"image_size": "auto", "short_side": 1024, "max_scale": 1.0})
     assert resolve_image_size(cfg, spec=_Spec) == (832, 1600)
+
+
+def test_size_census_prefers_dominant_size(tmp_path):
+    """尺寸不统一时, auto 要按**最常见的**那一档算, 而不是第一张/中位数."""
+    from PIL import Image
+
+    from fabric_ncd.data.yolo import image_size_census, native_image_size, resolve_image_size
+
+    d = tmp_path / "images" / "train"
+    d.mkdir(parents=True)
+    for i in range(6):  # 主流尺寸: 316x128 (1.89:1 的缩比)
+        Image.new("RGB", (316, 128)).save(d / f"a{i}.jpg")
+    for i in range(2):  # 少数派: 180x96
+        Image.new("RGB", (180, 96)).save(d / f"b{i}.jpg")
+
+    class _Spec:
+        splits = {"train": d}
+        normal_splits: dict = {}
+
+    census = image_size_census(_Spec)
+    assert list(census)[0] == (128, 316)  # 首项 = 最常见
+    assert census[(128, 316)] == 6 and census[(96, 180)] == 2
+    assert native_image_size(_Spec) == (128, 316)
+
+    cfg = load_yaml("configs/fabric19.yaml")
+    cfg["data"].update({"image_size": "auto", "short_side": 64, "max_scale": 2.0})
+    h, w = resolve_image_size(cfg, spec=_Spec)
+    assert w > h  # 跟随主流尺寸的横图长宽比

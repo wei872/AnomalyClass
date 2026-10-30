@@ -415,38 +415,62 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 # 构建
 # --------------------------------------------------------------------------- #
 
-def native_image_size(spec: "DatasetSpec", samples: int = 8) -> Optional[Tuple[int, int]]:
-    """读几张图的原尺寸 (H, W), 返回中位数; 读不到返回 None."""
-    sizes: List[Tuple[int, int]] = []
-    candidates: List[Path] = []
-    for split in ("train", "val"):
-        path = getattr(spec, "splits", {}).get(split)
-        if path:
-            try:
-                candidates.extend(list_images(path)[:samples])
-            except Exception:  # pragma: no cover
-                continue
-        if len(candidates) >= samples:
-            break
-    for path in getattr(spec, "normal_splits", {}).values() or []:
-        if path and len(candidates) < samples:
-            try:
-                candidates.extend(list_images(path)[:samples])
-            except Exception:  # pragma: no cover
-                continue
-    for path in candidates[:samples]:
+def _iter_split_images(spec: "DatasetSpec", max_per_split: int = 400) -> List[Path]:
+    files: List[Path] = []
+    seen = set()
+    for path in list(getattr(spec, "splits", {}).values()) + list(getattr(spec, "normal_splits", {}).values()):
+        if not path:
+            continue
+        try:
+            for f in list_images(path)[:max_per_split]:
+                key = str(f)
+                if key not in seen:
+                    seen.add(key)
+                    files.append(f)
+        except Exception:  # pragma: no cover
+            continue
+    return files
+
+
+def image_size_census(spec: "DatasetSpec", max_per_split: int = 400) -> Dict[Tuple[int, int], int]:
+    """统计数据集里出现过的 (H, W) 及张数, 按张数降序返回 {Size: count}.
+
+    注意读的是**文件里的存储尺寸**, 与 ``load_rgb`` 一致 (不做 EXIF 旋转),
+    这样报告出来的数字就是网络真正看到的画面方向.
+    """
+    counts: Dict[Tuple[int, int], int] = {}
+    for path in _iter_split_images(spec, max_per_split):
         try:
             with Image.open(path) as im:
                 w, h = im.size
-            sizes.append((int(h), int(w)))
         except Exception:  # pragma: no cover
             continue
-    if not sizes:
+        key = (int(h), int(w))
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def native_image_size(spec: "DatasetSpec", samples: int = 400) -> Optional[Tuple[int, int]]:
+    """返回数据集中**最常见**的原图尺寸 (H, W); 读不到返回 None."""
+    census = image_size_census(spec, samples)
+    if not census:
         return None
-    arr = np.asarray(sizes, dtype=np.float64)
-    h = int(np.median(arr[:, 0]))
-    w = int(np.median(arr[:, 1]))
-    return (h, w) if h > 0 and w > 0 else None
+    return next(iter(census))  # 已按张数降序
+
+
+def _log_size_census(census: Dict[Tuple[int, int], int]) -> None:
+    total = sum(census.values())
+    if not total:
+        return
+    top = list(census.items())[:3]
+    detail = ", ".join(f"{h}x{w} x{n} ({100.0 * n / total:.1f}%)" for (h, w), n in top)
+    logger.info("原图尺寸统计 (扫描 %d 张): %s", total, detail)
+    if len(census) > 1:
+        logger.warning(
+            "数据集里有 %d 种尺寸. 训练会把每张图各自缩放到同一个输入尺寸: 长宽比相同的只是缩放, "
+            "长宽比不同的会被拉伸变形 (经纬周期比例失真). 建议先把数据集统一成一种尺寸.",
+            len(census),
+        )
 
 
 def resolve_image_size(cfg: Dict[str, Any], spec: Optional["DatasetSpec"] = None) -> Tuple[int, int]:
@@ -460,7 +484,9 @@ def resolve_image_size(cfg: Dict[str, Any], spec: Optional["DatasetSpec"] = None
     raw = data_cfg.get("image_size", "auto")
     if isinstance(raw, str) and raw.lower() == "auto":
         spec = spec or load_dataset_spec(cfg)
-        native = native_image_size(spec)
+        census = image_size_census(spec)
+        _log_size_census(census)
+        native = next(iter(census)) if census else None
         if native is None:
             resolved = (1024, 576)  # 兜底: 16:9, 至少有确定值
             logger.warning("无法读取原图尺寸, data.image_size=auto 回退为 %s", resolved)
