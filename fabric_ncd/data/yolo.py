@@ -414,7 +414,7 @@ class FabricDataset(Dataset):
             "boxes": boxes_t,
             "labels": labels,
             "image_label": int(labels[0]) if labels.numel() else -1,
-            "normal": bool(entry.normal or labels.numel() == 0),
+            "normal": bool(entry.normal),
             "path": str(entry.image),
         }
 
@@ -756,3 +756,24 @@ def build_normal_loader(
         pin_memory=True,
         collate_fn=collate_fn,
     )
+
+
+def build_reference_loaders(
+    cfg: Dict[str, Any], split: str = "train", shuffle: bool = False
+) -> List[DataLoader]:
+    """按 ``train.memory_source`` 构建与训练一致的参照集.
+
+    以前尺度扫描/阈值扫描无条件加 ``normal_loader``, 即使记忆库只用了
+    ``defect_outside``, 也会把正常图混进参照分布, 导致扫描结果与训练口径不一致.
+    """
+    source = str((cfg.get("train", {}) or {}).get("memory_source", "both")).lower()
+    loaders: List[DataLoader] = []
+    if "defect" in source or "both" in source:
+        bg = build_background_loader(cfg, split, shuffle=shuffle)
+        if bg is not None:
+            loaders.append(bg)
+    if "normal" in source or not loaders:
+        normal = build_normal_loader(cfg, split, shuffle=shuffle)
+        if normal is not None:
+            loaders.append(normal)
+    return loaders

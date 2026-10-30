@@ -120,7 +120,9 @@ class RegionAnalyzer:
         cloth_ok = (cloth > 0.5) if self.use_cloth else np.ones_like(cloth, dtype=bool)
         masked = score * cloth_ok
 
-        thr = self.threshold if self.threshold is not None else auto_threshold(masked, cloth, self.sigma)
+        thr = self.threshold if self.threshold is not None else auto_threshold(
+            masked, cloth if self.use_cloth else None, self.sigma
+        )
         binary = ((masked > thr) & cloth_ok).astype(np.uint8)
         binary = binary_close(binary_open(binary, self.open_radius), self.open_radius)
 
@@ -330,7 +332,13 @@ def select_k(
 ) -> Tuple[int, np.ndarray, np.ndarray]:
     """在 [k_min, k_max] 上按轮廓系数选 k."""
     n = len(features)
-    k_max = int(min(k_max, max(2, n - 1)))
+    if n <= 1:
+        labels = np.zeros(n, dtype=np.int64)
+        feats = np.asarray(features, dtype=np.float32)
+        centers = feats.reshape(n, feats.shape[1] if feats.ndim == 2 else 0).copy()
+        return max(1, n), labels, centers
+    k_max = int(min(k_max, n - 1))
+    k_min = max(2, min(int(k_min), k_max))
     best = (-2.0, None, None, 2)
     for k in range(k_min, k_max + 1):
         labels, centers, _ = kmeans_cosine(features, k, seed=seed)

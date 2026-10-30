@@ -31,6 +31,7 @@ from .data.yolo import (
     build_background_loader,
     build_dataloaders,
     build_normal_loader,
+    build_reference_loaders,
     load_dataset_spec,
 )
 from .losses import FabricCriterion
@@ -148,6 +149,42 @@ def image_score_of(score: np.ndarray, eval_cfg: dict) -> float:
     return float(peak)
 
 
+def analysis_stride_of(cfg: Dict[str, Any]) -> int:
+    """区域后处理/阈值校准共用的下采样倍数.
+
+    以前 ``evaluate`` 在 1/8 特征上做区域分析, ``evaluate_tiled`` 用全分辨率,
+    推理又用 ``infer.out_stride``; 三套分辨率对应三套阈值. 现在统一读
+    ``eval.analysis_stride``, 未配置时回退到推理的 ``out_stride``.
+    """
+    ev = cfg.get("eval", {}) or {}
+    raw = ev.get("analysis_stride")
+    if raw is None:
+        raw = (cfg.get("infer", {}) or {}).get("out_stride", 1)
+    if raw is None:
+        raw = 1
+    return max(1, int(raw))
+
+
+def _downsample_np(arr: np.ndarray, stride: int) -> np.ndarray:
+    if stride <= 1:
+        return arr
+    h, w = arr.shape[-2:]
+    sh, sw = max(8, int(math.ceil(h / stride))), max(8, int(math.ceil(w / stride)))
+    t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))[None, None]
+    t = F.interpolate(t, size=(sh, sw), mode="bilinear", align_corners=False)
+    return t[0, 0].numpy()
+
+
+def _downsample_mask_np(arr: np.ndarray, stride: int) -> np.ndarray:
+    if stride <= 1:
+        return arr.astype(bool)
+    h, w = arr.shape[-2:]
+    sh, sw = max(8, int(math.ceil(h / stride))), max(8, int(math.ceil(w / stride)))
+    t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))[None, None]
+    t = F.interpolate(t, size=(sh, sw), mode="nearest")
+    return t[0, 0].numpy() > 0.5
+
+
 def evaluate(
     model: FabricNCD,
     loader: DataLoader,
@@ -167,8 +204,11 @@ def evaluate(
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
     eval_cfg = cfg.get("eval", {})
     gate = bool(eval_cfg.get("cloth_gate", True))
+    analysis_stride = analysis_stride_of(cfg)
     acc = MetricAccumulator(num_classes=len(names), names=names)
-    if analyzer.threshold is not None:
+    if calibration and calibration.get("pixel_threshold_full") is not None:
+        acc.pixel_threshold = float(calibration["pixel_threshold_full"])
+    elif analyzer.threshold is not None:
         acc.pixel_threshold = float(analyzer.threshold)
     loss_meter = AverageMeter()
     predictions: List[Dict[str, Any]] = []
@@ -205,7 +245,17 @@ def evaluate(
         score = gate_by_cloth(score, cloth, gate)
         score_np = score.squeeze(1).detach().cpu().numpy()
 
-        region_results = postprocess_outputs(outputs, analyzer, input_size=(h, w))
+        analysis_outputs = outputs
+        if analysis_stride > 1:
+            ah, aw = max(8, int(math.ceil(h / analysis_stride))), max(8, int(math.ceil(w / analysis_stride)))
+            analysis_outputs = dict(outputs)
+            analysis_outputs["anomaly_score"] = F.interpolate(
+                outputs["anomaly_score"], size=(ah, aw), mode="bilinear", align_corners=False
+            )
+            analysis_outputs["cloth_prob"] = F.interpolate(
+                outputs["cloth_prob"], size=(ah, aw), mode="bilinear", align_corners=False
+            )
+        region_results = postprocess_outputs(analysis_outputs, analyzer, input_size=(h, w))
         for i in range(score.shape[0]):
             normal = bool(batch["normal"][i].item())
             image_score = image_score_of(score_np[i], eval_cfg)
@@ -334,7 +384,9 @@ def evaluate_tiled(
         analyzer.threshold = float(calibration.get("pixel_threshold", 0.0)) or None
 
     acc = MetricAccumulator(num_classes=len(names), names=names)
-    if analyzer.threshold is not None:
+    if calibration and calibration.get("pixel_threshold_full") is not None:
+        acc.pixel_threshold = float(calibration["pixel_threshold_full"])
+    elif analyzer.threshold is not None:
         acc.pixel_threshold = float(analyzer.threshold)
 
     image_size = _resolve_image_size(cfg)
@@ -343,6 +395,8 @@ def evaluate_tiled(
     tile_batch = int(eval_cfg.get("tile_batch", 4))
     gate = bool(eval_cfg.get("cloth_gate", True))
     max_pixels = float(eval_cfg.get("max_pixels", 3e5))
+    analysis_stride = analysis_stride_of(cfg)
+    target_period = float((cfg.get("infer", {}) or {}).get("weave_target_period", 8.0))
 
     defect_images = list_images(spec.splits.get(split))
     labels_dir = spec.labels.get(split)
@@ -369,9 +423,15 @@ def evaluate_tiled(
         maps = forward_maps(
             model, rgb, device, image_size,
             tile=True, tile_size=tile_hw, tile_overlap=overlap, tile_batch=tile_batch,
+            out_stride=1, probs_mul=analysis_stride,
+            weave_norm=True, target_period=target_period,
         )
         score = gate_by_cloth(maps["score"], maps["cloth"], gate)
-        infos, image_level = analyzer.analyze(score, maps["cloth"], maps["probs"])
+        score_analysis = _downsample_np(score, analysis_stride)
+        cloth_analysis = _downsample_np(maps["cloth"], analysis_stride)
+        infos, image_level = analyzer.analyze(
+            score_analysis, cloth_analysis, maps["probs"], probs_scale=1
+        )
         image_score = image_score_of(score, eval_cfg)
 
         # 像素级统计下采样, 大幅面图 (2000x3000) 全分辨率累计会吃掉数 GB 内存
@@ -534,7 +594,7 @@ class Trainer:
             else None
         )
         self.memory_loaders = []
-        if "defect" in self.memory_source and self.background_loader is not None:
+        if ("defect" in self.memory_source or "both" in self.memory_source) and self.background_loader is not None:
             self.memory_loaders.append(self.background_loader)
         if self.normal_loader is not None and (("normal" in self.memory_source) or not self.memory_loaders):
             self.memory_loaders.append(self.normal_loader)
@@ -605,9 +665,25 @@ class Trainer:
         bank = getattr(self, "_bank_paths", set()) if skip_bank else set()
         for loader in getattr(self, "memory_loaders", []) or []:
             for batch in loader:
-                if bank and any(str(p) in bank for p in batch.get("path", [])):
+                paths = [str(p) for p in batch.get("path", [])]
+                if not paths:
+                    yield batch
                     continue
-                yield batch
+                keep = [i for i, p in enumerate(paths) if p not in bank]
+                if not keep:
+                    continue
+                if len(keep) == len(paths):
+                    yield batch
+                    continue
+                filtered = {}
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor) and value.shape[0] == len(paths):
+                        filtered[key] = value[keep]
+                    elif isinstance(value, (list, tuple)) and len(value) == len(paths):
+                        filtered[key] = [value[i] for i in keep]
+                    else:
+                        filtered[key] = value
+                yield filtered
 
     def warmup_memory(self, max_batches: Optional[int] = None, calibrate: bool = True) -> None:
         if not self.memory_loaders or not self.model.memory_enabled:
@@ -678,14 +754,7 @@ class Trainer:
                 val_loader = datasets["val"]
                 resolved = tuple(cfg_s["data"]["image_size"])
                 model.memory.reset()
-                sweep_loaders = []
-                if "defect" in self.memory_source or "both" in self.memory_source:
-                    bg = build_background_loader(cfg_s, "train", shuffle=False)
-                    if bg is not None:
-                        sweep_loaders.append(bg)
-                nl = build_normal_loader(cfg_s, "train")
-                if nl is not None:
-                    sweep_loaders.append(nl)
+                sweep_loaders = build_reference_loaders(cfg_s, "train", shuffle=False)
                 built = 0
                 for loader in sweep_loaders:
                     for batch in loader:
@@ -760,6 +829,7 @@ class Trainer:
         if not getattr(self, "memory_loaders", None):
             return self.calibration
         eval_cfg = self.cfg.get("eval", {})
+        analysis_stride = analysis_stride_of(self.cfg)
         q = float(quantile if quantile is not None else eval_cfg.get("normal_quantile", 0.999))
         qi = float(image_quantile if image_quantile is not None else eval_cfg.get("image_quantile", 0.995))
         model = self.ema.ema if self.ema is not None else self.model
@@ -769,6 +839,10 @@ class Trainer:
         learned_parts: List[np.ndarray] = []
         dist_parts: List[np.ndarray] = []
         mask_parts: List[np.ndarray] = []
+        # 像素阈值与区域分析统一到 analysis_stride; 图像级分数仍用全分辨率.
+        pixel_learned: List[np.ndarray] = []
+        pixel_dist: List[np.ndarray] = []
+        pixel_masks: List[np.ndarray] = []
         seen = 0
         # 若参照图全部进了记忆库 (memory_warmup_batches = 0 / 图很少), 跳过就什么都不剩,
         # 这时退回全部图 —— 尺度会被压小, 但至少不会算不出阈值 (会由 scale floor 兜底).
@@ -811,6 +885,15 @@ class Trainer:
                 learned_parts.append(learned[i].ravel()[::step])
                 dist_parts.append(dist_np[i].ravel()[::step])
                 mask_parts.append(keep[i].ravel()[::step])
+                if analysis_stride > 1:
+                    pl = _downsample_np(learned[i], analysis_stride)
+                    pd = _downsample_np(dist_np[i], analysis_stride)
+                    pm = _downsample_mask_np(keep[i], analysis_stride)
+                else:
+                    pl, pd, pm = learned[i], dist_np[i], keep[i]
+                pixel_learned.append(pl)
+                pixel_dist.append(pd)
+                pixel_masks.append(pm)
                 seen += 1
             if seen >= max_batches * batch["image"].shape[0]:
                 break
@@ -855,27 +938,67 @@ class Trainer:
                 )
 
         weight = float(self.model.memory_weight)
-        scores: List[np.ndarray] = []
-        image_scores: List[float] = []
-        cursor = 0
-        for part_learned, part_dist in zip(learned_parts, dist_parts):
-            n = part_learned.shape[0]
-            part_mask = mask_all[cursor : cursor + n]
-            cursor += n
+        pixel_scores: List[np.ndarray] = []
+        for pl, pd, pm in zip(pixel_learned, pixel_dist, pixel_masks):
             if use_memory:
-                mem = part_dist / (part_dist + scale)
-                score = (1.0 - weight) * part_learned + weight * mem
+                mem = pd / (pd + scale)
+                s = (1.0 - weight) * pl + weight * mem
             else:
-                score = part_learned
-            score = np.where(part_mask, score, 0.0).astype(np.float32)
-            scores.append(score)
-            image_scores.append(image_score_of(score, eval_cfg))
-        pixel_values = np.concatenate(scores)
+                s = pl
+            pixel_scores.append(np.where(pm, s, 0.0).astype(np.float32))
+        pixel_values = np.concatenate([s.ravel() for s in pixel_scores]) if pixel_scores else np.zeros(0, np.float32)
         if pixel_values.size > max_pixels:
             idx = np.random.default_rng(0).choice(pixel_values.size, max_pixels, replace=False)
             pixel_values = pixel_values[idx]
         k = float(eval_cfg.get("calib_sigma", 6.0))
         thr_stats = threshold_from_normal_pixels(pixel_values, q, k)
+        # 图像级分数和像素级指标都跑全分辨率, 阈值必须也在全分辨率分布上取.
+        # 第一遍只收集了 analysis_stride 的像素阈值; 这里再跑一遍拿全分辨率
+        # score, 避免把 1/4 分辨率的分布套到全分辨率指标上.
+        full_parts: List[np.ndarray] = []
+        image_scores: List[float] = []
+        seen_full = 0
+        for batch in self._reference_batches(skip_bank=skip_bank):
+            batch = move_to(batch, self.device)
+            out = model(batch["image"])
+            h, w = batch["image"].shape[-2:]
+            learned = F.interpolate(
+                out["learned_score"], size=(h, w), mode="bilinear", align_corners=False
+            ).squeeze(1).float().cpu().numpy()
+            cloth = F.interpolate(out["cloth_prob"], size=(h, w), mode="bilinear", align_corners=False)
+            keep = (
+                (cloth > 0.5).squeeze(1).cpu().numpy()
+                if bool(eval_cfg.get("cloth_gate", True))
+                else np.ones_like(cloth.squeeze(1).cpu().numpy(), dtype=bool)
+            )
+            if batch.get("cloth_mask") is not None:
+                keep = keep & (batch["cloth_mask"].squeeze(1).cpu().numpy() > 0.5)
+            dist = out.get("memory_distance")
+            if dist is None:
+                dist_np = np.zeros_like(learned)
+            else:
+                if tuple(dist.shape[-2:]) != (h, w):
+                    dist = F.interpolate(dist.float(), size=(h, w), mode="bilinear", align_corners=False)
+                dist_np = dist.squeeze(1).float().cpu().numpy()
+            for i in range(learned.shape[0]):
+                if not keep[i].any():
+                    continue
+                if use_memory:
+                    mem = dist_np[i] / (dist_np[i] + scale)
+                    score = (1.0 - weight) * learned[i] + weight * mem
+                else:
+                    score = learned[i]
+                score = np.where(keep[i], score, 0.0).astype(np.float32)
+                image_scores.append(image_score_of(score, eval_cfg))
+                full_parts.append(score.ravel()[:: max(1, score.size // 20000)])
+                seen_full += 1
+            if seen_full >= max_batches * batch["image"].shape[0]:
+                break
+        pixel_values_full = np.concatenate(full_parts) if full_parts else np.zeros(0, np.float32)
+        if pixel_values_full.size > max_pixels:
+            idx = np.random.default_rng(0).choice(pixel_values_full.size, max_pixels, replace=False)
+            pixel_values_full = pixel_values_full[idx]
+        thr_full_stats = threshold_from_normal_pixels(pixel_values_full, q, k)
         if thr_stats["max"] <= 1e-6:
             self.logger.warning(
                 "校准失败: 正常图分数全为 0 (布面掩码可能还没学出来), 暂用 0.5 作为阈值"
@@ -889,11 +1012,15 @@ class Trainer:
         # 首次直接采用, 之后用指数滑动平均跟上, 读数才稳定可比.
         smooth = float(eval_cfg.get("calib_smooth", 0.5))
         pixel_thr_new = float(thr_stats["threshold"])
+        pixel_thr_full_new = float(thr_full_stats["threshold"])
         if self._calib_calls > 0 and 0.0 < smooth < 1.0:
             prev = self.calibration.get("pixel_threshold")
+            prev_full = self.calibration.get("pixel_threshold_full")
             prev_img = self.calibration.get("image_threshold")
             if prev is not None:
                 pixel_thr_new = smooth * float(prev) + (1.0 - smooth) * pixel_thr_new
+            if prev_full is not None:
+                pixel_thr_full_new = smooth * float(prev_full) + (1.0 - smooth) * pixel_thr_full_new
             if prev_img is not None:
                 image_thr_new = smooth * float(prev_img) + (1.0 - smooth) * image_thr_new
         self._calib_calls += 1
@@ -904,26 +1031,36 @@ class Trainer:
             "pixel_max": vmax,
             "pixel_mean": float(pixel_values.mean()),
             "pixel_std": float(pixel_values.std()),
+            "pixel_threshold_full": pixel_thr_full_new,
+            "pixel_thr_full_quantile": thr_full_stats["quantile_thr"],
+            "pixel_thr_full_sigma": thr_full_stats["sigma_thr"],
+            "pixel_full_max": thr_full_stats["max"],
+            "pixel_full_mean": float(pixel_values_full.mean()),
+            "pixel_full_std": float(pixel_values_full.std()),
             "memory_distance_scale": float(scale if use_memory else 0.0),
             "image_threshold": image_thr_new,
             "image_mean": float(np.mean(image_scores)),
             "image_std": float(np.std(image_scores)),
             "num_normal_images": len(image_scores),
             "quantile": q,
+            "analysis_stride": analysis_stride,
         }
         self.logger.info(
             "阈值校准: pixel_thr=%.4f (q%.3f=%.4f, mean+%.0fσ=%.4f, 正常最大值=%.4f) | "
-            "image_thr=%.4f (正常图均值 %.4f) | 记忆项尺度 %.3f | %d 张正常图",
+            "pixel_thr_full=%.4f | image_thr=%.4f (正常图均值 %.4f) | 记忆项尺度 %.3f | "
+            "%d 张正常图 | 后处理 stride=%d",
             self.calibration["pixel_threshold"],
             q,
             q_thr,
             k,
             sigma_thr,
             vmax,
+            self.calibration["pixel_threshold_full"],
             self.calibration["image_threshold"],
             float(np.mean(image_scores)),
             float(self.calibration["memory_distance_scale"]),
             len(image_scores),
+            analysis_stride,
         )
         self.model.train()
         return self.calibration
@@ -950,11 +1087,21 @@ class Trainer:
         if not covers:
             return
         mean_cov = float(np.mean(covers))
-        self.logger.info("布面掩码覆盖率 %.3f (data.cloth_mask=%s) = 异常损失监督到的像素比例", mean_cov, mode)
-        if mean_cov < 0.90 and mode != "full":
+        bg_negative = bool(getattr(getattr(self, "criterion", None), "ano_bg_negative", True))
+        supervised = 1.0 if bg_negative else mean_cov
+        self.logger.info(
+            "布面掩码覆盖率 %.3f (data.cloth_mask=%s) | 异常损失监督比例 %.3f "
+            "(background_as_negative=%s)",
+            mean_cov,
+            mode,
+            supervised,
+            bg_negative,
+        )
+        if not bg_negative and mean_cov < 0.90 and mode != "full":
             self.logger.warning(
-                "覆盖率只有 %.0f%%: 其余像素的异常头输出完全没有约束 (会漂移到 1.0, 让正常图分数反而更高). "
-                "整幅都是布的产线图应设 data.cloth_mask: full",
+                "异常损失只监督了 %.0f%% 像素 (其余像素无约束, 异常头会漂移到 1.0). "
+                "整幅都是布的产线图应设 data.cloth_mask: full, 或打开 "
+                "model.loss.anomaly.background_as_negative",
                 mean_cov * 100.0,
             )
 
@@ -971,7 +1118,7 @@ class Trainer:
         for epoch in range(self.start_epoch, self.epochs):
             train_logs = self.train_one_epoch(epoch)
             if refresh > 0 and (epoch + 1) % refresh == 0:
-                if self.normal_loader is not None:
+                if getattr(self, "memory_loaders", None):
                     self.model.memory.reset()
                     if self.ema is not None:
                         self.ema.ema.memory.reset()
@@ -985,7 +1132,7 @@ class Trainer:
                 model_for_eval = self.ema.ema if self.ema is not None else self.model
                 # 阈值必须跟着模型走: 固定阈值在训练中会逐渐失配, 表现为验证集区域数
                 # 突然变 0 (map50/acc 一起塌), 所以默认每轮用正常图重新校准一次.
-                if self.cfg.get("eval", {}).get("threshold") is None and self.normal_loader is not None:
+                if self.cfg.get("eval", {}).get("threshold") is None and getattr(self, "memory_loaders", None):
                     interval = int(self.cfg.get("eval", {}).get("calib_interval", 1))
                     if (epoch + 1) % max(1, interval) == 0:
                         self.calibrate(max_batches=int(self.cfg.get("eval", {}).get("calib_batches", 4)))

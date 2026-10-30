@@ -7,7 +7,7 @@
 | 指标 | 数值 |
 |---|---|
 | 参数量（MobileNetV3-Small 主干 + 全部头） | **1.11 M**（主干 0.93 M） |
-| 计算量 @512×512 | **0.62 GMACs / 1.24 GFLOPs** |
+| 计算量 @512×512 | **0.62 GMACs（旧口径，仅 Conv/Linear）**；完整口径见 `tools/bench.py` |
 | CPU 单张延迟（2 核 Intel/AMD，PyTorch） | ≈ **100 ms**（224×224 约 23 ms） |
 | 输出 | 异常热力图 + 布面掩码 + 布边带 + 19 类（可扩展）分类 + 区域框 + 嵌入 |
 | 监督需求 | 有框标注可用；**无标签正常图即可冷启动**（记忆库 + 合成异常） |
@@ -278,6 +278,10 @@ python tools/train.py --config configs/fabric19.yaml \
 
 （本机 CPU（2 核）实测 + 卷积乘加解析统计；显存含反向，GPU 上与 batch 近似线性。）
 
+> 上表是旧版 Conv/Linear 口径，**未包含** Gabor 的 `F.conv2d` 与记忆库 `einsum`。
+> `tools/bench.py` 现在会分项输出 `macs_conv_G / macs_linear_G / macs_gabor_G / macs_memory_G`，
+> 完整 `macs_G` 以它为准。
+
 **怎么选**：小疵点的可检出性由"缩放后还剩几个像素"决定，织造纹理的可建模性由"缩放后经纬周期"决定。
 
 ```bash
@@ -453,7 +457,7 @@ ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部�
   查 `data.cloth_mask`：估计模式在"整幅都是布"的图上常给出 5%~60% 的覆盖率，
   而 `region = cloth_mask > 0.5` 是异常损失的取样区域——覆盖率低于 50% 的图，
   大半个画面拿不到任何负样本约束。这类数据集必须设 `data.cloth_mask: full`。
-  训练开始时会自动打印 `布面掩码覆盖率`，低于 90% 会告警。
+  训练开始时会自动打印 `布面掩码覆盖率` 和 `异常损失监督比例`；后者低于 90% 才告警。
 - **`imgAUROC` 长期低于 0.5**：先看同一行的 `top16 / max` 两个括号值。三者都低 = 分数真的分不开；
   只有 top-k 低、peak 高 = 聚合口径问题（`eval.topk_pixels` 调小）。若三者都低但 `pixelAUROC` 正常，
   多半是**布面蒙版把疵点裁掉了**——整幅都是布的数据必须 `eval.cloth_gate: false`，
@@ -549,7 +553,7 @@ python tools/diagnose_scores.py --dataset-only --mask-check 2   # 同时量布�
 | 体检结果 | 后果 | 处理 |
 |---|---|---|
 | `缺陷来源 ∩ 正常来源 = 0` | 模型只要学会"这是哪批布"就能把训练集分对，这个捷径与"有没有疵点"无关；跨类的 `imageAUROC` / 检出率被捷径污染，可能整体反向 | 把与缺陷同批次的正常图补进 `normal/`；指标只看**同批次内** AUROC |
-| 布面掩码估计覆盖率远低于 1（整幅都是布时） | 覆盖率 = **异常损失真正监督到的像素比例**，1 - 覆盖率就是"没有梯度"的白区（`width_margin` 合成底色就占约 21%）；这些像素推理时照样进入后处理 → 大块误报。另外 `geography()` 会用这张噪声掩码逐图缩放特征，注入图像级偏移 | `data.cloth_mask: full`（整幅都是布）；保持 `loss.anomaly.background_as_negative: true`；有辊筒/台面才用 `estimate` |
+| 布面掩码估计覆盖率远低于 1（整幅都是布时） | 布面掩码覆盖率只是掩码面积占比；`background_as_negative: false` 时它才等于异常损失监督比例，1 - 覆盖率就是"没有梯度"的白区（`width_margin` 合成底色就占约 21%）；这些像素推理时照样进入后处理 → 大块误报。另外 `geography()` 会用这张噪声掩码逐图缩放特征，注入图像级偏移 | `data.cloth_mask: full`（整幅都是布）；保持 `loss.anomaly.background_as_negative: true`；有辊筒/台面才用 `estimate` |
 
 探针还会打印 **批次覆盖**: 训练正常图的批次 vs 验证集的批次、交集、以及"验证集里训练
 正常图从未出现过的批次"。批次覆盖率低 + 记忆库抽样不洗牌, 是 imageAUROC 反向最常见的原因
@@ -569,9 +573,12 @@ python tools/diagnose_scores.py --dataset-only --mask-check 2   # 同时量布�
 日志里现在会同时打印两个数，差值就是被浪费的比例：
 
 ```
-布面掩码覆盖率 0.790 = 异常损失监督到的像素比例     # 旧行为
-布面掩码覆盖率 0.995 (data.cloth_mask=full)          # 现在
+布面掩码覆盖率 0.790 (data.cloth_mask=estimate) | 异常损失监督比例 0.790 (background_as_negative=False)
+布面掩码覆盖率 0.790 (data.cloth_mask=estimate) | 异常损失监督比例 1.000 (background_as_negative=True)
 ```
+
+注意：`布面掩码覆盖率` 只是布面掩码本身的面积占比，不等于异常损失的监督比例；
+`background_as_negative: true` 时框外所有像素都参与负监督，监督比例应为 1.0。
 
 修法是 `loss.anomaly.background_as_negative: true`（**默认开**）：整幅布都被 YOLO 框之外的区域
 视为**正常布面**，全部给负样本监督；只有 `data.cloth_mask: estimate`（真有辊筒/台面）时才需要用

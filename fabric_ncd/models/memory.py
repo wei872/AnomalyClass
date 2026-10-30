@@ -124,12 +124,18 @@ class MemoryBank(nn.Module):
 
 
 def compact_loss(bank: MemoryBank, embeddings: torch.Tensor) -> torch.Tensor:
-    """可微的 "正常嵌入靠近记忆库" 正则项."""
-    if not bank.is_ready:
+    """可微的 "正常嵌入靠近记忆库" 正则项.
+
+    ``embeddings`` 既支持 ``(B,C,H,W)`` 也支持已按掩码选出的 ``(N,C)``.
+    """
+    if not bank.is_ready or embeddings.numel() == 0:
         return embeddings.new_zeros(())
     # 同样要对齐 dtype: autocast(fp16/bf16) 下 embedding 是半精度, 库是 fp32
     bank_feat = F.normalize(
         bank.features[: int(bank.size.item())].detach().to(embeddings.dtype), dim=1
     )
+    if embeddings.ndim == 2:
+        sim = F.normalize(embeddings, dim=1) @ bank_feat.t()
+        return (1.0 - sim.max(dim=1).values).mean()
     sim = torch.einsum("bdhw,nd->bnhw", F.normalize(embeddings, dim=1), bank_feat)
     return (1.0 - sim.max(dim=1).values).mean()

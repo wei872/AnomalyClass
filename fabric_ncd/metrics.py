@@ -478,8 +478,13 @@ class MetricAccumulator:
                 out["pro"] = per_region_overlap(self.pixel_scores, self.pixel_gts, self.normal_scores)
         if self.multi_true:
             out.update(classification_report(self.multi_true, self.multi_pred, self.num_classes))
-        if self.pred_boxes and self.gt_boxes:
-            _, map50 = box_ap(self.pred_boxes, self.gt_boxes, 0.5, self.num_classes)
-            out["map50"] = map50
-            out["map50_agnostic"] = box_ap_agnostic(self.pred_boxes, self.gt_boxes, 0.5)
+        if self.gt_boxes:
+            if self.pred_boxes:
+                _, map50 = box_ap(self.pred_boxes, self.gt_boxes, 0.5, self.num_classes)
+                out["map50"] = map50
+                out["map50_agnostic"] = box_ap_agnostic(self.pred_boxes, self.gt_boxes, 0.5)
+            else:
+                # 有 GT 但一个框都没检出时, mAP 应为 0, 而不是从指标里消失.
+                out["map50"] = 0.0
+                out["map50_agnostic"] = 0.0
         return {k: float(v) for k, v in out.items() if not (isinstance(v, float) and np.isnan(v))}

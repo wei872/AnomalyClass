@@ -23,20 +23,31 @@ import torch.nn as nn  # noqa: E402
 from _common import base_parser, load_config  # noqa: E402
 
 from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
+from fabric_ncd.models.memory import MemoryBank  # noqa: E402
+from fabric_ncd.models.texture import GaborBank  # noqa: E402
 from fabric_ncd.utils import json_dump, resolve_device  # noqa: E402
 
 
-def count_macs(model: nn.Module, input_size: Tuple[int, int]) -> float:
-    """统计卷积/全连接乘加次数 (MACs), 单位 G."""
-    total = [0.0]
+def count_macs(model: nn.Module, input_size: Tuple[int, int]) -> Tuple[float, Dict[str, float]]:
+    """统计卷积/全连接/Gabor/记忆库乘加次数 (MACs), 单位 G."""
+    total = {"conv": 0.0, "linear": 0.0, "gabor": 0.0, "memory": 0.0}
 
     def conv_hook(module: nn.Conv2d, inputs, output):
         out = output[0] if isinstance(output, (tuple, list)) else output
         macs = out.numel() * (module.in_channels // module.groups) * module.kernel_size[0] * module.kernel_size[1]
-        total[0] += macs
+        total["conv"] += macs
 
     def linear_hook(module: nn.Linear, inputs, output):
-        total[0] += output.numel() * module.in_features
+        total["linear"] += output.numel() * module.in_features
+
+    def gabor_hook(module: GaborBank, inputs, output):
+        out = output[0] if isinstance(output, (tuple, list)) else output
+        total["gabor"] += out.numel() * module.kernel_size * module.kernel_size
+
+    def memory_hook(module: MemoryBank, inputs, output):
+        bank = int(module.size.item()) or int(module.capacity)
+        queries = output.numel()
+        total["memory"] += queries * bank * int(module.dim)
 
     handles = []
     for m in model.modules():
@@ -44,6 +55,10 @@ def count_macs(model: nn.Module, input_size: Tuple[int, int]) -> float:
             handles.append(m.register_forward_hook(conv_hook))
         elif isinstance(m, nn.Linear):
             handles.append(m.register_forward_hook(linear_hook))
+        elif isinstance(m, GaborBank):
+            handles.append(m.register_forward_hook(gabor_hook))
+        elif isinstance(m, MemoryBank):
+            handles.append(m.register_forward_hook(memory_hook))
     was_training = model.training
     model.eval()
     with torch.no_grad():
@@ -51,7 +66,8 @@ def count_macs(model: nn.Module, input_size: Tuple[int, int]) -> float:
     for h in handles:
         h.remove()
     model.train(was_training)
-    return total[0] / 1e9
+    macs = sum(total.values()) / 1e9
+    return macs, {k: v / 1e9 for k, v in total.items()}
 
 
 @torch.no_grad()
@@ -103,7 +119,7 @@ def main() -> int:
 
     total_params = sum(p.numel() for p in model.parameters())
     backbone_params = sum(p.numel() for p in model.backbone.parameters())
-    macs = count_macs(model, size_hw)
+    macs, macs_parts = count_macs(model, size_hw)
     lat = latency(model, size_hw, device, args.iters)
 
     report = {
@@ -113,6 +129,10 @@ def main() -> int:
         "backbone_params_M": round(backbone_params / 1e6, 2),
         "macs_G": round(macs, 3),
         "flops_G": round(macs * 2, 3),
+        "macs_conv_G": round(macs_parts["conv"], 3),
+        "macs_linear_G": round(macs_parts["linear"], 3),
+        "macs_gabor_G": round(macs_parts["gabor"], 3),
+        "macs_memory_G": round(macs_parts["memory"], 3),
         **{k: round(v, 2) for k, v in lat.items()},
     }
     for key, value in report.items():

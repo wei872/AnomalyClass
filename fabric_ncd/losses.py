@@ -198,6 +198,9 @@ class FabricCriterion(nn.Module):
         self.fab_bce = float(fab.get("bce_weight", 0.5))
         self.fab_dice = float(fab.get("dice_weight", 0.5))
         self.fab_edge = float(fab.get("edge_weight", 0.5))
+        # 没有真实布边标注时, 旧逻辑用布面掩码外沿造边界; width_margin 增广下
+        # 这条"边"其实是合成底色边界, 布边头会学成固定画幅边. 默认关闭, 需要时再开.
+        self.fab_boundary_from_cloth = bool(fab.get("boundary_from_cloth", False))
 
         cls = loss_cfg.get("cls", {})
         self.cls_weight = float(cls.get("weight", 1.0))
@@ -272,16 +275,25 @@ class FabricCriterion(nn.Module):
             cloth_logit = outputs["cloth_logit"]
             loss_cloth = F.binary_cross_entropy_with_logits(cloth_logit, cloth_gt) + dice_loss(cloth_logit, cloth_gt)
             boundary = targets.get("boundary_mask")
-            if boundary is None:  # 未提供真实布边时由布面掩码退化得到
+            if boundary is None and self.fab_boundary_from_cloth:
+                # 未提供真实布边时才由布面掩码退化得到; 默认关闭, 避免学习合成画幅边.
                 boundary = boundary_from_mask(targets["cloth_mask"], band=max(1, min(ch, cw) // 64))
-            edge_gt = _resize_mask(boundary, (ch, cw), mode="max")
-            pos_weight = torch.tensor([max(1.0, float((edge_gt < 0.5).sum()) / max(float((edge_gt > 0.5).sum()), 1.0))], device=device)
-            loss_edge = F.binary_cross_entropy_with_logits(
-                outputs["boundary_logit"], edge_gt, pos_weight=pos_weight
-            )
-            loss_fab = self.fab_bce * loss_cloth + self.fab_edge * loss_edge
+            if boundary is not None:
+                edge_gt = _resize_mask(boundary, (ch, cw), mode="max")
+                pos_weight = torch.tensor(
+                    [max(1.0, float((edge_gt < 0.5).sum()) / max(float((edge_gt > 0.5).sum()), 1.0))],
+                    device=device,
+                )
+                loss_edge = F.binary_cross_entropy_with_logits(
+                    outputs["boundary_logit"], edge_gt, pos_weight=pos_weight
+                )
+                loss_fab = self.fab_bce * loss_cloth + self.fab_edge * loss_edge
+                logs.update(cloth=loss_cloth.item(), edge=loss_edge.item())
+            else:
+                loss_fab = self.fab_bce * loss_cloth
+                logs.update(cloth=loss_cloth.item(), edge=0.0)
             total = total + loss_fab
-            logs.update(cloth=loss_cloth.item(), edge=loss_edge.item(), loss_fabric=loss_fab.item())
+            logs.update(loss_fabric=loss_fab.item())
 
         # ---------- 3. 疵点分类 (弱监督, 仅框内) ----------
         class_logits = outputs["class_logits"]  # (B,C,h,w) 可能与异常图不同尺度
@@ -311,10 +323,17 @@ class FabricCriterion(nn.Module):
             from .models.memory import compact_loss
 
             emb = outputs["embedding"]
-            region_emb = _resize_mask(region, tuple(emb.shape[-2:]), mode="area")
-            loss_c = compact_loss(memory, emb * region_emb)
-            total = total + self.compact_weight * loss_c
-            logs.update(compact=float(loss_c.detach()))
+            # 只约束布面上的正常像素: 疵点像素本来就应该远离记忆库,
+            # 以前用全 1 region 会把疵点也拉向正常中心, 与异常头目标冲突.
+            normal_region = cloth_mask * (1.0 - defect_mask)
+            normal_emb_mask = _resize_mask(
+                normal_region, tuple(emb.shape[-2:]), mode="area"
+            ) > 0.5
+            if bool(normal_emb_mask.any()):
+                vecs = emb.permute(0, 2, 3, 1)[normal_emb_mask]
+                loss_c = compact_loss(memory, vecs)
+                total = total + self.compact_weight * loss_c
+                logs.update(compact=float(loss_c.detach()))
 
         logs["loss_total"] = float(total.detach())
         return total, logs

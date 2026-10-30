@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
-from fabric_ncd.data.yolo import build_dataloaders, build_normal_loader  # noqa: E402
+from fabric_ncd.data.yolo import build_dataloaders, build_reference_loaders  # noqa: E402
 from fabric_ncd.engine import evaluate  # noqa: E402
 from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
 from fabric_ncd.ncd import RegionAnalyzer  # noqa: E402
@@ -100,15 +100,20 @@ def main() -> int:
         val_loader = datasets["val"]
         model = _build_model(state, cfg_s, device)
 
-        normal_loader = build_normal_loader(cfg_s, "train")
-        if normal_loader is not None:
+        reference_loaders = build_reference_loaders(cfg_s, "train", shuffle=False)
+        if reference_loaders:
             model.memory.reset()
+            built = 0
             with torch.no_grad():
-                for i, batch in enumerate(normal_loader):
-                    images = batch["image"].to(device)
-                    mask = batch["cloth_mask"].to(device)
-                    model.update_memory(images, mask=mask)
-                    if i + 1 >= args.memory_batches:
+                for loader in reference_loaders:
+                    for batch in loader:
+                        images = batch["image"].to(device)
+                        mask = batch["cloth_mask"].to(device)
+                        model.update_memory(images, mask=mask)
+                        built += 1
+                        if built >= args.memory_batches:
+                            break
+                    if built >= args.memory_batches:
                         break
 
         hw = resolved_hw
