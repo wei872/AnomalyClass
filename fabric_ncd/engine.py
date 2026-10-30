@@ -37,7 +37,7 @@ from .losses import FabricCriterion
 from .metrics import MetricAccumulator, auroc
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer, postprocess_outputs
-from .ops import threshold_from_normal_pixels, topk_mean
+from .ops import bbox_iou, threshold_from_normal_pixels, topk_mean
 from .utils import (
     AverageMeter,
     Timer,
@@ -157,6 +157,10 @@ def evaluate(
     defect_images = 0
     detected_images = 0
     region_total = 0
+    # 框外误报: 与任何 GT 框都不重叠的预测区域. 没有同批次良品图时, 这才是
+    # 图上真正的"假阳"——每张疵点图的框外区域就是这块布的正常纹理.
+    outside_fp = 0
+    outside_fp_images = 0
     # 图像级聚合方式对比: 小疵点用 top-k 均值容易被稀释, 这里同时统计 peak 与小 top-k
     agg = {"topk": [], "top16": [], "max": []}
     agg_labels: List[int] = []
@@ -202,6 +206,15 @@ def evaluate(
                 "labels": gt_labels,
             }
             pred_boxes, pred_scores, pred_labels = _regions_to_boxes(infos, w, h, cfg)
+            if infos:
+                gt_xyxy = gt_dict["boxes"]
+                outside_fp_images += 1
+                for box in pred_boxes:
+                    if len(gt_xyxy) == 0:
+                        outside_fp += 1
+                        continue
+                    if max(bbox_iou(list(map(float, box[:4])), list(map(float, g[:4]))) for g in gt_xyxy) < 0.10:
+                        outside_fp += 1
 
             multi_true, multi_pred = -1, -1
             if len(gt_labels):
@@ -245,6 +258,9 @@ def evaluate(
     metrics["det_rate"] = detected_images / defect_images if defect_images else 0.0
     metrics["num_defect_images"] = defect_images
     metrics["regions_per_image"] = region_total / max(1, seen)
+    # 框外误报密度 = 每张图的假阳区域数 (与任何 GT 框 IoU<0.1 的区域).
+    # 没有同批次良品图时, 这是唯一能在"这块布"上量化假阳的指标.
+    metrics["outside_fp_per_image"] = outside_fp / max(1, outside_fp_images)
     if agg_labels and 0 < sum(agg_labels) < len(agg_labels):
         for key, values in agg.items():
             metrics[f"image_auroc_{key}"] = auroc(np.asarray(agg_labels), np.asarray(values))
@@ -935,7 +951,7 @@ class Trainer:
                 )
                 self.logger.info(
                     "  检测 | pixelAUROC %.4f | imgAUROC %.4f (top16 %.3f / max %.3f) | mAP50 %.4f | "
-                    "检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图) | thr %.4f",
+                    "检出率 %.2f (%d 张疵点图, 平均 %.1f 区域/图, 框外误报 %.2f/图) | thr %.4f",
                     metrics.get("pixel_auroc", float("nan")),
                     metrics.get("image_auroc", float("nan")),
                     metrics.get("image_auroc_top16", float("nan")),
@@ -944,6 +960,7 @@ class Trainer:
                     metrics.get("det_rate", 0.0),
                     int(metrics.get("num_defect_images", 0)),
                     metrics.get("regions_per_image", 0.0),
+                    metrics.get("outside_fp_per_image", 0.0),
                     float(self.analyzer.threshold or 0.0),
                 )
                 if (
