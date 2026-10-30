@@ -301,3 +301,49 @@ def test_boxes_to_mask_keeps_rect_when_polygon_shares_class():
     mask = boxes_to_mask(boxes, polys, 100, 100)
     assert mask[70, 75] == 1, "同类别的矩形框被误删了"
     assert mask[10, 10] == 1
+
+
+def test_resize_sample_keeps_masks_aligned_with_boxes():
+    """整图缩放 (data.max_scale) 时, 掩膜与归一化框必须仍然对齐."""
+    import numpy as np
+
+    from fabric_ncd.data.augment import resize_sample
+
+    h0, w0 = 96, 192
+    image = np.zeros((h0, w0, 3), dtype=np.uint8)
+    boxes = np.array([[0.0, 0.25, 0.25, 0.50, 0.50]], dtype=np.float32)  # 归一化 cx,cy,w,h
+    defect = np.zeros((h0, w0), dtype=np.uint8)
+    defect[: h0 // 2, : w0 // 2] = 1  # 左上角 1/4 面积, 中心 (0.25, 0.25)
+    sample = {
+        "image": image, "defect_mask": defect,
+        "cloth_mask": np.ones((h0, w0), dtype=np.uint8), "boxes": boxes,
+    }
+    out = resize_sample(sample, (77, 154))  # 0.8 倍
+    m = out["defect_mask"] > 0
+    cy, cx = np.array(np.nonzero(m)).mean(1) / np.array([77, 154])
+    bx, by = boxes[0, 1], boxes[0, 2]
+    assert abs(cx - bx) < 0.01 and abs(cy - by) < 0.01, (cx, cy, bx, by)
+    # 相对面积也保持 (0.8 倍缩放不改变占比, 误差来自取整)
+    assert abs(m.mean() - 0.25) < 0.02
+
+
+def test_bank_self_distance_separates_compact_from_spread_bank():
+    """记忆库自距: 全挤在一起时接近 0, 分散时明显变大 (用于判断是不是参照图泄漏)."""
+    import torch
+    import torch.nn.functional as F
+
+    from fabric_ncd.engine import Trainer
+    from fabric_ncd.models.memory import MemoryBank
+
+    torch.manual_seed(0)
+    compact = F.normalize(torch.randn(1, 16).repeat(64, 1) + 1e-3 * torch.randn(64, 16), dim=1)
+    mem = MemoryBank(capacity=128, dim=16)
+    mem.update(compact)
+    d_compact = Trainer._bank_self_distance(type("S", (), {"model": type("M", (), {"memory": mem})()})())
+
+    spread = F.normalize(torch.randn(64, 16), dim=1)
+    mem2 = MemoryBank(capacity=128, dim=16)
+    mem2.update(spread)
+    d_spread = Trainer._bank_self_distance(type("S", (), {"model": type("M", (), {"memory": mem2})()})())
+
+    assert d_compact < 0.01 < 0.1 < d_spread

@@ -737,6 +737,30 @@ class Trainer:
                 )
         return results
 
+    @torch.no_grad()
+    def _bank_self_distance(self, samples: int = 512) -> float:
+        """记忆库内部的最近邻距离中位数 (留一法), 用于给"记忆项尺度异常小"定性.
+
+        拿它和"校准像素到库的中位距离"比:
+
+        * 两者同量级 -> 布料纹理本身高度自相似 + 嵌入太紧凑, 不是参照图泄漏;
+        * 校准距离 << 库内自距 -> 校准图离库太近, 才是泄漏 (建库图没被排除干净).
+        """
+        mem = getattr(self.model, "memory", None)
+        if mem is None or not getattr(mem, "is_ready", False):
+            return float("nan")
+        n = int(mem.size.item())
+        if n < 8:
+            return float("nan")
+        feats = mem.features[:n].float()
+        if n > samples:
+            idx = torch.randperm(n, device=feats.device)[:samples]
+            feats = feats[idx]
+        sim = feats @ feats.t()
+        sim.fill_diagonal_(-1.0)
+        nearest = (1.0 - sim.max(dim=1).values).clamp_min(0.0)
+        return float(nearest.median())
+
     def _set_memory_scale(self, scale: float) -> None:
         """记忆项尺度同步给训练模型与 EMA (两者都会被用于评估/推理)."""
         for m in (self.model, self.ema.ema if self.ema is not None else None):
@@ -832,10 +856,17 @@ class Trainer:
             # 正常是 0.01~0.05 量级; 真的掉到 0 附近时先兜底, 并明确告警.
             floor = float(self.train_cfg.get("memory_scale_floor", 0.01))
             if median_dist < floor:
+                bank_d = self._bank_self_distance()
+                why = (
+                    "校准已排除建库图, 且库内最近邻中位距离 %.4f, 与之同量级 -> "
+                    "布料纹理本身高度自相似 + 嵌入过于紧凑, 不是参照图泄漏" % bank_d
+                    if skip_bank and np.isfinite(bank_d)
+                    else "库内最近邻中位距离 %.4f; 检查参照集是否与建库图重叠" % bank_d
+                )
                 self.logger.warning(
-                    "记忆项尺度只有 %.4f (正常 0.01~0.05): 校准用的像素基本就在记忆库里, "
-                    "记忆分支会整体饱和 -> 已抬到 %.3f. 检查参照集是否与建库图重叠",
-                    median_dist, floor,
+                    "记忆项尺度只有 %.4f (正常 0.01~0.05): %s. memory_score = d/(d+scale) 对 d 单调, "
+                    "尺度只影响它与学习式分数的混合形状, 过小会让整个记忆分支贴边 (≈%.2f) -> 已抬到 %.3f",
+                    median_dist, why, median_dist / max(median_dist + floor, 1e-12), floor,
                 )
                 median_dist = floor
             scale = median_dist
@@ -930,15 +961,26 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def audit_cloth_coverage(self, batches: int = 4) -> None:
-        """开工前量一次布面掩码覆盖率 = anomaly 损失真正监督到的像素比例.
+        """开工前量一次掩码覆盖率, 说清楚异常损失到底监督了多少像素.
 
-        ``region = cloth_mask > 0.5`` 是异常损失的取样区域: 覆盖率 5% 就意味着
-        95% 的像素**没有任何负样本约束**, 异常头在那里会自由漂移 (实测正常图的
-        learned_max 会打满 1.0, 图级分数整体反向). 所以这里在训练开始时就报出来.
+        两种情形不能混为一谈:
+
+        * ``loss.anomaly.background_as_negative: true`` (默认): region = **全部像素**,
+          框外都算正常布面 (负样本), 监督覆盖率恒为 100%; 布料掩码只再用于
+          fabric 分支和推理时的区域过滤;
+        * ``false`` (旧行为): ``region = cloth_mask > 0.5``, 覆盖率 5% 就意味着
+          95% 的像素**没有任何负样本约束**, 异常头在那里自由漂移 (实测正常图的
+          learned_max 打满 1.0, 图级分数整体反向).
+
+        注意 ``data.cloth_mask: full`` 时覆盖率也**不会**是 1.0: ``augment.width_margin``
+        补出来的那圈合成布宽底色在掩码里记为 0 (占画面两成左右) —— 这部分正是
+        "白扔"的区域, 只有 ``background_as_negative`` 打开时才拿到负监督.
         """
         if self.train_loader is None:
             return
         mode = str(self.cfg.get("data", {}).get("cloth_mask", "estimate")).lower()
+        loss_cfg = (self.cfg.get("model", {}) or {}).get("loss", {}) or {}
+        bg_negative = bool((loss_cfg.get("anomaly", {}) or {}).get("background_as_negative", True))
         covers: List[float] = []
         with torch.no_grad():
             for i, batch in enumerate(self.train_loader):
@@ -950,12 +992,26 @@ class Trainer:
         if not covers:
             return
         mean_cov = float(np.mean(covers))
+        margin = max(0.0, 1.0 - mean_cov)
+        if bg_negative:
+            self.logger.info(
+                "监督覆盖率 1.000 (loss.anomaly.background_as_negative=true): 框外全部像素都当正常布面; "
+                "其中布面 %.3f / 合成底色(宽幅增广) %.3f (data.cloth_mask=%s) —— 掩码只再用于 fabric 分支与推理区域过滤",
+                mean_cov, margin, mode,
+            )
+            if mean_cov < 0.50:
+                self.logger.warning(
+                    "布面只占 %.0f%%: 布面掩码把画面大半判成了非布 (data.cloth_mask=%s). "
+                    "整幅都是布的产线图应设 data.cloth_mask: full, 否则 fabric 分支与推理时的区域过滤会裁掉真实疵点",
+                    mean_cov * 100.0, mode,
+                )
+            return
         self.logger.info("布面掩码覆盖率 %.3f (data.cloth_mask=%s) = 异常损失监督到的像素比例", mean_cov, mode)
-        if mean_cov < 0.90 and mode != "full":
+        if mean_cov < 0.90:
             self.logger.warning(
-                "覆盖率只有 %.0f%%: 其余像素的异常头输出完全没有约束 (会漂移到 1.0, 让正常图分数反而更高). "
-                "整幅都是布的产线图应设 data.cloth_mask: full",
-                mean_cov * 100.0,
+                "覆盖率只有 %.0f%%: 其余 %.0f%% 的像素上异常头输出完全没有约束 (会漂移到 1.0, 让正常图分数反而更高). "
+                "整幅都是布的产线图应设 data.cloth_mask: full, 或把 loss.anomaly.background_as_negative 设回 true",
+                mean_cov * 100.0, margin * 100.0,
             )
 
     # ------------------------------------------------------------------ #

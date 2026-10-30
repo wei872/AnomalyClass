@@ -207,6 +207,38 @@ python tools/prepare_dataset.py --root D:/tyhn/yolo/dataset/source5_augmenteds -
 据此保证缩放后周期仍 ≥ 3 px；量不准就逐次放大 `work_size` 重试，实在量不到就退回全分辨率。
 几何清理（开/闭/填洞/连通块）在回放分辨率上按同一物理尺度做，所以掩码边界不会因为降采样而变糊。
 
+### 6.1.1 掩膜和分辨率/缩放的关系（`--set data.max_scale=0.8` 会让掩膜对不上吗）
+
+不会。先把三种掩膜分开看（`prepare_dataset` 的输出里也这么写）：
+
+| | 谁生成 | 落盘吗 | 训练时读吗 |
+|---|---|---|---|
+| ① 布面/背景掩码 | `--export-masks` 预计算 or 运行时 `estimate_cloth_mask` | 可选 | 只有 `data.mask_dir` 非空时才读 |
+| ② 疵点掩码 | **每次取图时**按 YOLO 归一化标注现画 | 否（`--export-defect-masks` 只为肉眼核对） | 不读盘，现画 |
+| ③ 异常热力图 | 模型输出 | 否 | —— |
+
+所以"先导出掩膜、再缩放到 0.8"这个动作在训练里根本不存在。具体地说：
+
+1. **疵点掩码不落盘、不读盘**。`DefectBackgroundDataset`/`FabricDataset` 的 `__getitem__` 每张图
+   先 `boxes_to_mask(boxes, polygons, 原生 h, 原生 w)` 画一张原生分辨率的掩码，
+   紧接着同一个 `sample` 字典（image + defect_mask + cloth_mask）一起进变换。
+2. **变换是同一组参数作用在同一个字典上的**：`resize_sample`（缩放到 800×1952，掩码用 NEAREST）、
+   `width_margin`（补边时掩码一起补 0/1）、翻转/旋转/裁块都是如此。图像和掩码不可能各自为政。
+3. **`data.max_scale=0.8` 只决定输入尺寸**（`resolve_image_size` → 800×1952），
+   归一化坐标与掩码跟着一起缩；`box_pad` 这类"像素余量"是按**输入**短边算的（800 → 8 px），
+   不会因为换了尺度就失配。
+4. **`data.mask_dir` 只接受布面/背景掩码**。把 `--export-defect-masks` 产出的 `defect_masks/`
+   填进去是致命的：模型会把"疵点=布面、布面=背景"整个反过来。工具有告警，但别试。
+5. 若 `data.mask_dir` 里的 png 尺寸与当前图不同（比如用 `--mask-size 1024` 导出的），
+   读入时会用 NEAREST 缩放到**当前图**尺寸再进变换，不会错位；只是边界会略糙。
+
+实测（0.8 输入，三层厚布 1012×2448 → 800×1952）：把变换后的疵点掩膜与"按同一张图的归一化框
+重画"的掩膜比，IoU ≈ 0.92，残差全部来自框边界的栅格化取整，没有整体平移/缩放偏差。
+
+> 真正该担心的不是对不上，而是**标注框本身是弱标注**（框比疵点大得多）：
+> 那会让异常头学会"整框都是疵点"。目前的对策是 `loss.anomaly.pseudo_ratio`（默认 0，开了反而掉点）
+> 与 `data.box_pad`（框外 1% 短边不参与正常像素统计）。
+
 ### 6.2 训练
 
 ```bash

@@ -339,7 +339,15 @@ def main() -> int:
                     if done % 100 == 0 or done == len(todo):
                         logger.info("  %s: %d/%d", split, done, len(todo))
             logger.info("疵点掩码导出完成: %s (%d 张)", target, len(todo))
-        logger.info("这些掩码只用于人工核对标注; 训练时疵点掩码由 dataloader 实时生成, 无需配置")
+        logger.info(
+            "这些掩码只用于人工核对标注: 训练时疵点掩码由 dataloader 按归一化标注**实时生成**, "
+            "并和图像用同一套变换缩放 (data.max_scale 改输入尺寸时同步缩, 不会错位), 无需配置"
+        )
+        logger.warning(
+            "不要把 %s 填进 data.mask_dir —— 那里要的是**布面/背景**掩码, 填疵点掩码会让模型"
+            "把\"疵点=布面, 布面=背景\"整个反过来",
+            out_root,
+        )
     return 0
 
 
