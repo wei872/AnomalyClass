@@ -156,12 +156,16 @@ class FabricNCD(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) and m.out_channels != 1:
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            if isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        # 主干可能已经加载 ImageNet 或用户指定的权重，绝不能重新初始化它。
+        for name, child in self.named_children():
+            if name == "backbone":
+                continue
+            for m in child.modules():
+                if isinstance(m, nn.Conv2d) and m.out_channels != 1:
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -287,6 +291,6 @@ class FabricNCD(nn.Module):
             (backbone_params if name.startswith("backbone.") else head_params).append(param)
         groups = [{"params": head_params, "lr": base_lr}]
         if backbone_params:
-            groups.insert(0, {"params": backbone_params, "lr": backbone_lr or base_lr * 0.2})
+            groups.insert(0, {"params": backbone_params, "lr": backbone_lr if backbone_lr is not None else base_lr * 0.2})
         return groups
 

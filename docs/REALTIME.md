@@ -1,6 +1,7 @@
 # 实时推理指南（GTX 1660 · 40 FPS）
 
-目标：1600×846 原图整幅输入（网络输入 832×1600），端到端 ≥ 40 FPS（单帧 ≤ 25 ms）。
+规划目标：1600×846 原图整幅输入（网络输入 832×1600），端到端 ≥ 40 FPS。
+本文硬件数字仅为历史示例或理论估算，**不是已验证的性能或精度保证**；需在目标产线上实测。
 
 ## 1. 单帧预算怎么切
 
@@ -19,15 +20,14 @@
 读图线程 ──▶ 前向线程(GPU) ──▶ 后处理线程(CPU) ──▶ results()
 ```
 
-此时吞吐 ≈ 1 / 最慢的一段，端到端延迟 ≈ 三段之和 + 排队（≤2 帧）。
-按上表，吞吐上限 ~80–100 FPS，40 FPS 有 2 倍余量。
+理想情况下吞吐受最慢阶段限制，端到端延迟还包括各阶段排队、调度和同步；实际吞吐与延迟应以压测为准。
 
 ## 2. 怎么测（在你自己的机器上）
 
 ```bash
 # 单帧各段耗时 + 流水线吞吐（含达标判定与优化建议）
 python tools/rt_bench.py --ckpt runs/fabric19_fabricncd_s/best.pt \
-    --source /data/fabric/line/*.jpg --frames 300 --fp16
+    --source /data/fabric/line --frames 300 --fp16
 
 # 只看单帧串行延迟
 python tools/rt_bench.py --ckpt best.pt --source a.jpg --frames 100 --mode sequential
@@ -74,13 +74,13 @@ analyze         5.33     5.33     5.71
 
 ## 5. 精度代价
 
-- `out_stride=4`：定位框最细量化 4 px（1600 宽图上 0.25%），区域级召回不变；
+- `out_stride=4`：定位框会受地图分辨率量化影响，细小区域的召回需实测；
 - `memory_stride=2`：小面积（< 8×8 px）疵点的异常分数会略微平滑，建议 ≥ 8 px 的疵点用默认值；
 - `weave_interval=30`：布面纹理在 1 s 内突变（换布种）时，最多滞后 30 帧重新估计；
-- `fp16`：分数变化 < 1e-3，阈值校准（`calibration`）本身在 fp32 下完成，不受影响。
+- `fp16`：数值偏差取决于硬件和输入，阈值附近的结果可能变化；应在目标设备上验证。
 
-训练与 `tools/evaluate.py` 仍然在 fp32 + 全分辨率下跑（`evaluate_tiled` 不使用
-`out_stride`），所以**报告指标不会因为实时开关而虚高**。
+切块评估使用 `infer.out_stride` / `infer.probs_mul` 和相同的区域分析；训练端校准仍采用训练输入。
+改变尺寸、切块或 stride 时需要重新验证阈值。`eval.analysis_stride` 应与 `infer.out_stride` 对齐。
 
 ## 6. 常驻服务写法
 
@@ -89,15 +89,17 @@ from fabric_ncd.inference import FabricPredictor
 from fabric_ncd.realtime import RealtimePipeline
 
 predictor = FabricPredictor("runs/fabric19_fabricncd_s/best.pt", device="cuda", fp16=True)
-pipe = RealtimePipeline(predictor, queue_size=2).start()
-
-for frame in camera:          # 相机的张量/路径/PIL 图都行
-    pipe.submit(frame)
-
-for res in pipe.results():    # 按完成顺序产出, 不阻塞相机
-    if res.regions:
-        print(res.index, res.latency_ms, [(r["name"], round(r["score"], 3)) for r in res.regions])
+with RealtimePipeline(predictor, queue_size=2) as pipe:
+    for frame in camera:      # HWC ndarray、CHW tensor、路径或 PIL 图
+        pipe.submit(frame)
+        while (res := pipe.poll()) is not None:
+            if res.error:
+                print("处理失败:", res.error)
+            elif res.regions:
+                print(res.index, res.latency_ms, res.regions)
 ```
 
-`submit` 在队列满时会**丢弃最旧帧**而不是阻塞，保证产线永远处理最新画面；
-需要严格不丢帧时用 `pipe.submit(frame, block=True)`。
+非阻塞 `submit` 只在输入队列满时丢弃最旧的待处理帧，可通过 `pipe.dropped` 统计；
+正在处理的旧帧仍会完成。`block=True` 对所有阶段施加背压、不主动丢帧。失败帧以带 `error`
+的结果返回，可能比更早的成功帧先返回。输出队列无界，务必持续消费。`stop()` 是立即停止，
+不会保证处理完在途帧，也不能重启同一实例；有限批次需先消费全部预期结果再停止。

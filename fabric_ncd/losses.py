@@ -45,8 +45,13 @@ def sigmoid_focal_loss(
     return loss
 
 
-def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+def dice_loss(
+    logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0, mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     prob = torch.sigmoid(logits)
+    if mask is not None:
+        prob = prob * mask
+        targets = targets * mask
     dims = (1, 2, 3)
     inter = (prob * targets).sum(dims)
     union = prob.sum(dims) + targets.sum(dims)
@@ -108,21 +113,21 @@ class SupConLoss(nn.Module):
             return features.new_zeros(())
         valid = labels >= 0
         features, labels = features[valid], labels[valid]
-        if features.shape[0] < 2 or labels.unique().numel() < 2:
+        if features.shape[0] < 2:
             return features.new_zeros(()) if features.numel() else torch.tensor(0.0, device=labels.device)
 
-        sim = features @ features.t() / self.temperature
-        sim = sim - sim.max(dim=1, keepdim=True).values.detach()
-        exp_sim = torch.exp(sim)
+        # fp32 log-softmax 避免半精度指数下溢 / 对角项溢出。
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            sim = features.float() @ features.float().t() / self.temperature
         n = features.shape[0]
         self_mask = torch.eye(n, dtype=torch.bool, device=features.device)
         pos_mask = (labels[:, None] == labels[None, :]) & ~self_mask
-        log_prob = sim - torch.log(exp_sim.masked_fill(self_mask, 0).sum(dim=1, keepdim=True) + 1e-8)
+        log_prob = F.log_softmax(sim.masked_fill(self_mask, float("-inf")), dim=1)
         pos_count = pos_mask.sum(dim=1)
         valid_rows = pos_count > 0
         if not valid_rows.any():
             return features.new_zeros(())
-        mean_log_prob = (log_prob * pos_mask).sum(dim=1)[valid_rows] / pos_count[valid_rows]
+        mean_log_prob = log_prob.masked_fill(~pos_mask, 0).sum(dim=1)[valid_rows] / pos_count[valid_rows]
         return -mean_log_prob.mean()
 
 
@@ -163,7 +168,7 @@ def build_label_map(
             ix1, ix2 = int(round(x1)), int(round(x2))
             iy1, iy2 = int(round(y1)), int(round(y2))
             if ix2 <= ix1 or iy2 <= iy1:
-                ix1, iy1 = int(round(cx)), int(round(cy))
+                ix1, iy1 = min(w - 1, max(0, int(round(cx)))), min(h - 1, max(0, int(round(cy))))
                 ix2, iy2 = min(w, ix1 + 1), min(h, iy1 + 1)
             labels[b, iy1:iy2, ix1:ix2] = cls
     return labels
@@ -258,7 +263,7 @@ class FabricCriterion(nn.Module):
         )
         weight = region if ignore is None else region * (~ignore).float()
         focal = (focal * weight).sum() / weight.sum().clamp_min(1.0)
-        dice = dice_loss(ano_logit * region, ano_pos * region)
+        dice = dice_loss(ano_logit, ano_pos, mask=weight)
         loss_ano = self.ano_focal * focal + self.ano_dice * dice
         total = total + loss_ano
         logs.update(
@@ -273,7 +278,9 @@ class FabricCriterion(nn.Module):
             ch, cw = outputs["cloth_logit"].shape[-2:]
             cloth_gt = _resize_mask(targets["cloth_mask"], (ch, cw), mode="area")
             cloth_logit = outputs["cloth_logit"]
-            loss_cloth = F.binary_cross_entropy_with_logits(cloth_logit, cloth_gt) + dice_loss(cloth_logit, cloth_gt)
+            cloth_bce = F.binary_cross_entropy_with_logits(cloth_logit, cloth_gt)
+            cloth_dice = dice_loss(cloth_logit, cloth_gt)
+            loss_cloth = self.fab_bce * cloth_bce + self.fab_dice * cloth_dice
             boundary = targets.get("boundary_mask")
             if boundary is None and self.fab_boundary_from_cloth:
                 # 未提供真实布边时才由布面掩码退化得到; 默认关闭, 避免学习合成画幅边.
@@ -287,10 +294,10 @@ class FabricCriterion(nn.Module):
                 loss_edge = F.binary_cross_entropy_with_logits(
                     outputs["boundary_logit"], edge_gt, pos_weight=pos_weight
                 )
-                loss_fab = self.fab_bce * loss_cloth + self.fab_edge * loss_edge
+                loss_fab = loss_cloth + self.fab_edge * loss_edge
                 logs.update(cloth=loss_cloth.item(), edge=loss_edge.item())
             else:
-                loss_fab = self.fab_bce * loss_cloth
+                loss_fab = loss_cloth
                 logs.update(cloth=loss_cloth.item(), edge=0.0)
             total = total + loss_fab
             logs.update(loss_fabric=loss_fab.item())
@@ -325,12 +332,13 @@ class FabricCriterion(nn.Module):
             emb = outputs["embedding"]
             # 只约束布面上的正常像素: 疵点像素本来就应该远离记忆库,
             # 以前用全 1 region 会把疵点也拉向正常中心, 与异常头目标冲突.
-            normal_region = cloth_mask * (1.0 - defect_mask)
-            normal_emb_mask = _resize_mask(
-                normal_region, tuple(emb.shape[-2:]), mode="area"
-            ) > 0.5
+            emb_size = tuple(emb.shape[-2:])
+            cloth_emb = _resize_mask(targets["cloth_mask"], emb_size, mode="area") > 0.5
+            # 小疵点只占池化单元的一小部分时，也不能将该单元拉向正常库。
+            defect_emb = _resize_mask(targets["defect_mask"], emb_size, mode="max") > 0.5
+            normal_emb_mask = cloth_emb & ~defect_emb
             if bool(normal_emb_mask.any()):
-                vecs = emb.permute(0, 2, 3, 1)[normal_emb_mask]
+                vecs = emb.permute(0, 2, 3, 1)[normal_emb_mask.squeeze(1)]
                 loss_c = compact_loss(memory, vecs)
                 total = total + self.compact_weight * loss_c
                 logs.update(compact=float(loss_c.detach()))
@@ -367,7 +375,6 @@ def masked_ce(
     return loss, acc
 
 
-@torch.no_grad()
 def pooled_region_embeddings(
     embedding: torch.Tensor,
     boxes: Sequence[torch.Tensor],

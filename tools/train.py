@@ -14,12 +14,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import base_parser, load_config  # noqa: E402
 
 from fabric_ncd.engine import Trainer  # noqa: E402
-from fabric_ncd.utils import ensure_dir, prepare_logging  # noqa: E402
+from fabric_ncd.utils import checkpoint_compat_config, ensure_dir, prepare_logging  # noqa: E402
 
 
 def main() -> int:
@@ -32,7 +34,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只构建模型与数据, 不训练")
     args = parser.parse_args()
 
-    cfg = load_config(args.config, args.overrides, args.root)
+    resume_config = None
+    if args.resume:
+        state = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_config = state.get("config")
+    cfg = load_config(args.config, args.overrides, args.root, checkpoint_config=resume_config)
+    if args.resume:
+        cfg = checkpoint_compat_config(cfg, state)
+        # 完整 checkpoint 会覆盖主干参数，不需要下载或加载 ImageNet 权重。
+        cfg.setdefault("model", {}).setdefault("backbone", {}).update(pretrained=False, weights_path=None)
     if args.device:
         cfg.setdefault("experiment", {})["device"] = args.device
     if args.epochs:

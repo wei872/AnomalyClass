@@ -21,7 +21,7 @@ import torch  # noqa: E402
 from _common import base_parser, load_config  # noqa: E402
 
 from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
-from fabric_ncd.utils import deep_update, get_logger  # noqa: E402
+from fabric_ncd.utils import checkpoint_compat_config, get_logger, load_model_weights, model_config_for_weights  # noqa: E402
 
 
 class ExportWrapper(torch.nn.Module):
@@ -37,7 +37,7 @@ class ExportWrapper(torch.nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor, weave_desc: torch.Tensor):
-        out = self.model(x, weave_desc=weave_desc)
+        out = self.model(x, compute_memory=False, weave_desc=weave_desc)
         return out["anomaly_logit"], out["cloth_logit"], out["boundary_logit"], out["class_logits"], out["embedding"]
 
 
@@ -45,29 +45,39 @@ def main() -> int:
     parser = base_parser("导出 ONNX")
     parser.add_argument("--ckpt", default="runs/fabric19_fabricncd_s/best.pt")
     parser.add_argument("--out", default="model.onnx")
-    parser.add_argument("--size", type=int, default=None)
+    parser.add_argument("--size", default=None, help="输入尺寸 HxW 或正方形边长；默认使用训练尺寸")
     parser.add_argument("--opset", type=int, default=13)
     parser.add_argument("--dynamic", action="store_true", help="动态 H/W (TensorRT 建议固定尺寸)")
     parser.add_argument("--check", action="store_true", help="用 onnxruntime 校验数值一致性")
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides, args.root)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    cfg = deep_update(state.get("config", {}), cfg)
-    size = args.size or int(cfg.get("data", {}).get("image_size", [512])[0])
-    model = FabricNCD(cfg)
-    model.load_state_dict(state.get("ema", state["model"]))
+    cfg = checkpoint_compat_config(
+        load_config(args.config, args.overrides, args.root, checkpoint_config=state.get("config")), state
+    )
+    from fabric_ncd.inference import _resolve_image_size, as_hw
+
+    if args.size:
+        try:
+            size = as_hw(args.size)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        size = _resolve_image_size(cfg)
+    model = FabricNCD(model_config_for_weights(cfg))
+    load_model_weights(model, state.get("ema") or state["model"])
     model.eval()
 
     wrapper = ExportWrapper(model).eval()  # 必须在 eval 模式下导出, 否则 BatchNorm 会用当前 batch 统计量
-    dummy = torch.randn(1, 3, size, size)
+    dummy = torch.randn(1, 3, *size)
     dummy_weave = torch.zeros(1, 6)
     dynamic_axes = {"images": {0: "batch"}, "weave_desc": {0: "batch"}}
     if args.dynamic:
         dynamic_axes["images"].update({2: "height", 3: "width"})
         for name in ("anomaly_logit", "cloth_logit", "boundary_logit", "class_logits", "embedding"):
-            dynamic_axes[name] = {0: "batch", 2: "h", 3: "w"}
+            dynamic_axes[name] = {0: "batch", 2: f"{name}_height", 3: f"{name}_width"}
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         wrapper,
         (dummy, dummy_weave),
@@ -78,7 +88,7 @@ def main() -> int:
         dynamic_axes=dynamic_axes,
         do_constant_folding=True,
     )
-    logger.info("ONNX 已导出: %s (输入 %dx%d)", args.out, size, size)
+    logger.info("ONNX 已导出: %s (输入 %dx%d)", args.out, size[0], size[1])
 
     if args.check:
         import numpy as np
@@ -93,6 +103,8 @@ def main() -> int:
         ):
             diff = float(np.max(np.abs(a.numpy() - b)))
             logger.info("  输出 %-16s 最大误差 %.2e", name, diff)
+            if not np.allclose(a.numpy(), b, rtol=1e-3, atol=1e-4):
+                raise RuntimeError(f"ONNX 校验失败: {name} 最大误差 {diff:.3g}")
     return 0
 
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from _common import base_parser, load_config  # noqa: E402
+from _common import base_parser, load_predict_overrides  # noqa: E402
 
 from fabric_ncd.inference import FabricPredictor  # noqa: E402
 from fabric_ncd.ncd import discover_classes, l2_normalize  # noqa: E402
@@ -32,7 +32,7 @@ from fabric_ncd.utils import ensure_dir, get_logger, json_dump  # noqa: E402
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def _region_features(maps: Dict[str, np.ndarray], regions: List[Dict[str, Any]], thr: float) -> List[np.ndarray]:
+def _region_features(maps: Dict[str, np.ndarray], regions: List[Dict[str, Any]], thr: float) -> List[Optional[np.ndarray]]:
     """区域级嵌入: 在区域内的异常像素上做掩码平均池化."""
     score = maps["score"]
     emb = maps["embedding"]
@@ -44,10 +44,14 @@ def _region_features(maps: Dict[str, np.ndarray], regions: List[Dict[str, Any]],
         ix2, iy2 = min(w, int(np.ceil(x2 * w))), min(h, int(np.ceil(y2 * h)))
         sub = score[iy1:iy2, ix1:ix2]
         sub_emb = emb[:, iy1:iy2, ix1:ix2]
+        if sub.size == 0:
+            feats.append(None)
+            continue
         mask = sub >= thr
         if mask.sum() < 4:
             mask = sub >= np.percentile(sub, 80)
         if mask.sum() == 0:
+            feats.append(None)
             continue
         feat = (sub_emb * mask[None]).sum(axis=(1, 2)) / mask.sum()
         feats.append(l2_normalize(feat[None])[0])
@@ -69,12 +73,13 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides, args.root)
+    cfg = load_predict_overrides(args.config, args.overrides, args.root)
     predictor = FabricPredictor(checkpoint=args.ckpt, config=cfg, device=args.device)
     out_dir = ensure_dir(args.out)
     crops_dir = ensure_dir(out_dir / "cluster_samples")
 
-    files = [p for p in sorted(Path(args.source).rglob("*")) if p.suffix.lower() in IMG_EXTS]
+    source = Path(args.source)
+    files = [p for p in sorted(source.rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
     if args.max_images:
         files = files[: args.max_images]
     if not files:
@@ -82,25 +87,26 @@ def main() -> int:
 
     features, meta, crops = [], [], []
     for path in files:
-        image = Image.open(path).convert("RGB")
+        with Image.open(path) as img:
+            image = img.convert("RGB")
         result = predictor.predict(image, with_embedding=True)
         maps = result["maps"]
         if "embedding" not in maps:
-            raise RuntimeError(
-                "新类发现需要区域嵌入, 请关闭切块推理 (FabricPredictor(tile=False)); "
-                "切块模式目前只返回异常图与类别概率."
-            )
+            raise RuntimeError("新类发现需要模型输出区域嵌入，请检查 checkpoint 与模型配置")
         thr = float(result["image"].get("threshold", 0.5))
         feats = _region_features(maps, result["regions"], thr)
         img_arr = np.asarray(image)
         h, w = img_arr.shape[:2]
         for region, feat in zip(result["regions"], feats):
+            if feat is None:
+                continue
             x1, y1, x2, y2 = region["bbox"]
             box = (int(x1 * w), int(y1 * h), int(np.ceil(x2 * w)), int(np.ceil(y2 * h)))
             features.append(feat)
             meta.append({"path": str(path), "bbox": region["bbox"], "score": region["score"],
                          "pred_cls": region["cls"], "pred_name": region["name"]})
-            crops.append((img_arr, box))
+            x1, y1, x2, y2 = box
+            crops.append(img_arr[max(0, y1 - 8):y2 + 8, max(0, x1 - 8):x2 + 8].copy())
     if not features:
         logger.warning("没有提取到任何疵点区域, 结束")
         return 0
@@ -132,10 +138,7 @@ def main() -> int:
         }
         # 保存每个簇的样例抠图
         for rank, i in enumerate(members[: args.save_crops]):
-            arr, box = crops[i]
-            pad = 8
-            x1, y1, x2, y2 = box
-            patch = arr[max(0, y1 - pad) : y2 + pad, max(0, x1 - pad) : x2 + pad]
+            patch = crops[i]
             if patch.size == 0:
                 continue
             label = assignments[c]["name"].replace("/", "_")

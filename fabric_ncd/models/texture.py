@@ -64,6 +64,10 @@ class GaborBank(nn.Module):
         use_imaginary: bool = True,
     ) -> None:
         super().__init__()
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError("Gabor kernel_size 必须是不小于 3 的奇数")
+        if not orientations or not wavelengths or any(float(wl) <= 0 for wl in wavelengths):
+            raise ValueError("Gabor 方向和正波长不能为空")
         kernels = []
         for wl in wavelengths:
             sigma = 0.56 * float(wl)
@@ -126,7 +130,7 @@ def estimate_weave_period(
     """
     if images.dim() != 4:
         raise ValueError("images 需为 (B,3,H,W)")
-    if images.dtype == torch.float16:  # 半精度推理时 FFT 在 fp32 上做, 避免 cuFFT 精度/兼容问题
+    if images.dtype in (torch.float16, torch.bfloat16):  # FFT 在 fp32 上做，避免半精度兼容问题
         images = images.float()
     b, _, h, w = images.shape
     gray = (
@@ -154,7 +158,10 @@ def estimate_weave_period(
         """k: 整幅内的周期数 (浮点) -> 周期 = dim / k."""
         nbins = energy.shape[1]
         k_lo = max(1, int(math.floor(dim / max_period)))
-        k_hi = max(k_lo + 1, min(nbins - 2, int(math.ceil(dim / min_period))))
+        k_hi = min(nbins - 2, int(math.ceil(dim / min_period)))
+        if k_lo > k_hi:
+            return (energy.new_full((energy.shape[0],), dim / default_period),
+                    energy.new_zeros((energy.shape[0],)))
         band = energy[:, k_lo : k_hi + 1]
         idx = band.argmax(dim=1) + k_lo
         k = _parabolic_peak(energy, idx.clamp(1, nbins - 2)).clamp(min=1e-3)
@@ -236,7 +243,7 @@ class TextureEncoder(nn.Module):
         super().__init__()
         self.gabor = GaborBank(orientations, wavelengths, kernel_size, use_imaginary=use_imaginary)
         self.weave_norm = WeaveNorm() if use_weave_norm else None
-        gabor_norm = nn.GroupNorm(min(8, self.gabor.out_channels), self.gabor.out_channels)
+        gabor_norm = nn.GroupNorm(math.gcd(8, self.gabor.out_channels), self.gabor.out_channels)
         self.gabor_norm = gabor_norm
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels + self.gabor.out_channels, out_channels, 1, bias=False),

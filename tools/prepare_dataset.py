@@ -38,6 +38,7 @@ from fabric_ncd.data.yolo import (  # noqa: E402
     list_images,
     load_dataset_spec,
     read_yolo_labels,
+    resolve_label_path,
 )
 from fabric_ncd.utils import ensure_dir, get_logger  # noqa: E402
 
@@ -160,7 +161,7 @@ def main() -> int:
         empty = 0
         missing = 0
         for img in images:
-            label_path = Path(spec.labels[split]) / f"{img.stem}.txt" if spec.labels.get(split) else None
+            label_path = resolve_label_path(img, spec.splits[split], spec.labels.get(split))
             if label_path is None or not label_path.exists():
                 missing += 1
                 continue
@@ -272,7 +273,12 @@ def main() -> int:
             if args.limit:
                 images = images[: args.limit]
             target = ensure_dir(out_root / split)
-            todo = [img for img in images if args.force or not (target / f"{img.stem}.png").exists()]
+            todo = []
+            for img in images:
+                destination = target / img.relative_to(spec.splits[split]).with_suffix(".png")
+                if args.force or not destination.exists():
+                    ensure_dir(destination.parent)
+                    todo.append((img, destination.parent))
             skipped = len(images) - len(todo)
             logger.info("%s: 待处理 %d 张 (已存在跳过 %d 张, workers=%d, mask_size=%s)",
                         split, len(todo), skipped, workers, mask_size)
@@ -282,7 +288,7 @@ def main() -> int:
             done = 0
             failed = 0
             with ProcessPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_export_one, str(img), str(target), mask_size): img for img in todo}
+                futures = {pool.submit(_export_one, str(img), str(parent), mask_size): img for img, parent in todo}
                 for future in as_completed(futures):
                     img = futures[future]
                     done += 1
@@ -315,20 +321,21 @@ def main() -> int:
                 images = images[: args.limit]
             label_dir = spec.labels.get(split)
             target = ensure_dir(out_root / split)
-            todo = [
-                img for img in images
-                if label_dir is not None and (Path(label_dir) / f"{img.stem}.txt").exists()
-                and (args.force or not (target / f"{img.stem}.png").exists())
-            ]
+            todo = []
+            for img in images:
+                label = resolve_label_path(img, spec.splits[split], label_dir)
+                destination = target / img.relative_to(spec.splits[split]).with_suffix(".png")
+                if label is not None and (args.force or not destination.exists()):
+                    ensure_dir(destination.parent)
+                    todo.append((img, label, destination.parent))
             logger.info("%s: 待处理 %d 张 (workers=%d)", split, len(todo), workers)
             if not todo:
                 continue
             done = 0
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(_export_defect_one, str(img), str(Path(label_dir) / f"{img.stem}.txt"),
-                                str(target), mask_size): img
-                    for img in todo
+                    pool.submit(_export_defect_one, str(img), str(label), str(parent), mask_size): img
+                    for img, label, parent in todo
                 }
                 for future in as_completed(futures):
                     done += 1

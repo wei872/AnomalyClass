@@ -17,6 +17,9 @@ from __future__ import annotations
 import copy
 import csv
 import math
+import os
+import random
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,15 +41,17 @@ from .losses import FabricCriterion
 from .metrics import MetricAccumulator, auroc, grouped_auroc
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer, postprocess_outputs
-from .ops import bbox_iou, threshold_from_normal_pixels, topk_mean
+from .ops import bbox_iou, box_filter, threshold_from_normal_pixels, topk_mean
 from .utils import (
     AverageMeter,
     Timer,
     describe_device,
+    checkpoint_compat_config,
     ensure_dir,
     format_seconds,
     get_logger,
     json_dump,
+    load_model_weights,
     move_to,
     resolve_device,
     save_yaml,
@@ -72,7 +77,7 @@ class ModelEMA:
         d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
         for ema_p, p in zip(self.ema.parameters(), model.parameters()):
             ema_p.mul_(d).add_(p.detach(), alpha=1 - d)
-        # BN 统计量与记忆库直接同步, 不做平滑
+        # BN 统计量直接同步，不做平滑；记忆库各自维护。
         for (ema_buf_name, ema_buf), (buf_name, buf) in zip(
             self.ema.named_buffers(), model.named_buffers()
         ):
@@ -80,9 +85,7 @@ class ModelEMA:
                 continue
             if ema_buf.shape == buf.shape and ema_buf.dtype == buf.dtype:
                 ema_buf.copy_(buf.detach())
-        if getattr(model, "memory", None) is not None:
-            self.ema.memory.features.copy_(model.memory.features)
-            self.ema.memory.size.copy_(model.memory.size)
+        # EMA 的嵌入与训练模型不同，记忆库由 warmup_memory 分别构建，不能逐步覆盖。
 
 
 # --------------------------------------------------------------------------- #
@@ -97,6 +100,20 @@ def _reshuffled(cfg: Dict[str, Any], loader) -> Optional[Any]:
     if dataset is not None:
         return build_normal_loader(cfg, "train", shuffle=True)
     return None
+
+
+def _interleave(loaders):
+    """轮询不同来源，限制批次数时也能覆盖每种来源。"""
+    active = [iter(loader) for loader in loaders]
+    while active:
+        remaining = []
+        for iterator in active:
+            try:
+                yield next(iterator)
+                remaining.append(iterator)
+            except StopIteration:
+                pass
+        active = remaining
 
 
 def analyzer_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -185,6 +202,7 @@ def _downsample_mask_np(arr: np.ndarray, stride: int) -> np.ndarray:
     return t[0, 0].numpy() > 0.5
 
 
+@torch.no_grad()
 def evaluate(
     model: FabricNCD,
     loader: DataLoader,
@@ -228,6 +246,17 @@ def evaluate(
     agg_src: List[str] = []
 
     for batch in loader:
+        if max_samples is not None:
+            remaining = int(max_samples) - seen
+            if remaining <= 0:
+                break
+            batch_size = batch["image"].shape[0]
+            if remaining < batch_size:
+                batch = {
+                    key: (value[:remaining] if isinstance(value, (torch.Tensor, list, tuple))
+                          and len(value) == batch_size else value)
+                    for key, value in batch.items()
+                }
         batch = move_to(batch, device)
         outputs = model(batch["image"])
         if criterion is not None:
@@ -282,7 +311,7 @@ def evaluate(
                 "labels": gt_labels,
             }
             pred_boxes, pred_scores, pred_labels = _regions_to_boxes(infos, w, h, cfg)
-            if infos and not normal:  # 只统计"这块布"上的假阳 (正常图属于别的布种)
+            if not normal:  # 分母包含没有预测区域的疵点图
                 gt_xyxy = gt_dict["boxes"]
                 outside_fp_images += 1
                 for box in pred_boxes:
@@ -363,7 +392,7 @@ def evaluate_tiled(
     tile_size: Optional[int | Tuple[int, int]] = None,
     tile_overlap: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """大幅面切块评估 —— 与 ``FabricPredictor(tile=True)`` 完全一致的指标.
+    """大幅面切块评估 —— 使用与 ``FabricPredictor(tile=True)`` 相同的地图和区域分析.
 
     整图缩放会丢细节时 (小疵点只有几像素), 评估必须和推理走同一条路径:
     按原始像素尺度切块 -> 融合异常图 -> 区域分析 -> 计算指标.
@@ -372,8 +401,8 @@ def evaluate_tiled(
     像素级指标按 ``eval.max_pixels`` 下采样后再统计 (AUROC/PRO 对下采样不敏感),
     检测框/分类指标仍使用原始坐标, 因此与部署时的输出一致.
     """
-    from .inference import _resolve_image_size, as_hw, forward_maps
-    from .data.yolo import boxes_to_mask, list_images, load_rgb, read_yolo_labels
+    from .inference import _resolve_image_size, _resize_map, as_hw, forward_maps
+    from .data.yolo import FabricDataset, boxes_to_mask, load_rgb, read_yolo_labels
 
     model.eval()
     spec = load_dataset_spec(cfg)
@@ -390,23 +419,32 @@ def evaluate_tiled(
         acc.pixel_threshold = float(analyzer.threshold)
 
     image_size = _resolve_image_size(cfg)
-    tile_hw = as_hw(tile_size or eval_cfg.get("tile_size") or image_size)
-    overlap = int(tile_overlap if tile_overlap is not None else eval_cfg.get("tile_overlap", 128))
-    tile_batch = int(eval_cfg.get("tile_batch", 4))
+    infer_cfg = cfg.get("infer", {}) or {}
+    tile_hw = as_hw(tile_size or eval_cfg.get("tile_size") or infer_cfg.get("tile_size") or image_size)
+    overlap = int(tile_overlap if tile_overlap is not None else eval_cfg.get("tile_overlap", infer_cfg.get("tile_overlap", 128)))
+    tile_batch = int(eval_cfg.get("tile_batch", infer_cfg.get("tile_batch", 4)))
     gate = bool(eval_cfg.get("cloth_gate", True))
     max_pixels = float(eval_cfg.get("max_pixels", 3e5))
-    analysis_stride = analysis_stride_of(cfg)
-    target_period = float((cfg.get("infer", {}) or {}).get("weave_target_period", 8.0))
+    out_stride = max(1, int(infer_cfg.get("out_stride", 4)))
+    probs_mul = max(1, int(infer_cfg.get("probs_mul", 2)))
+    target_period = float(infer_cfg.get("weave_target_period", 8.0))
+    memory_stride = infer_cfg.get("memory_stride")
+    if memory_stride is not None and getattr(model, "memory", None) is not None:
+        model.memory.query_stride = max(1, int(memory_stride))
 
-    defect_images = list_images(spec.splits.get(split))
-    labels_dir = spec.labels.get(split)
-    normal_images = list_images(spec.normal_splits.get(split))
-    items: List[Tuple[Path, bool]] = [(p, False) for p in defect_images] + [(p, True) for p in normal_images]
-    if max_samples:
-        items = items[:max_samples]
+    source = FabricDataset._collect(spec.splits.get(split), spec.labels.get(split), None, False, split)
+    normal_items = FabricDataset._collect(spec.normal_splits.get(split), None, None, True, split)
+    items = [item for item in source if not item.normal] + normal_items + [item for item in source if item.normal]
+    limit = cfg.get("data", {}).get("limit_train" if split == "train" else "limit_val")
+    if limit and int(limit) < len(items):
+        items = FabricDataset._stratified_limit(items, int(limit))
+    if max_samples is not None:
+        items = items[:max(0, int(max_samples))]
 
     predictions: List[Dict[str, Any]] = []
-    for path, is_normal in items:
+    defect_images = detected_images = region_total = outside_fp = normal_images = normal_region_total = 0
+    for entry in items:
+        path, is_normal = entry.image, entry.normal
         rgb = load_rgb(path)
         h, w = rgb.shape[:2]
         if is_normal:
@@ -414,8 +452,9 @@ def evaluate_tiled(
             gt_labels = np.zeros((0,), dtype=np.int64)
             gt_boxes = np.zeros((0, 4), dtype=np.float32)
         else:
-            label_path = None if labels_dir is None else Path(labels_dir) / f"{path.stem}.txt"
-            boxes, polygons = read_yolo_labels(label_path)
+            boxes, polygons = read_yolo_labels(entry.label)
+            if len(boxes) and spec.nc > 0 and ((boxes[:, 0] < 0) | (boxes[:, 0] >= spec.nc)).any():
+                raise ValueError(f"标签类别超出 0..{spec.nc - 1}: {entry.label}")
             gt_mask = boxes_to_mask(boxes, polygons, h, w)
             gt_labels = boxes[:, 0].astype(np.int64) if len(boxes) else np.zeros((0,), dtype=np.int64)
             gt_boxes = _xyxy_pixels(boxes, w, h)
@@ -423,20 +462,33 @@ def evaluate_tiled(
         maps = forward_maps(
             model, rgb, device, image_size,
             tile=True, tile_size=tile_hw, tile_overlap=overlap, tile_batch=tile_batch,
-            out_stride=1, probs_mul=analysis_stride,
-            weave_norm=True, target_period=target_period,
+            out_stride=out_stride, probs_mul=probs_mul,
+            weave_norm=bool(infer_cfg.get("weave_norm", True)), target_period=target_period,
         )
         score = gate_by_cloth(maps["score"], maps["cloth"], gate)
-        score_analysis = _downsample_np(score, analysis_stride)
-        cloth_analysis = _downsample_np(maps["cloth"], analysis_stride)
         infos, image_level = analyzer.analyze(
-            score_analysis, cloth_analysis, maps["probs"], probs_scale=1
+            maps["score"], maps["cloth"], maps["probs"], probs_scale=probs_mul
         )
-        image_score = image_score_of(score, eval_cfg)
+        score_for_image = _resize_map(score, (h, w)) if infer_cfg.get("image_score_full_res", True) else score
+        image_score = image_score_of(score_for_image, eval_cfg)
 
-        # 像素级统计下采样, 大幅面图 (2000x3000) 全分辨率累计会吃掉数 GB 内存
+        # 与部署共享低分辨率融合图，仅在像素指标需要时放大或限额下采样。
         factor = max(1, int(math.ceil(math.sqrt((h * w) / max(max_pixels, 1.0)))))
+        sample_h, sample_w = math.ceil(h / factor), math.ceil(w / factor)
+        sampled_gt = F.interpolate(torch.from_numpy(gt_mask.astype(np.float32))[None, None],
+                                   size=(sample_h, sample_w), mode="nearest")[0, 0].numpy()
+        sampled_score = _resize_map(score, (sample_h, sample_w))
         pred_boxes, pred_scores, pred_labels = _regions_to_boxes(infos, w, h, cfg)
+        region_total += len(infos)
+        if is_normal:
+            normal_images += 1
+            normal_region_total += len(infos)
+        else:
+            defect_images += 1
+            detected_images += bool(infos)
+            for box in pred_boxes:
+                if not len(gt_boxes) or max(bbox_iou(box[:4], gt[:4]) for gt in gt_boxes) < 0.10:
+                    outside_fp += 1
 
         multi_true, multi_pred = -1, -1
         if len(gt_labels):
@@ -445,8 +497,8 @@ def evaluate_tiled(
                 multi_pred = int(np.argmax(image_level["probs"]))
 
         acc.update(
-            anomaly_score=score[::factor, ::factor],
-            anomaly_gt=gt_mask[::factor, ::factor],
+            anomaly_score=sampled_score,
+            anomaly_gt=sampled_gt,
             normal=is_normal,
             image_score=image_score,
             pred={"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels},
@@ -471,6 +523,11 @@ def evaluate_tiled(
 
     metrics = acc.compute()
     metrics["num_samples"] = len(items)
+    metrics["det_rate"] = detected_images / defect_images if defect_images else 0.0
+    metrics["num_defect_images"] = defect_images
+    metrics["regions_per_image"] = region_total / max(1, len(items))
+    metrics["outside_fp_per_image"] = outside_fp / max(1, defect_images)
+    metrics["normal_regions_per_image"] = normal_region_total / max(1, normal_images)
     metrics["tile_size"] = list(tile_hw)
     metrics["tile_overlap"] = overlap
     if collect_predictions:
@@ -485,10 +542,13 @@ def _class_names(cfg: Dict[str, Any]) -> List[str]:
         return list(names)
     try:
         spec = load_dataset_spec(cfg)
-        return list(spec.names)
+        if spec.names:
+            return list(spec.names)
+        num = spec.nc
     except Exception:  # pragma: no cover
-        num = int(cfg.get("model", {}).get("heads", {}).get("num_classes", 19))
-        return [f"class_{i}" for i in range(num)]
+        num = 0
+    num = int(num or cfg.get("model", {}).get("heads", {}).get("num_classes", 19))
+    return [f"class_{i}" for i in range(num)]
 
 
 def _xyxy_pixels(boxes: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -546,7 +606,9 @@ class Trainer:
         self.train_cfg = cfg.get("train", {})
         self.epochs = int(self.train_cfg.get("epochs", 60))
         self.amp = bool(exp.get("amp", True)) and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler(enabled=self.amp) if hasattr(torch, "amp") else None
+        scaler_cls = getattr(getattr(torch, "amp", None), "GradScaler", None)
+        self.scaler = (scaler_cls(enabled=self.amp) if scaler_cls is not None
+                       else torch.cuda.amp.GradScaler(enabled=self.amp))
 
         # 类别数以数据集 yaml 为准, 避免配置与标注不一致导致越界
         try:
@@ -596,7 +658,9 @@ class Trainer:
         self.memory_loaders = []
         if ("defect" in self.memory_source or "both" in self.memory_source) and self.background_loader is not None:
             self.memory_loaders.append(self.background_loader)
-        if self.normal_loader is not None and (("normal" in self.memory_source) or not self.memory_loaders):
+        if self.normal_loader is not None and (
+            "normal" in self.memory_source or "both" in self.memory_source or not self.memory_loaders
+        ):
             self.memory_loaders.append(self.normal_loader)
         if not self.memory_loaders:
             self.logger.warning(
@@ -623,6 +687,8 @@ class Trainer:
         self._memory_stale = False
         self._calib_calls = 0
         self.best_score = -float("inf")
+        self.bad_epochs = 0
+        self._bank_paths = set()
         self.history: List[Dict[str, Any]] = []
         self.global_step = 0
         self.logger.info(
@@ -663,27 +729,42 @@ class Trainer:
         成一个常数偏置, 图像级分数整体被它带平.
         """
         bank = getattr(self, "_bank_paths", set()) if skip_bank else set()
-        for loader in getattr(self, "memory_loaders", []) or []:
-            for batch in loader:
-                paths = [str(p) for p in batch.get("path", [])]
-                if not paths:
-                    yield batch
-                    continue
-                keep = [i for i, p in enumerate(paths) if p not in bank]
-                if not keep:
-                    continue
-                if len(keep) == len(paths):
-                    yield batch
-                    continue
-                filtered = {}
-                for key, value in batch.items():
-                    if isinstance(value, torch.Tensor) and value.shape[0] == len(paths):
-                        filtered[key] = value[keep]
-                    elif isinstance(value, (list, tuple)) and len(value) == len(paths):
-                        filtered[key] = [value[i] for i in keep]
-                    else:
-                        filtered[key] = value
-                yield filtered
+        for batch in _interleave(getattr(self, "memory_loaders", []) or []):
+            paths = [str(p) for p in batch.get("path", [])]
+            if not paths:
+                yield batch
+                continue
+            keep = [i for i, p in enumerate(paths) if p not in bank]
+            if not keep:
+                continue
+            if len(keep) == len(paths):
+                yield batch
+                continue
+            filtered = {}
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor) and value.shape[0] == len(paths):
+                    filtered[key] = value[keep]
+                elif isinstance(value, (list, tuple)) and len(value) == len(paths):
+                    filtered[key] = [value[i] for i in keep]
+                else:
+                    filtered[key] = value
+            yield filtered
+
+    @torch.no_grad()
+    def _bank_self_distance(self, chunk: int = 512) -> float:
+        """库内每个特征到其他特征的最近余弦距离，用于检测特征塌缩。"""
+        bank = self.model.memory
+        n = int(bank.size.item())
+        if n < 2:
+            return 0.0
+        features = F.normalize(bank.features[:n].float(), dim=1)
+        distances = []
+        for start in range(0, n, chunk):
+            sim = features[start:start + chunk] @ features.T
+            row = torch.arange(sim.shape[0], device=sim.device)
+            sim[row, row + start] = -float("inf")
+            distances.append((1.0 - sim.max(dim=1).values).clamp_min(0))
+        return float(torch.cat(distances).mean())
 
     def warmup_memory(self, max_batches: Optional[int] = None, calibrate: bool = True) -> None:
         if not self.memory_loaders or not self.model.memory_enabled:
@@ -699,15 +780,14 @@ class Trainer:
         batches = 0
         self._bank_paths = set()
         with torch.no_grad():
-            for loader in loaders:
-                for batch in loader:
-                    for path in batch.get("path", []):
-                        self._bank_paths.add(str(path))
-                    batch = move_to(batch, self.device)
-                    self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
-                    batches += 1
-                    if max_batches and batches >= max_batches:
-                        break
+            for batch in _interleave(loaders):
+                for path in batch.get("path", []):
+                    self._bank_paths.add(str(path))
+                batch = move_to(batch, self.device)
+                self.model.update_memory(batch["image"], mask=batch["cloth_mask"])
+                if self.ema is not None and self.ema.num_updates > 0:
+                    self.ema.ema.update_memory(batch["image"], mask=batch["cloth_mask"])
+                batches += 1
                 if max_batches and batches >= max_batches:
                     break
         self.model.train()
@@ -715,10 +795,10 @@ class Trainer:
             "记忆库预热完成: %d 个 patch 特征 (来自 %d 张参照图; 阈值校准会跳过这些图)",
             int(self.model.memory.size.item()), len(self._bank_paths),
         )
-        # 先把新记忆库同步给 EMA, 再用 EMA 做阈值校准, 否则校准用的是旧记忆库,
-        # 得到的阈值会系统性偏高.
-        if self.ema is not None:
-            self.ema.update(self.model)
+        # 启动时 EMA 与模型参数相同，可直接复制；训练开始后分别用各自嵌入建库。
+        if self.ema is not None and self.ema.num_updates == 0:
+            self.ema.ema.memory.features.copy_(self.model.memory.features)
+            self.ema.ema.memory.size.copy_(self.model.memory.size)
         if calibrate:
             self.calibrate()
 
@@ -756,14 +836,11 @@ class Trainer:
                 model.memory.reset()
                 sweep_loaders = build_reference_loaders(cfg_s, "train", shuffle=False)
                 built = 0
-                for loader in sweep_loaders:
-                    for batch in loader:
-                        model.update_memory(
-                            batch["image"].to(self.device), mask=batch["cloth_mask"].to(self.device)
-                        )
-                        built += 1
-                        if built >= memory_batches:
-                            break
+                for batch in _interleave(sweep_loaders):
+                    model.update_memory(
+                        batch["image"].to(self.device), mask=batch["cloth_mask"].to(self.device)
+                    )
+                    built += 1
                     if built >= memory_batches:
                         break
                 started = time.time()
@@ -854,7 +931,9 @@ class Trainer:
                 "记忆项尺度会被压小, 请增大参照集或减小 memory_warmup_batches",
                 n_ref,
             )
-        for batch in self._reference_batches(skip_bank=skip_bank):
+        for batch_index, batch in enumerate(self._reference_batches(skip_bank=skip_bank)):
+            if max_batches > 0 and batch_index >= max_batches:
+                break
             batch = move_to(batch, self.device)
             out = model(batch["image"])
             h, w = batch["image"].shape[-2:]
@@ -895,8 +974,6 @@ class Trainer:
                 pixel_dist.append(pd)
                 pixel_masks.append(pm)
                 seen += 1
-            if seen >= max_batches * batch["image"].shape[0]:
-                break
         if not learned_parts:
             return self.calibration
 
@@ -945,7 +1022,10 @@ class Trainer:
                 s = (1.0 - weight) * pl + weight * mem
             else:
                 s = pl
-            pixel_scores.append(np.where(pm, s, 0.0).astype(np.float32))
+            smooth = int(getattr(self.analyzer, "smooth", 1))
+            if smooth > 1:
+                s = box_filter(s, smooth // 2)
+            pixel_scores.append(s[pm].astype(np.float32))
         pixel_values = np.concatenate([s.ravel() for s in pixel_scores]) if pixel_scores else np.zeros(0, np.float32)
         if pixel_values.size > max_pixels:
             idx = np.random.default_rng(0).choice(pixel_values.size, max_pixels, replace=False)
@@ -958,7 +1038,9 @@ class Trainer:
         full_parts: List[np.ndarray] = []
         image_scores: List[float] = []
         seen_full = 0
-        for batch in self._reference_batches(skip_bank=skip_bank):
+        for batch_index, batch in enumerate(self._reference_batches(skip_bank=skip_bank)):
+            if max_batches > 0 and batch_index >= max_batches:
+                break
             batch = move_to(batch, self.device)
             out = model(batch["image"])
             h, w = batch["image"].shape[-2:]
@@ -988,12 +1070,10 @@ class Trainer:
                     score = (1.0 - weight) * learned[i] + weight * mem
                 else:
                     score = learned[i]
-                score = np.where(keep[i], score, 0.0).astype(np.float32)
-                image_scores.append(image_score_of(score, eval_cfg))
-                full_parts.append(score.ravel()[:: max(1, score.size // 20000)])
+                valid_score = score[keep[i]].astype(np.float32)
+                image_scores.append(image_score_of(valid_score, eval_cfg))
+                full_parts.append(valid_score[:: max(1, valid_score.size // 20000)])
                 seen_full += 1
-            if seen_full >= max_batches * batch["image"].shape[0]:
-                break
         pixel_values_full = np.concatenate(full_parts) if full_parts else np.zeros(0, np.float32)
         if pixel_values_full.size > max_pixels:
             idx = np.random.default_rng(0).choice(pixel_values_full.size, max_pixels, replace=False)
@@ -1107,12 +1187,19 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def fit(self) -> Dict[str, Any]:
-        self.audit_cloth_coverage()
-        self.warmup_memory(int(self.train_cfg.get("memory_warmup_batches", 50)))
+        if self.start_epoch >= self.epochs:
+            raise ValueError(
+                f"checkpoint 已训练 {self.start_epoch} 轮，而 train.epochs={self.epochs}；请增大总轮数再续训"
+            )
+        if self.start_epoch == 0:
+            self.audit_cloth_coverage()
+        if self.start_epoch == 0 or (self.model.memory_enabled and not self.model.memory.is_ready):
+            self.warmup_memory(int(self.train_cfg.get("memory_warmup_batches", 50)))
+        else:
+            self.logger.info("续训: 保留 checkpoint 中的记忆库与校准结果")
         refresh = int(self.train_cfg.get("memory_refresh_interval", 5))
         best_path = self.output_dir / "best.pt"
         patience = int(self.train_cfg.get("early_stop_patience", 15))
-        bad_epochs = 0
         timer = Timer()
 
         for epoch in range(self.start_epoch, self.epochs):
@@ -1188,10 +1275,10 @@ class Trainer:
                     )
                 if score > self.best_score:
                     self.best_score = score
-                    bad_epochs = 0
+                    self.bad_epochs = 0
                     self.save_checkpoint(best_path, epoch, metrics, best=True)
                 else:
-                    bad_epochs += 1
+                    self.bad_epochs += 1
             else:
                 self.logger.info(
                     "Epoch %03d | loss %.4f | %s",
@@ -1204,12 +1291,13 @@ class Trainer:
             record = {"epoch": epoch + 1, **train_logs, **metrics, "lr": self.optimizer.param_groups[0]["lr"]}
             self.history.append(record)
             self._write_history(record)
+            # 中断时仍能从最近完整轮次恢复，而不是只剩训练结束时的 last.pt。
+            self.save_checkpoint(self.output_dir / "last.pt", epoch, metrics, best=False)
 
-            if bad_epochs >= patience:
-                self.logger.info("早停: 连续 %d 轮无提升", bad_epochs)
+            if patience > 0 and self.bad_epochs >= patience:
+                self.logger.info("早停: 连续 %d 轮无提升", self.bad_epochs)
                 break
 
-        self.save_checkpoint(self.output_dir / "last.pt", epoch, {}, best=False)
         sweep = self.train_cfg.get("scale_sweep") or []
         if sweep:
             self.logger.info("分辨率体检: 用当前权重扫 %s (不落盘, 不影响已保存的 checkpoint)", list(sweep))
@@ -1316,14 +1404,13 @@ class Trainer:
             # (否则会报 "Detected call of lr_scheduler.step() before optimizer.step()")
             if scale_before is None or self.scaler.get_scale() >= scale_before:
                 self.scheduler.step()
-            self.global_step += 1
-            if self.ema is not None:
-                self.ema.update(self.model)
+                self.global_step += 1
+                if self.ema is not None:
+                    self.ema.update(self.model)
 
             for key in meters:
                 if key in logs:
                     meters[key].update(logs[key])
-            meters["loss_total"].update(logs.get("loss_total", float(loss)))
 
             if (step + 1) % int(self.train_cfg.get("log_interval", 10)) == 0 or step == total - 1:
                 lr = self.optimizer.param_groups[0]["lr"]
@@ -1409,35 +1496,87 @@ class Trainer:
             "scheduler": self.scheduler.state_dict(),
             "metrics": metrics,
             "best_score": self.best_score,
+            "global_step": self.global_step,
+            "bad_epochs": self.bad_epochs,
+            "bank_paths": sorted(self._bank_paths),
+            "calib_calls": self._calib_calls,
+            "rng_state": {
+                "python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+            "ema_updates": self.ema.num_updates if self.ema is not None else 0,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "calibration": self.calibration,
             "config": self.cfg,
             "names": _class_names(self.cfg),
-            "version": 1,
+            "version": 2,
         }
         if self.ema is not None:
             payload["ema"] = self.ema.ema.state_dict()
-        torch.save(payload, path)
+        # 原子替换：中途异常不会把上一个完整 checkpoint 覆盖成半截文件。
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        os.close(fd)
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         if best:
             self.logger.info("保存最优模型 -> %s (score=%.4f)", path, self.best_score)
 
     def load_checkpoint(self, path: str | Path, load_optimizer: bool = False) -> Dict[str, Any]:
         state = torch.load(path, map_location=self.device, weights_only=False)
+        if state.get("version") == 1 and hasattr(self, "cfg"):
+            cfg = checkpoint_compat_config(self.cfg, state)
+            legacy = cfg.get("model", {}).get("backbone", {}).get("legacy_p5_stride64")
+            backbone = getattr(self.model, "backbone", None)
+            if legacy is not None and hasattr(backbone, "set_legacy_p5_stride64"):
+                backbone.set_legacy_p5_stride64(bool(legacy))
+                if self.ema is not None:
+                    self.ema.ema.backbone.set_legacy_p5_stride64(bool(legacy))
+            self.cfg = cfg
         key = "ema" if "ema" in state and not load_optimizer else "model"
-        try:
-            self.model.load_state_dict(state[key])
-        except RuntimeError as exc:
-            # 结构升级后旧权重形状可能不一致 (例如 geography 新增 border_prior 输入),
-            # 尽量加载其余权重并明确告警, 而不是直接崩掉
-            missing, unexpected = self.model.load_state_dict(state[key], strict=False)
-            self.logger.warning(
-                "权重与当前结构不一致 (%s): 跳过 %d 个参数, 多余 %d 个; 建议重新训练",
-                exc.__class__.__name__, len(missing), len(unexpected),
-            )
-        if load_optimizer and "optimizer" in state:
+        load_model_weights(self.model, state[key])
+        if self.ema is not None:
+            load_model_weights(self.ema.ema, state.get("ema") or state["model"])
+            self.ema.num_updates = int(state.get("ema_updates", state.get("global_step", state.get("scheduler", {}).get("last_epoch", 0))))
+        if load_optimizer and "optimizer" not in state:
+            raise ValueError("checkpoint 缺少优化器状态，不能断点续训；请作为预训练权重重新开始")
+        if load_optimizer:
             self.optimizer.load_state_dict(state["optimizer"])
             if "scheduler" in state:
                 self.scheduler.load_state_dict(state["scheduler"])
+            if self.scaler is not None and state.get("scaler"):
+                self.scaler.load_state_dict(state["scaler"])
+            self.global_step = int(state.get("global_step", state.get("scheduler", {}).get("last_epoch", 0)))
             self.start_epoch = int(state.get("epoch", 0)) + 1
+            self.bad_epochs = int(state.get("bad_epochs", 0))
+            self._bank_paths = set(state.get("bank_paths", []))
+            self._calib_calls = int(state.get("calib_calls", 0))
+            rng = state.get("rng_state") or {}
+            if "python" in rng:
+                random.setstate(rng["python"])
+            if "numpy" in rng:
+                np.random.set_state(rng["numpy"])
+            if "torch" in rng:
+                torch.set_rng_state(rng["torch"].cpu())
+            if rng.get("cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all([item.cpu() for item in rng["cuda"]])
+            saved_data = (state.get("config") or {}).get("data", {})
+            current_data = getattr(self, "cfg", {}).get("data", {})
+            if saved_data and any(saved_data.get(key) != current_data.get(key) for key in ("root", "dataset_yaml")):
+                if getattr(self.model, "memory_enabled", False):
+                    self.model.memory.reset()
+                    if self.ema is not None:
+                        self.ema.ema.memory.reset()
+                    self._bank_paths.clear()
+                    self.logger.warning("数据集路径已更改，续训时将重新建立记忆库并校准")
+            if (getattr(self.model, "memory_enabled", False)
+                    and self.model.memory.is_ready and not self._bank_paths):
+                self.logger.warning("旧 checkpoint 未记录建库图像，后续校准可能复用入库图；建议刷新记忆库")
         self.best_score = float(state.get("best_score", -1))
         if state.get("calibration"):
             self.calibration = dict(state["calibration"])

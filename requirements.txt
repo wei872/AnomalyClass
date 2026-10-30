@@ -1,7 +1,8 @@
 # 核心依赖 (CPU 可运行)
 torch>=2.0
 torchvision>=0.15
-numpy>=1.24
+numpy>=1.24,<2; python_version < "3.13"
+numpy>=2,<3; python_version >= "3.13"
 pillow>=9.1
 PyYAML>=6.0
 

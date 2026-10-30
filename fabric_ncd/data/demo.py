@@ -50,7 +50,7 @@ def add_defect(img: np.ndarray, rng: np.random.Generator) -> Tuple[np.ndarray, L
 
 def make_dataset(root: Path, n_train: int = 8, n_val: int = 4, n_normal: int = 6, size=(96, 96)) -> Path:
     """生成临时 YOLO 数据集并返回数据根目录."""
-    root = Path(root)
+    root = Path(root).resolve()
     rng = np.random.default_rng(0)
     for split, n in (("train", n_train), ("val", n_val)):
         img_dir = root / "images" / split

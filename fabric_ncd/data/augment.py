@@ -84,7 +84,7 @@ def aspect_jitter(sample: Sample, scale: Tuple[float, float], rng: np.random.Gen
 def random_scale_crop(sample: Sample, scale: Tuple[float, float], rng: np.random.Generator) -> Sample:
     h, w = sample["image"].shape[:2]
     s = float(rng.uniform(*scale))
-    ch, cw = max(8, int(round(h * s))), max(8, int(round(w * s)))
+    ch, cw = min(h, max(1, int(round(h * s)))), min(w, max(1, int(round(w * s))))
     y0 = int(rng.integers(0, max(1, h - ch + 1)))
     x0 = int(rng.integers(0, max(1, w - cw + 1)))
     out = dict(sample)
@@ -131,7 +131,7 @@ def native_scale_crop(
         sample = resize_sample(sample, (max(H, int(round(h * factor))), max(W, int(round(w * factor)))))
         h, w = sample["image"].shape[:2]
         ch, cw = min(ch, h), min(cw, w)
-    ch, cw = max(16, min(ch, h)), max(16, min(cw, w))
+    ch, cw = max(1, min(ch, h)), max(1, min(cw, w))
 
     y0 = int(rng.integers(0, max(1, h - ch + 1)))
     x0 = int(rng.integers(0, max(1, w - cw + 1)))
@@ -189,16 +189,22 @@ def fabric_width_augment(
     if ml > 0:
         if rng.random() < extend_prob:
             canvas[mt : mt + h, :ml] = image_f[:, :1]
-            cloth[mt : mt + h, :ml] = 1
+            cloth[mt : mt + h, :ml] = sample["cloth_mask"][:, :1]
         else:
             canvas[mt : mt + h, :ml] = base + grad[mt : mt + h]
     if mr > 0:
         if rng.random() < extend_prob:
             canvas[mt : mt + h, ml + w :] = image_f[:, -1:]
-            cloth[mt : mt + h, ml + w :] = 1
+            cloth[mt : mt + h, ml + w :] = sample["cloth_mask"][:, -1:]
         else:
             canvas[mt : mt + h, ml + w :] = base + grad[mt : mt + h]
     canvas[mt : mt + h, ml : ml + w] = image_f
+    if mt > 0 and rng.random() < extend_prob:
+        canvas[:mt, ml : ml + w] = image_f[:1]
+        cloth[:mt, ml : ml + w] = sample["cloth_mask"][:1]
+    if mb > 0 and rng.random() < extend_prob:
+        canvas[mt + h :, ml : ml + w] = image_f[-1:]
+        cloth[mt + h :, ml : ml + w] = sample["cloth_mask"][-1:]
 
     boxes = np.asarray(sample["boxes"], dtype=np.float32).reshape(-1, 5)
     if boxes.size:
@@ -454,6 +460,7 @@ class TrainAugment:
                 rng,
                 types=self.synth_types,
                 max_ops=self.synth_max_ops,
+                region=sample["cloth_mask"],
             )
             sample["image"] = img
             sample["synth_mask"] = np.maximum(sample["synth_mask"], synth)

@@ -116,7 +116,7 @@ def add_cutpaste(
     h, w = mask.shape
     ph = int(rng.uniform(0.06, 0.25) * h)
     pw = int(rng.uniform(0.06, 0.25) * w)
-    ph, pw = max(ph, 6), max(pw, 6)
+    ph, pw = min(h, max(ph, 6)), min(w, max(pw, 6))
     y0 = int(rng.integers(0, max(1, h - ph)))
     x0 = int(rng.integers(0, max(1, w - pw)))
     patch = image[y0 : y0 + ph, x0 : x0 + pw].copy()
@@ -126,6 +126,9 @@ def add_cutpaste(
     if rng.random() < 0.5:
         pil_patch = pil_patch.transpose(Image.FLIP_LEFT_RIGHT)
     ph2, pw2 = pil_patch.size[1], pil_patch.size[0]
+    if ph2 > h or pw2 > w:
+        pil_patch.thumbnail((w, h), Image.Resampling.BILINEAR)
+        ph2, pw2 = pil_patch.size[1], pil_patch.size[0]
     dy = int(rng.integers(0, max(1, h - ph2)))
     dx = int(rng.integers(0, max(1, w - pw2)))
     out = image.copy()
@@ -164,7 +167,7 @@ def add_missing_yarn(
     seg_w = int(rng.uniform(0.15, 0.7) * w)
     x0 = int(rng.integers(0, max(1, w - seg_w)))
     out = image.copy()
-    src = np.clip(y0 + int(rng.choice([-1, 1]) * rng.integers(2, 6)), 0, h - 1)
+    src = np.clip(y0 + int(rng.choice([-1, 1]) * rng.integers(2, 6)), 0, max(0, h - thickness))
     out[y0 : y0 + thickness, x0 : x0 + seg_w] = image[src : src + thickness, x0 : x0 + seg_w]
     m = np.zeros((h, w), dtype=np.uint8)
     m[y0 : y0 + thickness, x0 : x0 + seg_w] = 1
@@ -215,17 +218,28 @@ def apply_random_anomaly(
     types: Sequence[str] = SYNTH_TYPES,
     max_ops: int = 2,
     prob: float = 1.0,
+    region: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """随机叠加 1~max_ops 个合成疵点, 返回 (image, 合成掩码)."""
     synth_mask = np.zeros_like(mask, dtype=np.uint8)
-    if rng.random() > prob or not types:
+    if rng.random() > prob or not types or max_ops < 1:
         return image, synth_mask
+    if region is not None:
+        region = np.asarray(region, dtype=bool)
+        if region.shape != mask.shape:
+            raise ValueError("region 与掩码的尺寸必须一致")
+        if not region.any():
+            return image, synth_mask
     n_ops = int(rng.integers(1, max_ops + 1))
     for _ in range(n_ops):
         name = str(rng.choice(list(types)))
         func = SYNTH_FUNCS.get(name)
         if func is None:
             continue
-        image, op_mask = func(image, np.zeros_like(mask, dtype=np.uint8), rng)
+        modified, op_mask = func(image, np.zeros_like(mask, dtype=np.uint8), rng, region)
+        if region is not None:
+            modified = np.where(region[..., None], modified, image)
+            op_mask = op_mask * region
+        image = modified
         synth_mask = np.maximum(synth_mask, op_mask)
     return image, synth_mask

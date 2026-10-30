@@ -108,7 +108,7 @@ def _round_channels(ch: int, width: float, divisor: int = 8) -> int:
 # 纯 PyTorch 主干 (MobileNetV3-Small 拓扑)
 # --------------------------------------------------------------------------- #
 class LiteBackbone(nn.Module):
-    def __init__(self, width_mult: float = 1.0) -> None:
+    def __init__(self, width_mult: float = 1.0, legacy_p5_stride64: bool = False) -> None:
         super().__init__()
         c = lambda ch: _round_channels(ch, width_mult)  # noqa: E731
         self.features = nn.Sequential(
@@ -122,11 +122,12 @@ class LiteBackbone(nn.Module):
             InvertedResidual(c(40), c(240), c(40), 5, 1, True),
             InvertedResidual(c(40), c(120), c(48), 5, 1, True),
             InvertedResidual(c(48), c(144), c(48), 5, 1, True),
-            InvertedResidual(c(48), c(288), c(96), 5, 2, True),  # 1/32 -> p5
+            InvertedResidual(c(48), c(288), c(96), 5, 2 if legacy_p5_stride64 else 1, True),  # p5
             InvertedResidual(c(96), c(576), c(96), 5, 1, True),
             InvertedResidual(c(96), c(576), c(96), 5, 1, True),
             ConvBNAct(c(96), c(576), 1, 1),
         )
+        self.legacy_p5_stride64 = bool(legacy_p5_stride64)
         # 与 features 下标对齐的抽头 (1/4, 1/8, 1/16, 1/32)
         self.taps: Dict[int, str] = {1: "p2", 3: "p3", 4: "p4", 10: "p5"}
         self.out_channels: Dict[str, int] = {
@@ -136,12 +137,23 @@ class LiteBackbone(nn.Module):
             "p5": c(96),
         }
 
+    def set_legacy_p5_stride64(self, enabled: bool) -> None:
+        """旧版 lite checkpoint 的 p5 实际为 1/64，载入时保留其数值行为。"""
+        stride = 2 if enabled else 1
+        depthwise = next(m for m in self.features[10].modules()
+                         if isinstance(m, nn.Conv2d) and m.groups == m.in_channels
+                         and m.kernel_size == (5, 5))
+        depthwise.stride = (stride, stride)
+        self.legacy_p5_stride64 = bool(enabled)
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         outs: Dict[str, torch.Tensor] = {}
         for idx, layer in enumerate(self.features):
             x = layer(x)
             if idx in self.taps:
                 outs[self.taps[idx]] = x
+            if idx == max(self.taps):
+                break  # 后续层不参与任何输出
         return outs
 
 
@@ -179,6 +191,7 @@ class TorchVisionBackbone(nn.Module):
         self.arch = arch
         self.features = self._build(arch, pretrained)
         self.taps, self.out_channels = self._probe(image_size, int(cfg_max_channels))
+        self._frozen_stages = 0
         if weights_path:
             state = torch.load(weights_path, map_location="cpu")
             state = state.get("state_dict", state.get("model", state))
@@ -251,10 +264,13 @@ class TorchVisionBackbone(nn.Module):
             x = layer(x)
             if idx in self.taps:
                 outs[self.taps[idx]] = x
+            if idx == max(self.taps):
+                break  # 后续层不参与任何输出
         return outs
 
     def freeze_stages(self, num_stages: int) -> None:
         """冻结前 num_stages 个子模块 (浅层纹理/边缘特征), 降低过拟合."""
+        self._frozen_stages = max(self._frozen_stages, int(num_stages))
         for idx, layer in enumerate(self.features):
             if idx < num_stages:
                 for p in layer.parameters():
@@ -263,11 +279,21 @@ class TorchVisionBackbone(nn.Module):
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # 外层 model.train() 会递归切换 BN；冻结层的统计量也必须保持不变。
+        for layer in list(self.features)[:self._frozen_stages]:
+            for module in layer.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.eval()
+        return self
+
 
 def build_backbone(cfg: Dict) -> nn.Module:
     arch = str(cfg.get("arch", "mobilenet_v3_small")).lower()
     if arch in ("lite", "lite_backbone", "custom"):
-        return LiteBackbone(width_mult=float(cfg.get("width_mult", 1.0)))
+        return LiteBackbone(width_mult=float(cfg.get("width_mult", 1.0)),
+                            legacy_p5_stride64=bool(cfg.get("legacy_p5_stride64", False)))
     backbone = TorchVisionBackbone(
         arch=arch,
         pretrained=bool(cfg.get("pretrained", True)),

@@ -60,6 +60,8 @@ def main() -> int:
     args = parser.parse_args()
 
     native = parse_size(args.native)
+    if min(native) <= 0:
+        parser.error("--native 尺寸必须为正")
     src = Path(args.source)
     files = list_images(src) if src.is_dir() else ([src] if src.exists() else [])
     if not files:
@@ -89,12 +91,14 @@ def main() -> int:
     print()
     print(f"{'输入 HxW':>12} {'缩放':>6} {'缩放后周期':>10} {'GMACs':>7} {'显存/张':>8}  说明")
     best = None
-    for (h, w, note) in CANDIDATES:
-        if native[1] > 0:
-            scale = (w / native[1] + h / native[0]) / 2.0
-        else:  # pragma: no cover
-            scale = 1.0
-        period = period_native * scale
+    for (reference_h, _, note) in CANDIDATES:
+        # 以原 846 高参考图的候选缩放档位为准，按输入原图长宽比重建候选尺寸。
+        nominal = reference_h / 846.0
+        h = max(64, int(round(native[0] * nominal / 32.0)) * 32)
+        w = max(64, int(round(native[1] * nominal / 32.0)) * 32)
+        scale_y, scale_x = h / native[0], w / native[1]
+        scale = (scale_x + scale_y) / 2.0
+        period = float(np.sqrt(max(px_med * scale_x * py_med * scale_y, 1e-6)))
         macs = BASELINE_MACS * (h * w) / BASELINE_PIXELS
         mem = MEM_PER_MPX * (h * w) / 1e6
         flag = ""
@@ -113,8 +117,8 @@ def main() -> int:
         print(f"      训练显存约 {MEM_PER_MPX * (h * w) / 1e6:.1f} GB/张, batch_size 按显存折算")
         print("      这是'够用'的最小尺寸; 若仍漏检小疵点, 往上调一档 (显存与耗时近似按面积增长)")
     else:
-        print(f"警告: 即使不缩放, 周期也只有 {period_native * 1.0:.2f} px, 布面过于细密。")
-        print("      建议改用 [1024, 1952] 超采样并减少下采样, 或用更高倍率镜头重新采集。")
+        print(f"警告: 所有候选尺寸都未满足周期或最小疵点约束 (原始等效周期 {period_native:.2f} px)。")
+        print("      可尝试更高输入分辨率、切块，或用更高倍率镜头重新采集。")
     if min(px_med, py_med) > 0 and abs(px_med - py_med) / min(px_med, py_med) > 0.6:
         print(f"提示: 经纬周期差异较大 ({px_med:.1f} vs {py_med:.1f} px), 属于正常织物各向异性, "
               "模型已用 texture 分支显式建模, 无需额外处理。")

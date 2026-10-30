@@ -20,6 +20,8 @@ import torch.nn.functional as F
 class MemoryBank(nn.Module):
     def __init__(self, capacity: int = 2048, dim: int = 64, eps: float = 1e-6, query_stride: int = 1) -> None:
         super().__init__()
+        if capacity < 1 or dim < 1:
+            raise ValueError("记忆库容量与特征维度必须为正")
         self.capacity = capacity
         self.dim = dim
         self.eps = eps
@@ -43,9 +45,11 @@ class MemoryBank(nn.Module):
         """embeddings: (M, d) 或 (B, d, H, W), 已 L2 归一化."""
         if embeddings.dim() == 4:
             embeddings = embeddings.permute(0, 2, 3, 1).reshape(-1, embeddings.shape[1])
-        embeddings = F.normalize(embeddings.float(), dim=1)
+        if embeddings.ndim != 2 or embeddings.shape[1] != self.dim:
+            raise ValueError(f"记忆库需要 (N, {self.dim}) 或 (B, {self.dim}, H, W) 特征")
         if embeddings.numel() == 0:
             return
+        embeddings = F.normalize(embeddings.to(device=self.features.device, dtype=torch.float32), dim=1)
 
         current = int(self.size.item())
         combined = torch.cat([self.features[:current], embeddings], dim=0)
@@ -84,12 +88,10 @@ class MemoryBank(nn.Module):
     def similarity(self, embeddings: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
         """返回每个位置与库的最大余弦相似度 (B,1,H,W) 或 (B,P)."""
         stride = max(1, int(getattr(self, "query_stride", 1)))
+        full = None
         if stride > 1 and embeddings.dim() == 4 and min(embeddings.shape[-2:]) >= stride:
             full = embeddings.shape[-2:]
-            small = F.avg_pool2d(embeddings, stride, stride, ceil_mode=True)
-            small = F.normalize(small, dim=1)
-            sims = self.similarity(small, chunk=chunk)
-            return F.interpolate(sims, size=full, mode="bilinear", align_corners=False)
+            embeddings = F.normalize(F.avg_pool2d(embeddings, stride, stride, ceil_mode=True), dim=1)
         squeeze = embeddings.dim() == 4
         if squeeze:
             b, d, h, w = embeddings.shape
@@ -102,7 +104,7 @@ class MemoryBank(nn.Module):
         else:
             # 与查询同一 dtype: eval 时模型可能是半精度, 库是 fp32 buffer,
             # einsum 混精度会直接报错
-            bank = F.normalize(self.features[: int(self.size.item())].to(embeddings.dtype), dim=1)
+            bank = F.normalize(self.features[: int(self.size.item())].to(device=embeddings.device, dtype=embeddings.dtype), dim=1)
             outputs = []
             for start in range(0, flat.shape[1], chunk):
                 part = flat[:, start : start + chunk]
@@ -111,6 +113,8 @@ class MemoryBank(nn.Module):
             sims = torch.cat(outputs, dim=1)
         if squeeze:
             sims = sims.view(b, 1, h, w)
+            if full is not None:
+                sims = F.interpolate(sims, size=full, mode="bilinear", align_corners=False)
         return sims
 
     def distance(self, embeddings: torch.Tensor) -> torch.Tensor:
@@ -132,7 +136,7 @@ def compact_loss(bank: MemoryBank, embeddings: torch.Tensor) -> torch.Tensor:
         return embeddings.new_zeros(())
     # 同样要对齐 dtype: autocast(fp16/bf16) 下 embedding 是半精度, 库是 fp32
     bank_feat = F.normalize(
-        bank.features[: int(bank.size.item())].detach().to(embeddings.dtype), dim=1
+        bank.features[: int(bank.size.item())].detach().to(device=embeddings.device, dtype=embeddings.dtype), dim=1
     )
     if embeddings.ndim == 2:
         sim = F.normalize(embeddings, dim=1) @ bank_feat.t()

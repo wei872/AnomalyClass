@@ -29,6 +29,7 @@ from .ops import (
     binary_close,
     binary_open,
     box_filter,
+    connected_components,
     extract_regions,
     topk_mean,
 )
@@ -108,13 +109,11 @@ class RegionAnalyzer:
     ) -> Tuple[List[RegionInfo], Dict[str, Any]]:
         """score/cloth: (h,w); class_probs: (C, h/ps, w/ps). input_size: (H,W) 用于归一化 bbox.
 
-        ``probs_scale``: 类别概率图相对分数图的下采样倍数. 类别图只用于"区域平均",
-        不需要和分数图同分辨率, 传更粗的图可以省掉一次 19x h x w 的上采样
-        (全图分辨率上这一步能吃掉 20~30 ms).
+        类别概率图可以比分数图更粗，按两个地图的实际形状映射像素中心。
+        ``probs_scale`` 为兼容旧调用保留，映射不依赖它（奇数尺寸时比例并非整数）。
         """
         score = np.asarray(score, dtype=np.float32)
         cloth = np.asarray(cloth, dtype=np.float32)
-        ps = max(1, int(probs_scale))
         if self.smooth > 1:
             score = box_filter(score, self.smooth // 2)
         cloth_ok = (cloth > 0.5) if self.use_cloth else np.ones_like(cloth, dtype=bool)
@@ -128,7 +127,8 @@ class RegionAnalyzer:
 
         h, w = score.shape
         min_area = max(4, int(self.min_area_ratio * h * w))
-        raw_regions: List[Region] = extract_regions(masked, binary, min_area=min_area)
+        labels, _ = connected_components(binary)
+        raw_regions: List[Region] = extract_regions(masked, binary, min_area=min_area, labels=labels)
         # 主元素二值化 (MEBin 思路): 只保留峰值分数接近图像最大峰值的连通域,
         # 抑制阈值附近大面积低置信区域 -> 区域更紧凑, 定位精度更高.
         if raw_regions and self.peak_ratio > 0:
@@ -140,12 +140,12 @@ class RegionAnalyzer:
             x1, y1, x2, y2 = region.bbox
             # 用高分核心收缩 bbox: 连通域常常包含阈值附近的大片低置信区域,
             # 收缩后定位更准 (尤其对细长疵点).
-            sub_mask = binary[y1:y2, x1:x2] > 0
+            sub_mask = labels[y1:y2, x1:x2] == region.label
             if self.bbox_refine_ratio > 0:
                 sub_scores = masked[y1:y2, x1:x2]
                 # 沿 "阈值 -> 峰值" 的方向取一个更紧的核心区域
                 core_thr = thr + self.bbox_refine_ratio * max(float(region.score) - thr, 0.0)
-                core = sub_scores >= core_thr
+                core = (sub_scores >= core_thr) & sub_mask
                 if core.sum() >= max(4, 0.05 * sub_mask.sum()):
                     ys, xs = np.nonzero(core)
                     ry1, ry2 = y1 + int(ys.min()), y1 + int(ys.max()) + 1
@@ -155,23 +155,13 @@ class RegionAnalyzer:
             probs = None
             cls, cls_score = -1, 0.0
             if class_probs is not None:
-                cy1, cy2 = max(0, y1 // ps), max(1, int(np.ceil(y2 / ps)))
-                cx1, cx2 = max(0, x1 // ps), max(1, int(np.ceil(x2 / ps)))
-                patch = class_probs[:, cy1:cy2, cx1:cx2]
-                mask_local = sub_mask
-                if ps > 1:  # 类别图更粗: 用步长采样把掩码对齐到类别图分辨率
-                    mask_local = sub_mask[::ps, ::ps]
-                hh = min(mask_local.shape[0], patch.shape[1])
-                ww = min(mask_local.shape[1], patch.shape[2])
-                if hh > 0 and ww > 0:
-                    sub = mask_local[:hh, :ww]
-                    pch = patch[:, :hh, :ww]
-                else:
-                    sub, pch = None, patch
-                if sub is not None and sub.any():
-                    probs = pch[:, sub].mean(axis=1)
-                else:
-                    probs = patch.reshape(patch.shape[0], -1).mean(axis=1)
+                # 根据实际图尺寸映射像素中心。ceil 尺寸及奇数偏移时，简单的 [::ps]
+                # 会把掩码错位到相邻类别单元。
+                ph, pw = class_probs.shape[-2:]
+                ys = np.minimum(((np.arange(y1, y2) + 0.5) * ph / h).astype(int), ph - 1)
+                xs = np.minimum(((np.arange(x1, x2) + 0.5) * pw / w).astype(int), pw - 1)
+                patch = class_probs[:, ys[:, None], xs[None, :]]
+                probs = patch[:, sub_mask].mean(axis=1)
                 cls = int(np.argmax(probs))
                 cls_score = float(probs[cls])
             area = float(sub_mask.sum()) / (h * w) if sub_mask.size else float(region.area) / (h * w)
@@ -198,10 +188,10 @@ class RegionAnalyzer:
         """区域合并: 由区域级分类结果得到图像级类别分布."""
         if not regions:
             return None
-        probs = [r.probs for r in regions if r.probs is not None]
-        if not probs:
+        regions = [r for r in regions if r.probs is not None]
+        if not regions:
             return None
-        stack = np.stack(probs)
+        stack = np.stack([r.probs for r in regions])
         if self.merge_strategy == "max":
             merged = stack.max(axis=0)
         elif self.merge_strategy == "top1":
@@ -274,8 +264,13 @@ def kmeans_cosine(
     n_init: int = 3,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """余弦 k-means (球面 k-means), 返回 (labels, centroids, inertia)."""
-    features = l2_normalize(np.asarray(features, dtype=np.float32))
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 2:
+        raise ValueError("features 必须是二维数组 (N, D)")
+    features = l2_normalize(features)
     n = features.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.int64), features.copy(), 0.0
     k = int(min(max(1, k), n))
     rng = np.random.default_rng(seed)
     best = (None, None, np.inf)
@@ -437,8 +432,9 @@ def discover_classes(
                 r, score = matched_clusters[c]
                 is_novel = score < novelty_threshold
                 assignments[c] = {
-                    "known_index": int(r),
-                    "name": known_names[r] if known_names is not None and r < len(known_names) else str(r),
+                    "known_index": -1 if is_novel else int(r),
+                    "name": (f"novel_{c}" if is_novel else
+                             known_names[r] if known_names is not None and r < len(known_names) else str(r)),
                     "similarity": score,
                     "novel": bool(is_novel),
                 }

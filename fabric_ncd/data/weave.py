@@ -43,7 +43,7 @@ def _peak_bin(energy: np.ndarray, dim: int, min_period: float, max_period: float
     """在谱上找主峰, 返回 (整幅内周期数 k, 置信度). 周期 = dim / k."""
     nbins = len(energy)
     k_lo = max(1, int(np.floor(dim / max_period)))
-    k_hi = max(k_lo + 1, min(nbins - 2, int(np.ceil(dim / min_period))))
+    k_hi = min(nbins - 2, int(np.ceil(dim / min_period)))
     band = energy[k_lo : k_hi + 1]
     if band.size == 0:
         return float(dim) / 8.0, 0.0
@@ -82,9 +82,11 @@ def estimate_period(
     small = small - small.mean()
     window = np.outer(np.hanning(ph), np.hanning(pw))
     spec = np.abs(np.fft.rfft2(small * window)) ** 2
-    spec[:, 0] = 0
     energy_y = spec.mean(axis=1)[: max(2, ph // 2)]
     energy_x = spec.mean(axis=0)
+    # 只去直流，不能删除整个 x=0 频率列（其中包含纵向纹理）。
+    energy_y[0] = 0
+    energy_x[0] = 0
     k_y, conf_y = _peak_bin(energy_y, h, min_period, max_period)
     k_x, conf_x = _peak_bin(energy_x, w, min_period, max_period)
     period_y = float(np.clip(h / k_y, min_period, max_period))

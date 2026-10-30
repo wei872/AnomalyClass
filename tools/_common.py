@@ -9,12 +9,12 @@ from typing import Any, Dict, List
 
 import yaml
 
-from fabric_ncd.utils import load_yaml
+from fabric_ncd.utils import deep_update, load_yaml
 
 
 def base_parser(description: str = "") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--config", default="configs/fabric19.yaml", help="训练/推理配置文件")
+    parser.add_argument("--config", default=None, help="配置文件 (默认使用内置配置；加载 checkpoint 时优先使用其训练配置)")
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
                         help="覆盖任意配置项, 例如 --set data.image_size=[384,384] --set train.epochs=30")
     parser.add_argument("--root", default=None,
@@ -60,12 +60,33 @@ def apply_overrides(cfg: Dict[str, Any], overrides: List[str]) -> Dict[str, Any]
     return cfg
 
 
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "fabric19.yaml"
+
+
 def load_config(
-    path: str | Path,
+    path: str | Path | None,
     overrides: List[str] | None = None,
     root: str | None = None,
+    checkpoint_config: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    cfg = load_yaml(path)
+    # 默认值 < checkpoint 配置 < 显式 --config < --set / --root。
+    cfg = load_yaml(DEFAULT_CONFIG)
+    if checkpoint_config:
+        cfg = deep_update(cfg, checkpoint_config)
+    if path is not None:
+        cfg = deep_update(cfg, load_yaml(path))
+    if overrides:
+        cfg = apply_overrides(cfg, overrides)
+    if root:
+        cfg = set_root(cfg, root)
+    return cfg
+
+
+def load_predict_overrides(
+    path: str | Path | None, overrides: List[str] | None = None, root: str | None = None
+) -> Dict[str, Any]:
+    """只返回显式覆盖，避免把默认配置反向覆盖 checkpoint 的训练配置。"""
+    cfg = load_yaml(path) if path is not None else {}
     if overrides:
         cfg = apply_overrides(cfg, overrides)
     if root:

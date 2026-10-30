@@ -25,8 +25,8 @@ from PIL import Image, ImageDraw, ImageFont
 from .data.weave import weave_scale_factor
 from .models.fabric_ncd import FabricNCD
 from .ncd import RegionAnalyzer
-from .ops import topk_mean
-from .utils import IMAGENET_MEAN, IMAGENET_STD, deep_update, load_yaml, resolve_device
+from .utils import (IMAGENET_MEAN, IMAGENET_STD, checkpoint_compat_config, deep_update, load_model_weights, load_yaml,
+                    model_config_for_weights, resolve_device)
 
 _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -51,7 +51,7 @@ def _load_font(size: int = 14) -> ImageFont.FreeTypeFont:
 def _resolve_image_size(cfg: Dict[str, Any]) -> Tuple[int, int]:
     """解析 ``data.image_size``; 值为 ``"auto"`` 时按数据集原图比例推断."""
     raw = cfg.get("data", {}).get("image_size", [512, 512])
-    if isinstance(raw, str):
+    if isinstance(raw, str) and raw.lower() == "auto":
         from .data.yolo import resolve_image_size
 
         try:
@@ -63,14 +63,24 @@ def _resolve_image_size(cfg: Dict[str, Any]) -> Tuple[int, int]:
 
 
 def as_hw(value: Any, default: Tuple[int, int] = (512, 512)) -> Tuple[int, int]:
-    """把 int / [h, w] / (h, w) 统一成 (h, w)."""
+    """把正数、HxW 字符串或 [h, w] 统一成 (h, w)。"""
     if value is None:
-        return tuple(int(v) for v in default)
+        value = default
     if isinstance(value, (int, float)):
-        return int(value), int(value)
-    if len(value) == 1:
-        return int(value[0]), int(value[0])
-    return int(value[0]), int(value[1])
+        parts = [value]
+    elif isinstance(value, str):
+        parts = value.lower().replace("*", "x").split("x")
+    else:
+        parts = list(value)
+    if len(parts) not in (1, 2):
+        raise ValueError("尺寸必须是正数或 HxW")
+    try:
+        h, w = int(parts[0]), int(parts[-1])
+    except (ValueError, TypeError) as exc:
+        raise ValueError("尺寸必须是正数或 HxW") from exc
+    if h <= 0 or w <= 0:
+        raise ValueError("尺寸必须为正数")
+    return h, w
 
 
 def to_rgb_uint8(image: Image.Image | np.ndarray) -> np.ndarray:
@@ -78,8 +88,18 @@ def to_rgb_uint8(image: Image.Image | np.ndarray) -> np.ndarray:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
     arr = np.asarray(image)
     if arr.ndim == 2:
-        return np.stack([arr] * 3, axis=-1).astype(np.uint8)
-    return arr[..., :3].astype(np.uint8)
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[-1] >= 3:
+        arr = arr[..., :3]
+    else:
+        raise ValueError("图像必须是 HxW、HxWx1、HxWx3 或 HxWx4")
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0)
+        if arr.size and arr.min() >= 0 and arr.max() <= 1:
+            arr = arr * 255.0
+    return np.clip(arr, 0, 255).astype(np.uint8)
 
 
 def _resize_map(arr: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
@@ -141,9 +161,10 @@ def _prep_tensor_gpu(
             ),
             mode="bilinear",
             align_corners=False,
+            antialias=True,
         )
     if tuple(x.shape[-2:]) != tuple(size):
-        x = F.interpolate(x, size=(int(size[0]), int(size[1])), mode="bilinear", align_corners=False)
+        x = F.interpolate(x, size=(int(size[0]), int(size[1])), mode="bilinear", align_corners=False, antialias=True)
     mean = torch.tensor(IMAGENET_MEAN, device=device, dtype=x.dtype).view(1, 3, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device, dtype=x.dtype).view(1, 3, 1, 1)
     x = (x - mean) / std
@@ -213,6 +234,16 @@ def _maps_single(
     return maps
 
 
+def _tile_starts(length: int, tile: int, overlap: int) -> List[int]:
+    if length <= tile:
+        return [0]
+    last = length - tile
+    starts = list(range(0, last + 1, tile - overlap))
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
 @torch.no_grad()
 def _maps_tiled(
     model,
@@ -233,77 +264,87 @@ def _maps_tiled(
     probs_mul: int = 2,
 ):
     h, w = rgb.shape[:2]
+    tile_h, tile_w = int(tile_size[0]), int(tile_size[1])
+    if min(tile_h, tile_w) <= 0 or tile_overlap < 0 or tile_overlap >= min(tile_h, tile_w):
+        raise ValueError("tile_overlap 必须大于等于 0 且小于 tile_size 的高和宽")
+    batch_size = max(1, int(tile_batch))
     sh, sw = _out_hw((h, w), out_stride)
     pmul = max(1, int(probs_mul))
     psh, psw = _out_hw((h, w), out_stride * pmul)
     score_map = np.zeros((sh, sw), dtype=np.float32)
     cloth_map = np.zeros((sh, sw), dtype=np.float32)
-    probs_map = np.zeros((model.num_classes, psh, psw), dtype=np.float32)
+    probs_map = None
+    probs_count = np.zeros((psh, psw), dtype=np.float32)
     emb_map = None
-    tile_h, tile_w = int(tile_size[0]), int(tile_size[1])
-    step_y = max(8, tile_h - tile_overlap)
-    step_x = max(8, tile_w - tile_overlap)
+    emb_count = np.zeros((sh, sw), dtype=np.float32) if want_embedding else None
 
-    tiles, positions = [], []
-    for y in range(0, max(1, h - tile_overlap), step_y):
-        for x in range(0, max(1, w - tile_overlap), step_x):
-            y2, x2 = min(y + tile_h, h), min(x + tile_w, w)
-            y1, x1 = max(0, y2 - tile_h), max(0, x2 - tile_w)
+    positions = [
+        (y, x, min(y + tile_h, h), min(x + tile_w, w))
+        for y in _tile_starts(h, tile_h, tile_overlap)
+        for x in _tile_starts(w, tile_w, tile_overlap)
+    ]
+
+    def bounds(a: int, b: int, source: int, target: int) -> Tuple[int, int]:
+        # 地图取 ceil(H/stride) 或最小 8 像素，实际比例不一定等于 stride。
+        return (max(0, int(math.floor(a * target / source))),
+                min(target, int(math.ceil(b * target / source))))
+
+    out = None
+    for start in range(0, len(positions), batch_size):
+        batch_positions = positions[start:start + batch_size]
+        # 逐批预处理，避免大幅面图片的全部瓦片同时占满 GPU/CPU 内存。
+        tiles = []
+        for y1, x1, y2, x2 in batch_positions:
+            crop = rgb[y1:y2, x1:x2]
             if prep == "gpu" and device.type == "cuda":
-                tiles.append(
-                    _prep_tensor_gpu(
-                        rgb[y1:y2, x1:x2], input_size, device, dtype, channels_last, weave_scale=weave_scale
-                    )
-                )
+                t = _prep_tensor_gpu(crop, input_size, device, dtype, channels_last, weave_scale=weave_scale)
             else:
-                tiles.append(_prep_tensor(rgb[y1:y2, x1:x2], input_size, device, weave_scale=weave_scale))
-            positions.append((y1, x1, y2, x2))
-    if not tiles:
-        return _maps_single(
-            model, rgb, device, input_size, want_embedding,
-            out_stride=out_stride, prep=prep, dtype=dtype, channels_last=channels_last,
-            weave_desc=weave_desc, weave_stats=weave_stats, weave_scale=weave_scale, probs_mul=probs_mul,
-        )
-
-    if want_embedding:
-        emb_dim = int(model.classifier.dim)
-        emb_map = np.zeros((emb_dim, sh, sw), dtype=np.float32)
-
-    s = max(1, int(out_stride))
-    for start in range(0, len(tiles), max(1, tile_batch)):
-        chunk = torch.cat(tiles[start : start + tile_batch], dim=0)
+                t = _prep_tensor(crop, input_size, device, weave_scale=weave_scale)
+            tiles.append(t)
+        chunk = torch.cat(tiles, dim=0)
         if dtype is not None:
             chunk = chunk.to(dtype)
-        out = model(chunk) if weave_desc is None else model(chunk, weave_desc=weave_desc)
-        for j, idx in enumerate(range(start, min(start + tile_batch, len(tiles)))):
-            y1, x1, y2, x2 = positions[idx]
-            dy1, dx1 = y1 // s, x1 // s
-            dy2 = min(sh, int(math.ceil(y2 / s)))
-            dx2 = min(sw, int(math.ceil(x2 / s)))
-            th, tw = max(1, dy2 - dy1), max(1, dx2 - dx1)
-            score = F.interpolate(out["anomaly_score"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
-            cloth = F.interpolate(out["cloth_prob"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
+        if channels_last:
+            chunk = chunk.contiguous(memory_format=torch.channels_last)
+        desc = weave_desc
+        if desc is not None and desc.shape[0] == 1 and len(batch_positions) > 1:
+            desc = desc.expand(len(batch_positions), -1)
+        out = model(chunk) if desc is None else model(chunk, weave_desc=desc)
+        for j, (y1, x1, y2, x2) in enumerate(batch_positions):
+            dy1, dy2 = bounds(y1, y2, h, sh)
+            dx1, dx2 = bounds(x1, x2, w, sw)
+            th, tw = dy2 - dy1, dx2 - dx1
+            score = F.interpolate(out["anomaly_score"][j:j+1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
+            cloth = F.interpolate(out["cloth_prob"][j:j+1], size=(th, tw), mode="bilinear", align_corners=False)[0, 0]
             score_map[dy1:dy2, dx1:dx2] = np.maximum(score_map[dy1:dy2, dx1:dx2], score.float().cpu().numpy())
             cloth_map[dy1:dy2, dx1:dx2] = np.maximum(cloth_map[dy1:dy2, dx1:dx2], cloth.float().cpu().numpy())
             if out.get("class_logits") is not None:
-                s2 = s * pmul
-                py1, px1 = y1 // s2, x1 // s2
-                py2 = min(psh, int(math.ceil(y2 / s2)))
-                px2 = min(psw, int(math.ceil(x2 / s2)))
-                pth, ptw = max(1, py2 - py1), max(1, px2 - px1)
-                p = F.interpolate(out["class_logits"][j : j + 1], size=(pth, ptw), mode="bilinear", align_corners=False)
-                p = torch.softmax(p.float(), dim=1)[0].cpu().numpy()
-                probs_map[:, py1:py2, px1:px2] = np.maximum(probs_map[:, py1:py2, px1:px2], p)
-            if emb_map is not None:
-                e = F.interpolate(out["embedding"][j : j + 1], size=(th, tw), mode="bilinear", align_corners=False)
+                if probs_map is None:
+                    probs_map = np.zeros((out["class_logits"].shape[1], psh, psw), dtype=np.float32)
+                py1, py2 = bounds(y1, y2, h, psh)
+                px1, px2 = bounds(x1, x2, w, psw)
+                logits = F.interpolate(out["class_logits"][j:j+1], size=(py2 - py1, px2 - px1), mode="bilinear", align_corners=False)
+                probs_map[:, py1:py2, px1:px2] += torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+                probs_count[py1:py2, px1:px2] += 1
+            if want_embedding:
+                e = F.interpolate(out["embedding"][j:j+1], size=(th, tw), mode="bilinear", align_corners=False)
                 e = F.normalize(e.float(), dim=1)[0].cpu().numpy()
-                emb_map[:, dy1:dy2, dx1:dx2] = np.maximum(emb_map[:, dy1:dy2, dx1:dx2], e)
+                if emb_map is None:
+                    emb_map = np.zeros((e.shape[0], sh, sw), dtype=np.float32)
+                emb_map[:, dy1:dy2, dx1:dx2] += e
+                emb_count[dy1:dy2, dx1:dx2] += 1
+
+    if probs_map is not None:
+        probs_map /= np.maximum(probs_count[None], 1)
+    if emb_map is not None:
+        emb_map /= np.maximum(emb_count[None], 1)
+        emb_map /= np.maximum(np.linalg.norm(emb_map, axis=0, keepdims=True), 1e-6)
     weave_info = weave_stats
     if weave_info is None:
         weave_info = {k: float(v[0]) for k, v in (out.get("weave") or {}).items()}
     maps = {
         "score": score_map, "cloth": cloth_map, "probs": probs_map, "weave": dict(weave_info),
-        "stride": s, "probs_scale": pmul, "shape": (h, w),
+        "stride": max(1, int(out_stride)), "probs_scale": pmul, "shape": (h, w),
     }
     if emb_map is not None:
         maps["embedding"] = emb_map
@@ -344,7 +385,7 @@ def forward_maps(
     use_tile = bool(tile and (h > tile_hw[0] or w > tile_hw[1]))
     # 切块时每块单独估计周期会得到不同描述子; 这里在整幅 (已归一化) 图上估计一次,
     # 所有块共用, 保证切块/整图结果一致.
-    if use_tile and weave_desc is None and weave_norm:
+    if use_tile and weave_desc is None:
         from .models.texture import descriptor_from_stats, estimate_weave_period
 
         probe = _prep_tensor(rgb, input_size, device, weave_scale=weave_scale).to(device)
@@ -387,8 +428,12 @@ class FabricPredictor:
     ) -> None:
         self.device = resolve_device(device)
         state: Dict[str, Any] = {}
-        if checkpoint and Path(checkpoint).exists():
+        if checkpoint is not None:
+            if not Path(checkpoint).is_file():
+                raise FileNotFoundError(f"checkpoint 不存在: {checkpoint}")
             state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            if not isinstance(state, dict):
+                raise ValueError(f"checkpoint 格式错误: {checkpoint}")
 
         # 配置优先级: 用户 config > checkpoint 内配置 > 默认 configs/fabric19.yaml
         cfg: Dict[str, Any] = {}
@@ -406,24 +451,18 @@ class FabricPredictor:
         if isinstance(cfg.get("data", {}).get("image_size"), str):
             saved = (state.get("config") or {}).get("data", {}).get("image_size")
             if saved and not isinstance(saved, str):
-                cfg.setdefault("data", {})["image_size"] = list(saved)
+                cfg.setdefault("data", {})["image_size"] = list(as_hw(saved))
 
+        cfg = checkpoint_compat_config(cfg, state)
         self.cfg = cfg
         self.calibration: Dict[str, float] = dict(state.get("calibration") or {})
         self.names: List[str] = list(state.get("names") or cfg.get("data", {}).get("names") or [])
-        self.model = FabricNCD(cfg)
-        if checkpoint:
-            key = "ema" if "ema" in state else "model"
-            try:
-                self.model.load_state_dict(state[key])
-            except RuntimeError as exc:
-                # 结构升级 (例如新增 border_prior 两路输入) 后旧权重形状不一致: 尽量加载
-                missing, unexpected = self.model.load_state_dict(state[key], strict=False)
-                print(
-                    f"[warn] 权重与当前结构不完全一致 ({exc.__class__.__name__}), "
-                    f"已跳过 {len(missing)} 个参数 / {len(unexpected)} 个多余参数; "
-                    "建议用新结构重新训练或微调"
-                )
+        self.model = FabricNCD(model_config_for_weights(cfg) if checkpoint is not None else cfg)
+        if checkpoint is not None:
+            key = "ema" if state.get("ema") is not None else "model"
+            if key not in state:
+                raise ValueError(f"checkpoint 中缺少模型权重: {checkpoint}")
+            load_model_weights(self.model, state[key])
         # 记忆项尺度必须和训练时校准出来的一致, 否则记忆库分数尺度漂移
         scale = float(self.calibration.get("memory_distance_scale", 0.0) or 0.0)
         if scale > 0 and hasattr(self.model, "memory_distance_scale"):
@@ -591,14 +630,16 @@ class FabricPredictor:
         """第二阶段: 区域分析 + 图像级判定 (纯 CPU, 可与下一帧的 GPU 计算重叠)."""
         score = maps["score"] * (maps["cloth"] > 0.5) if getattr(self, "cloth_gate", True) else maps["score"]
         infos, image_level = self.analyzer.analyze(
-            score, maps["cloth"], maps["probs"], probs_scale=int(maps.get("probs_scale", 1))
+            maps["score"], maps["cloth"], maps["probs"], probs_scale=int(maps.get("probs_scale", 1))
         )
         if self.image_score_full_res:
             from .engine import image_score_of
 
             image_score = image_score_of(_resize_map(score, tuple(maps["shape"])), self.eval_cfg)
         else:
-            image_score = topk_mean(score)
+            from .engine import image_score_of
+
+            image_score = image_score_of(score, self.eval_cfg)
         image_level["image_score"] = image_score
         if self.calibration:
             mean = self.calibration.get("image_mean", 0.0)
@@ -641,7 +682,7 @@ class FabricPredictor:
         path: str | Path,
         draw_heatmap: bool = True,
     ) -> None:
-        rgb = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image, dtype=np.uint8)
+        rgb = to_rgb_uint8(image)
         h, w = rgb.shape[:2]
         score = result["maps"]["score"]
         if score.shape != (h, w):

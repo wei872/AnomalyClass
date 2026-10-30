@@ -18,12 +18,12 @@ import torch  # noqa: E402
 
 from _common import base_parser, load_config  # noqa: E402
 
-from fabric_ncd.data.yolo import build_datasets, collate_fn  # noqa: E402
-from fabric_ncd.engine import evaluate  # noqa: E402
+from fabric_ncd.data.yolo import build_eval_dataset, collate_fn  # noqa: E402
+from fabric_ncd.engine import evaluate, evaluate_tiled  # noqa: E402
 from fabric_ncd.losses import FabricCriterion  # noqa: E402
 from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
 from fabric_ncd.ncd import RegionAnalyzer  # noqa: E402
-from fabric_ncd.utils import deep_update, get_logger, json_dump, resolve_device  # noqa: E402
+from fabric_ncd.utils import checkpoint_compat_config, get_logger, json_dump, load_model_weights, model_config_for_weights, resolve_device  # noqa: E402
 
 
 def main() -> int:
@@ -38,45 +38,51 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides, args.root)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    cfg = deep_update(state.get("config", {}), cfg)
+    cfg = checkpoint_compat_config(
+        load_config(args.config, args.overrides, args.root, checkpoint_config=state.get("config")), state
+    )
     if args.device:
         cfg.setdefault("experiment", {})["device"] = args.device
     device = resolve_device(cfg.get("experiment", {}).get("device", "auto"))
     names = state.get("names") or cfg.get("data", {}).get("names") or []
 
-    model = FabricNCD(cfg)
-    model.load_state_dict(state.get("ema", state["model"]))
+    model = FabricNCD(model_config_for_weights(cfg))
+    load_model_weights(model, state.get("ema") or state["model"])
+    scale = float((state.get("calibration") or {}).get("memory_distance_scale", 0.0) or 0.0)
+    if scale > 0:
+        model.memory_distance_scale = scale
     model.to(device).eval()
 
-    datasets = build_datasets(cfg)
-    dataset = datasets[args.split]
-    from torch.utils.data import DataLoader
-
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size or cfg.get("data", {}).get("eval_batch_size", 4),
-        shuffle=False,
-        num_workers=int(cfg.get("data", {}).get("num_workers", 2)),
-        collate_fn=collate_fn,
-    )
     from fabric_ncd.engine import analyzer_kwargs
 
     kwargs = analyzer_kwargs(cfg)
-    kwargs.update(names=names, threshold=args.threshold)
+    kwargs.update(names=names)
+    if args.threshold is not None:
+        kwargs["threshold"] = args.threshold
     analyzer = RegionAnalyzer(**kwargs)
-    metrics = evaluate(
-        model,
-        loader,
-        cfg,
-        device,
-        criterion=FabricCriterion(cfg).to(device),
-        analyzer=analyzer,
-        max_samples=args.max_samples,
-        collect_predictions=bool(args.save_preds),
-        calibration=state.get("calibration"),
-    )
+    if cfg.get("eval", {}).get("tile", False):
+        metrics = evaluate_tiled(
+            model, cfg, device, split=args.split, analyzer=analyzer,
+            max_samples=args.max_samples, collect_predictions=bool(args.save_preds),
+            calibration=state.get("calibration"),
+        )
+    else:
+        from torch.utils.data import DataLoader
+
+        dataset = build_eval_dataset(cfg, args.split)
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size or cfg.get("data", {}).get("eval_batch_size", 4),
+            shuffle=False,
+            num_workers=int(cfg.get("data", {}).get("num_workers", 2)),
+            collate_fn=collate_fn,
+        )
+        metrics = evaluate(
+            model, loader, cfg, device, criterion=FabricCriterion(cfg).to(device),
+            analyzer=analyzer, max_samples=args.max_samples,
+            collect_predictions=bool(args.save_preds), calibration=state.get("calibration"),
+        )
     preds = metrics.pop("predictions", None)
     logger.info("评估完成 (%d 张):", metrics.get("num_samples", 0))
     for key, value in sorted(metrics.items()):

@@ -96,17 +96,14 @@ def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y_score = np.asarray(y_score, dtype=np.float64).ravel()
     if y_true.sum() == 0:
         return float("nan")
-    order = np.argsort(-y_score)
-    y = y_true[order]
+    order = np.argsort(-y_score, kind="stable")
+    y, scores = y_true[order], y_score[order]
     tp = np.cumsum(y)
-    precision = tp / np.arange(1, len(y) + 1)
-    recall = tp / y_true.sum()
-    ap = 0.0
-    prev_recall = 0.0
-    for p, r in zip(precision, recall):
-        ap += p * (r - prev_recall)
-        prev_recall = r
-    return float(ap)
+    # 同分样本必须作为一个阈值一起处理，否则 AP 取决于输入排列顺序。
+    ends = np.r_[np.flatnonzero(scores[:-1] != scores[1:]), len(scores) - 1]
+    precision = tp[ends] / (ends + 1)
+    recall = tp[ends] / y_true.sum()
+    return float(np.sum(precision * np.diff(np.r_[0.0, recall])))
 
 
 def _subsample(y_true: np.ndarray, y_score: np.ndarray, max_pixels: int, seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
@@ -181,45 +178,47 @@ def per_region_overlap(
     anomaly_gts: Sequence[np.ndarray],
     normal_scores: Sequence[np.ndarray],
     num_thresholds: int = 100,
+    fpr_limit: float = 0.3,
 ) -> float:
-    """PRO (Per-Region Overlap) — MVTec 官方协议.
+    """MVTec AUPRO：按区域等权，在 FPR 0..0.3 上积分并归一化。
 
-    对每个真实疵点连通域单独计算重合率 (大疵点不会淹没小疵点), 再对假正率
-    积分得到曲线下面积.
+    FPR 的负像素包括异常图的框外像素和正常图的全部像素；
+    ``anomaly_scores`` / ``anomaly_gts`` 应只包含异常图。
     """
-    if not anomaly_scores or not normal_scores:
+    if not anomaly_scores:
         return float("nan")
-    all_scores = np.concatenate([s.ravel() for s in anomaly_scores])
-    thresholds = np.quantile(all_scores, np.linspace(0, 1, num_thresholds))
-    thresholds = np.unique(thresholds)
-
-    # 预先切出每个真实区域
-    regions: List[np.ndarray] = []
+    if not 0 < fpr_limit <= 1:
+        raise ValueError("fpr_limit 必须在 (0, 1] 内")
     region_scores: List[np.ndarray] = []
+    background: List[np.ndarray] = [np.asarray(s).ravel() for s in normal_scores]
     for score, gt in zip(anomaly_scores, anomaly_gts):
-        binary = (gt > 0.5).astype(np.uint8)
+        score = np.asarray(score)
+        binary = np.asarray(gt) > 0.5
+        if score.shape != binary.shape:
+            raise ValueError("分数图和标注掩码尺寸必须一致")
+        background.append(score[~binary])
         labels, num = connected_components(binary)
         for c in range(1, num + 1):
-            m = labels == c
-            if m.sum() < 4:
-                continue
-            regions.append(m)
-            region_scores.append(score[m])
-    if not regions:
+            region = labels == c
+            region_scores.append(score[region])
+    if not region_scores:
         return float("nan")
-
-    overlaps = np.zeros(len(thresholds))
-    fprs = np.zeros(len(thresholds))
-    normal_pixels = np.concatenate([s.ravel() for s in normal_scores])
-    for i, thr in enumerate(thresholds):
-        overlaps[i] = np.mean([(s > thr).mean() for s in region_scores])
-        fprs[i] = float((normal_pixels > thr).mean())
-    order = np.argsort(fprs)
-    fprs, overlaps = fprs[order], overlaps[order]
-    trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
-    if trapezoid is None:  # pragma: no cover
-        return float(np.sum(np.diff(fprs) * (overlaps[1:] + overlaps[:-1]) / 2.0))
-    return float(trapezoid(overlaps, fprs))
+    normal_pixels = np.concatenate(background)
+    if not normal_pixels.size:
+        return float("nan")
+    all_scores = np.concatenate([normal_pixels] + region_scores)
+    thresholds = np.r_[np.inf, np.unique(np.quantile(all_scores, np.linspace(0, 1, max(2, num_thresholds)))), -np.inf]
+    overlaps = np.array([np.mean([(s > thr).mean() for s in region_scores]) for thr in thresholds])
+    fprs = np.array([(normal_pixels > thr).mean() for thr in thresholds])
+    # 同一 FPR 下采用最高的区域召回，并在 0.3 处插值。
+    unique_fpr, inverse = np.unique(fprs, return_inverse=True)
+    best = np.zeros(len(unique_fpr), dtype=np.float64)
+    np.maximum.at(best, inverse, overlaps)
+    inside = unique_fpr < fpr_limit
+    x = np.r_[unique_fpr[inside], fpr_limit]
+    y = np.r_[best[inside], np.interp(fpr_limit, unique_fpr, best)]
+    trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    return float(trapezoid(y, x) / fpr_limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,13 +312,17 @@ def classification_report(
     y_pred = np.asarray(y_pred, dtype=int)
     if len(y_true) == 0:
         return {"acc": float("nan"), "f1_macro": float("nan")}
-    cm = confusion_matrix(y_true, y_pred, num_classes)
-    acc = float(np.trace(cm) / max(cm.sum(), 1))
+    # 未检出区域时预测为 -1；它必须计为该真实类别的漏检，而不是从分母中丢掉。
+    valid = (y_true >= 0) & (y_true < num_classes)
+    y_true, y_pred = y_true[valid], y_pred[valid]
+    if not len(y_true):
+        return {"acc": float("nan"), "f1_macro": float("nan")}
+    acc = float((y_true == y_pred).mean())
     f1s = []
     for c in range(num_classes):
-        tp = cm[c, c]
-        fp = cm[:, c].sum() - tp
-        fn = cm[c, :].sum() - tp
+        tp = int(((y_true == c) & (y_pred == c)).sum())
+        fp = int(((y_true != c) & (y_pred == c)).sum())
+        fn = int(((y_true == c) & (y_pred != c)).sum())
         prec = tp / max(tp + fp, 1e-8)
         rec = tp / max(tp + fn, 1e-8)
         if tp + fp + fn == 0:
@@ -362,12 +365,16 @@ def nmi(labels_true: np.ndarray, labels_pred: np.ndarray) -> float:
         hi = -np.nansum(pi * np.log(pi))
         hj = -np.nansum(pj * np.log(pj))
     denom = np.sqrt(hi * hj)
-    return float(mi / denom) if denom > 0 else 0.0
+    if denom > 0:
+        return float(mi / denom)
+    return 1.0 if hi < 1e-12 and hj < 1e-12 else 0.0
 
 
 def ari(labels_true: np.ndarray, labels_pred: np.ndarray) -> float:
     table = _contingency(np.asarray(labels_true), np.asarray(labels_pred))
     n = table.sum()
+    if n == 0:
+        return float("nan")
 
     def comb2(x):
         return x * (x - 1) / 2.0
@@ -378,7 +385,7 @@ def ari(labels_true: np.ndarray, labels_pred: np.ndarray) -> float:
     expected = sum_i * sum_j / max(comb2(n), 1e-8)
     max_index = 0.5 * (sum_i + sum_j)
     denom = max_index - expected
-    return float((sum_ij - expected) / denom) if abs(denom) > 1e-12 else 0.0
+    return float((sum_ij - expected) / denom) if abs(denom) > 1e-12 else 1.0
 
 
 def cluster_acc(labels_true: np.ndarray, labels_pred: np.ndarray) -> float:
@@ -474,8 +481,8 @@ class MetricAccumulator:
                     for k, v in pixel_f1(self.pixel_scores, self.pixel_gts, self.pixel_threshold).items()
                 }
             )
-            if self.normal_scores:
-                out["pro"] = per_region_overlap(self.pixel_scores, self.pixel_gts, self.normal_scores)
+            if self.defect_pixel_scores:
+                out["pro"] = per_region_overlap(self.defect_pixel_scores, self.defect_pixel_gts, self.normal_scores)
         if self.multi_true:
             out.update(classification_report(self.multi_true, self.multi_pred, self.num_classes))
         if self.gt_boxes:

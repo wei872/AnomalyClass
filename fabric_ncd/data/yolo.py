@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,24 +50,22 @@ def _is_abs_like(p: str) -> bool:
 
 def _suffix_after(path: str, markers: Sequence[str]) -> str:
     parts = path.replace("\\", "/").split("/")
-    for marker in markers:
-        if marker in parts:
-            idx = parts.index(marker)
-            return "/".join(parts[idx:])
-    return parts[-1]
+    indices = [parts.index(marker) for marker in markers if marker in parts]
+    return "/".join(parts[min(indices):]) if indices else parts[-1]
 
 
-def resolve_path(raw: Optional[str], root: Optional[str], markers: Sequence[str]) ->Optional[Path]:
+def resolve_path(
+    raw: Optional[str], root: Optional[str], markers: Sequence[str], prefer_root: bool = False
+) -> Optional[Path]:
     if raw is None:
         return None
     raw = str(raw)
     if _is_abs_like(raw):
         candidate = Path(raw)
+        if root and (prefer_root or not candidate.exists()):
+            return Path(root) / _suffix_after(raw, markers)
         if candidate.exists():
             return candidate
-        if root:
-            mapped = Path(root) / _suffix_after(raw, markers)
-            return mapped
         return candidate
     if root:
         return Path(root) / raw
@@ -101,19 +98,22 @@ def load_dataset_spec(cfg: Dict[str, Any], split_override: Optional[Dict[str, st
     if not yaml_path:
         raise ValueError("data.dataset_yaml 未配置")
     raw = load_yaml(yaml_path)
-    root = data_cfg.get("root") or raw.get("path")
+    root_override = data_cfg.get("root")
+    root = root_override or raw.get("path")
     root = str(root) if root else None
-    if root and not root.startswith("/") and not _is_abs_like(root):
-        root = str((Path(yaml_path).parent / root).resolve())
+    if root and not _is_abs_like(root):
+        # 命令行 root 相对于当前目录；数据集 YAML 的 path 相对于 YAML 本身。
+        base = Path.cwd() if root_override else Path(yaml_path).parent
+        root = str((base / root).resolve())
 
     markers = ("images", "labels", "normal")
     splits = {
-        "train": resolve_path(raw.get("train"), root, markers),
-        "val": resolve_path(raw.get("val"), root, markers),
+        "train": resolve_path(raw.get("train"), root, markers, prefer_root=bool(root_override)),
+        "val": resolve_path(raw.get("val"), root, markers, prefer_root=bool(root_override)),
     }
     normal_splits = {
-        "train": resolve_path(raw.get("normaltrain") or raw.get("normal_train"), root, markers),
-        "val": resolve_path(raw.get("normalval") or raw.get("normal_val"), root, markers),
+        "train": resolve_path(raw.get("normaltrain") or raw.get("normal_train"), root, markers, prefer_root=bool(root_override)),
+        "val": resolve_path(raw.get("normalval") or raw.get("normal_val"), root, markers, prefer_root=bool(root_override)),
     }
     if split_override:
         for key, value in split_override.items():
@@ -124,17 +124,34 @@ def load_dataset_spec(cfg: Dict[str, Any], split_override: Optional[Dict[str, st
         if img_dir is None:
             labels[key] = None
             continue
-        label_dir = Path(str(img_dir).replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"))
-        if not label_dir.exists():
-            alt = Path(str(img_dir).replace("/images/", "/labels/"))
-            label_dir = alt if alt.exists() else label_dir
+        parts = list(Path(img_dir).parts)
+        if "images" in parts:
+            parts[len(parts) - 1 - parts[::-1].index("images")] = "labels"
+        label_dir = Path(*parts)
         labels[key] = label_dir
 
     mask_dir = data_cfg.get("mask_dir")
     if mask_dir:
         mask_dir = resolve_path(mask_dir, root, markers)
-    names = list(raw.get("names", []))
-    nc = int(raw.get("nc", len(names)))
+    raw_names = raw.get("names") or []
+    if isinstance(raw_names, dict):
+        indexed = {int(key): str(value) for key, value in raw_names.items()}
+        inferred_nc = max(indexed, default=-1) + 1
+        nc = int(raw.get("nc", inferred_nc))
+        if any(key < 0 or key >= nc for key in indexed):
+            raise ValueError("数据集 names 的类别索引必须位于 0..nc-1")
+        names = [indexed.get(i, f"class_{i}") for i in range(nc)]
+    elif isinstance(raw_names, (list, tuple)):
+        names = [str(name) for name in raw_names]
+        nc = int(raw.get("nc", len(names)))
+        if len(names) > nc:
+            raise ValueError("数据集 names 长度不能大于 nc")
+        if names:
+            names += [f"class_{i}" for i in range(len(names), nc)]
+    else:
+        raise ValueError("数据集 names 必须是类别列表或索引字典")
+    if nc < 0:
+        raise ValueError("数据集 nc 不能为负")
     return DatasetSpec(root=root, splits=splits, labels=labels, normal_splits=normal_splits, names=names, nc=nc, mask_dir=mask_dir)
 
 
@@ -142,34 +159,42 @@ def load_dataset_spec(cfg: Dict[str, Any], split_override: Optional[Dict[str, st
 # 标注 / 图像读写
 # --------------------------------------------------------------------------- #
 def read_yolo_labels(path: Optional[Path]) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """返回 (boxes (N,5) 归一化 xyxy, polygons 列表)."""
+    """返回 (boxes (N,5) 归一化 xyxy, polygons 列表)，无效标签明确报错。"""
     boxes: List[List[float]] = []
     polygons: List[np.ndarray] = []
     if path is None or not Path(path).exists():
         return np.zeros((0, 5), dtype=np.float32), polygons
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 5:
+        for line_num, line in enumerate(f, 1):
+            parts = line.split("#", 1)[0].strip().split()
+            if not parts:
                 continue
             try:
-                cls = int(float(parts[0]))
-                coords = np.asarray([float(v) for v in parts[1:]], dtype=np.float32)
-            except ValueError:
-                continue
+                values = np.asarray([float(v) for v in parts], dtype=np.float64)
+            except ValueError as exc:
+                raise ValueError(f"无效 YOLO 标签 {path}:{line_num}") from exc
+            if (len(values) < 5 or not np.isfinite(values).all() or values[0] < 0
+                    or values[0] != int(values[0])):
+                raise ValueError(f"无效 YOLO 标签 {path}:{line_num}")
+            cls, coords = int(values[0]), values[1:]
+            poly = None
             if coords.size == 4:
                 cx, cy, w, h = coords
                 if w <= 0 or h <= 0:
-                    continue
-                boxes.append([cls, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+                    raise ValueError(f"YOLO 标注框宽高必须为正 {path}:{line_num}")
+                bounds = np.clip([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 0, 1)
             elif coords.size >= 6 and coords.size % 2 == 0:
-                pts = coords.reshape(-1, 2)
-                boxes.append([cls, pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()])
-                polygons.append(np.concatenate([[cls], coords.reshape(-1)]))
-    boxes_arr = np.asarray(boxes, dtype=np.float32).reshape(-1, 5)
-    if boxes_arr.size:
-        boxes_arr[:, 1:5] = np.clip(boxes_arr[:, 1:5], 0.0, 1.0)
-    return boxes_arr, polygons
+                pts = np.clip(coords.reshape(-1, 2), 0, 1)
+                bounds = np.array([pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()])
+                poly = np.concatenate([[cls], pts.reshape(-1)]).astype(np.float32)
+            else:
+                raise ValueError(f"YOLO 标签应为矩形或多边形 {path}:{line_num}")
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                raise ValueError(f"YOLO 标注在图像内没有有效面积 {path}:{line_num}")
+            boxes.append([cls, *bounds])
+            if poly is not None:
+                polygons.append(poly)
+    return np.asarray(boxes, dtype=np.float32).reshape(-1, 5), polygons
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -222,8 +247,22 @@ def boxes_to_mask(boxes: np.ndarray, polygons: Sequence[np.ndarray], h: int, w: 
 def list_images(directory: Optional[Path]) -> List[Path]:
     if directory is None or not Path(directory).exists():
         return []
-    out = [p for p in sorted(Path(directory).rglob("*")) if p.suffix.lower() in IMG_EXTS]
+    out = [p for p in sorted(Path(directory).rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
     return out
+
+
+def resolve_label_path(image: Path, image_dir: Path, label_dir: Optional[Path]) -> Optional[Path]:
+    """保留相对层级查找 YOLO 标签；仅在文件名唯一时递归兜底。"""
+    if label_dir is None:
+        return None
+    candidate = Path(label_dir) / image.relative_to(Path(image_dir)).with_suffix(".txt")
+    if candidate.is_file():
+        return candidate
+    flat = Path(label_dir) / f"{image.stem}.txt"
+    if flat.is_file():
+        return flat
+    matches = [p for p in Path(label_dir).rglob(f"{image.stem}.txt") if p.is_file()]
+    return matches[0] if len(matches) == 1 else None
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +314,9 @@ class FabricDataset(Dataset):
         self.defect_entries = [e for e in self.defect_entries if e.label is not None]
         self.normal_entries.extend(empty)
 
-        self.entries = self._balance(self.defect_entries, self.normal_entries, normal_ratio if train else 0.5)
+        # 验证集必须覆盖所有样本，不能为凑比例丢掉正常图。
+        self.entries = (self._balance(self.defect_entries, self.normal_entries, normal_ratio)
+                        if train else list(self.defect_entries) + list(self.normal_entries))
         if limit and int(limit) < len(self.entries):
             self.entries = self._stratified_limit(self.entries, int(limit))
         if not self.entries:
@@ -298,29 +339,29 @@ class FabricDataset(Dataset):
         for image in list_images(image_dir):
             label = None
             if label_dir is not None and not normal:
-                candidate = Path(label_dir) / f"{image.stem}.txt"
-                if not candidate.exists():
-                    # 标签目录可能与图片有不同层级
-                    matches = list(Path(label_dir).rglob(f"{image.stem}.txt"))
-                    candidate = matches[0] if matches else candidate
-                if candidate.exists():
-                    label = candidate
+                candidate = resolve_label_path(image, Path(image_dir), Path(label_dir))
+                if candidate is not None:
+                    content = candidate.read_text(encoding="utf-8", errors="ignore")
+                    if any(line.split("#", 1)[0].strip() for line in content.splitlines()):
+                        label = candidate
             mask = None
             if mask_dir is not None:
                 candidates = []
+                relative = image.relative_to(Path(image_dir))
                 for ext in (".png", ".bmp", ".jpg"):
-                    candidates.append(Path(mask_dir) / f"{image.stem}{ext}")
                     if split:
-                        candidates.append(Path(mask_dir) / split / f"{image.stem}{ext}")
+                        candidates.append(Path(mask_dir) / split / relative.with_suffix(ext))
+                    candidates.append(Path(mask_dir) / relative.with_suffix(ext))
+                    candidates.append(Path(mask_dir) / f"{image.stem}{ext}")
                 for candidate in candidates:
                     if candidate.exists():
                         mask = candidate
                         break
                 if mask is None:  # 兜底: 目录层级与图片不一致时递归查找
                     hits = list(Path(mask_dir).rglob(f"{image.stem}.png"))
-                    if hits:
+                    if len(hits) == 1:
                         mask = hits[0]
-            entries.append(Entry(image=image, label=label, normal=normal, mask=mask))
+            entries.append(Entry(image=image, label=label, normal=normal or label is None, mask=mask))
         return entries
 
     @staticmethod
@@ -330,6 +371,8 @@ class FabricDataset(Dataset):
         if not defect:
             return list(normal)
         normal_ratio = float(np.clip(normal_ratio, 0.0, 1.0))
+        if normal_ratio >= 1.0:
+            return list(normal)
         n_normal = int(round(len(defect) * normal_ratio / max(1e-6, 1 - normal_ratio)))
         n_normal = min(n_normal, len(normal))
         step = max(1, len(normal) // max(n_normal, 1))
@@ -340,6 +383,8 @@ class FabricDataset(Dataset):
     @staticmethod
     def _stratified_limit(entries: List[Entry], limit: int) -> List[Entry]:
         """按正常/疵点比例截断, 避免 limit 直接把正常图全部截掉."""
+        if limit < 2:
+            return entries[:max(0, limit)]
         defects = [e for e in entries if not e.normal]
         normals = [e for e in entries if e.normal]
         if not defects:
@@ -383,6 +428,8 @@ class FabricDataset(Dataset):
         image = load_rgb(entry.image)
         h, w = image.shape[:2]
         boxes, polygons = read_yolo_labels(entry.label)
+        if len(boxes) and self.spec.nc > 0 and ((boxes[:, 0] < 0) | (boxes[:, 0] >= self.spec.nc)).any():
+            raise ValueError(f"标签类别超出 0..{self.spec.nc - 1}: {entry.label}")
         defect_mask = boxes_to_mask(boxes, polygons, h, w)
         cloth_mask = self._cloth_mask(entry, image)
 
@@ -392,8 +439,12 @@ class FabricDataset(Dataset):
             "cloth_mask": cloth_mask,
             "boxes": boxes,
         }
-        rng = np.random.default_rng()
-        sample = self.transform(sample, rng) if self.train else self.transform(sample)
+        # PyTorch 会为每个 DataLoader worker 分配确定的种子，避免 default_rng() 从系统熵取种子。
+        if self.train:
+            seed = int(torch.randint(0, 2**32, (1,), dtype=torch.int64).item())
+            sample = self.transform(sample, np.random.default_rng(seed))
+        else:
+            sample = self.transform(sample)
 
         image_t = _to_tensor(sample["image"])
         defect = torch.from_numpy(sample["defect_mask"][None].astype(np.float32))
@@ -473,7 +524,8 @@ class DefectBackgroundDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         sample = self.base[index]
         cloth = (sample["cloth_mask"] > 0.5).numpy()[0]
-        defect = (sample["defect_mask"] > 0.5).numpy()[0]
+        # 训练增广可能额外合成疵点，必须与真实框一起从正常参照中排除。
+        defect = (sample["anomaly_mask"] > 0.5).numpy()[0]
         if defect.any():
             # 框是弱标注, 边界常比真实疵点大/小, 先膨胀再挖掉, 免得把疵点边缘当正常.
             # 漏进来的少量疵点像素会污染参照分布的长尾, 把校准阈值顶到疵点分数上
@@ -639,11 +691,10 @@ def resolve_image_size(cfg: Dict[str, Any], spec: Optional["DatasetSpec"] = None
                 " 不放大" if scale >= 1.0 else "",
                 "一致" if abs((w / h) - (w0 / h0)) / (w0 / h0) < 0.03 else "偏离",
             )
-    elif isinstance(raw, int):
-        resolved = (raw, raw)
     else:
-        values = list(raw)
-        resolved = (int(values[0]), int(values[1]))
+        from ..inference import as_hw
+
+        resolved = as_hw(raw)
     data_cfg["image_size"] = [resolved[0], resolved[1]]
     return resolved
 
@@ -668,6 +719,18 @@ def build_datasets(cfg: Dict[str, Any]) -> Dict[str, FabricDataset]:
         ),
     }
     return datasets
+
+
+def build_eval_dataset(cfg: Dict[str, Any], split: str = "val") -> FabricDataset:
+    """构建无随机增广、包含所有正常图的指定 split，训练集体检也使用此路径。"""
+    data = cfg.get("data", {})
+    spec = load_dataset_spec(cfg)
+    size = resolve_image_size(cfg, spec)
+    aug = dict(data.get("augment", {}))
+    aug.update(image_size=size, mask_work_size=data.get("mask_work_size", "auto"),
+               cloth_mask=data.get("cloth_mask", "estimate"))
+    return FabricDataset(spec, split, size, train=False, augment_cfg=aug,
+                         limit=data.get("limit_train" if split == "train" else "limit_val"))
 
 
 def build_dataloaders(cfg: Dict[str, Any], datasets: Optional[Dict[str, FabricDataset]] = None) -> Dict[str, DataLoader]:
@@ -772,7 +835,7 @@ def build_reference_loaders(
         bg = build_background_loader(cfg, split, shuffle=shuffle)
         if bg is not None:
             loaders.append(bg)
-    if "normal" in source or not loaders:
+    if "normal" in source or "both" in source or not loaders:
         normal = build_normal_loader(cfg, split, shuffle=shuffle)
         if normal is not None:
             loaders.append(normal)

@@ -48,6 +48,45 @@ def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
+def checkpoint_compat_config(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    """v1 的 lite 主干使用 1/64 p5，旧权重必须保留原来的步长。"""
+    bb = cfg.get("model", {}).get("backbone", {})
+    if (state.get("version") == 1 and str(bb.get("arch", "")).lower() in ("lite", "lite_backbone", "custom")
+            and "legacy_p5_stride64" not in bb):
+        logging.getLogger("fabric_ncd").warning("旧版 lite checkpoint: 保留 1/64 p5 步长；新训练使用 1/32")
+        return deep_update(cfg, {"model": {"backbone": {"legacy_p5_stride64": True}}})
+    return cfg
+
+
+def model_config_for_weights(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """加载完整 checkpoint 时不下载或加载一次无用的主干预训练权重。"""
+    return deep_update(cfg, {"model": {"backbone": {"pretrained": False, "weights_path": None}}})
+
+
+def load_model_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    """严格载入权重；兼容旧版缺少 border_prior 的地理编码层。"""
+    weights = dict(state)
+    key = "geography.embed.0.weight"
+    current = model.state_dict()
+    if key in weights and key in current:
+        old, new = weights[key], current[key]
+        geo = getattr(model, "geography", None)
+        if (getattr(geo, "border_prior", False) and old.ndim == 4 and new.ndim == 4
+                and old.shape[0] == new.shape[0] and old.shape[1] + 2 == new.shape[1]
+                and old.shape[2:] == new.shape[2:]):
+            # border_prior 位于可选的 xy 坐标之前，新增通道置零保持旧模型行为。
+            insert = old.shape[1] - (2 if getattr(geo, "use_xy", False) else 0)
+            zeros = old.new_zeros((old.shape[0], 2, *old.shape[2:]))
+            weights[key] = torch.cat((old[:, :insert], zeros, old[:, insert:]), dim=1)
+    try:
+        model.load_state_dict(weights, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "checkpoint 与当前模型结构不匹配；请使用训练时的配置和类别数，"
+            "或重新训练/转换权重。\n" + str(exc)
+        ) from exc
+
+
 def get_by_path(cfg: Dict[str, Any], path: str, default: Any = None) -> Any:
     node: Any = cfg
     for part in path.split("."):

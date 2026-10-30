@@ -210,9 +210,15 @@ def extract_regions(
     min_area: int = 16,
     max_regions: int = 64,
     connectivity: int = 8,
+    labels: np.ndarray | None = None,
 ) -> List[Region]:
     """从二值异常图提取候选区域, 按峰值分数排序."""
-    labels, num = connected_components(binary, connectivity=connectivity)
+    if labels is None:
+        labels, num = connected_components(binary, connectivity=connectivity)
+    else:
+        if labels.shape != binary.shape:
+            raise ValueError("labels 和 binary 尺寸必须一致")
+        num = int(labels.max()) if labels.size else 0
     regions: List[Region] = []
     if num == 0:
         return regions

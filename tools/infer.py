@@ -9,17 +9,25 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import base_parser, load_config  # noqa: E402
+from _common import base_parser, load_predict_overrides  # noqa: E402
 
-from fabric_ncd.inference import FabricPredictor  # noqa: E402
+from fabric_ncd.inference import FabricPredictor, as_hw  # noqa: E402
 from fabric_ncd.utils import ensure_dir, get_logger, json_dump  # noqa: E402
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _size_arg(value):
+    try:
+        return as_hw(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main() -> int:
@@ -30,7 +38,7 @@ def main() -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--tile", action="store_true", help="大幅面图像切块推理")
-    parser.add_argument("--tile-size", type=int, default=None)
+    parser.add_argument("--tile-size", type=_size_arg, default=None, help="瓦片尺寸: 边长或 HxW")
     parser.add_argument("--out-stride", type=int, default=None, help="分数图下采样倍数 (实时可设 4)")
     parser.add_argument("--fp16", dest="fp16", action="store_true", default=None, help="CUDA 上开启 FP16")
     parser.add_argument("--no-fp16", dest="fp16", action="store_false")
@@ -40,7 +48,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logger = get_logger("fabric_ncd")
-    cfg = load_config(args.config, args.overrides, args.root)
+    cfg = load_predict_overrides(args.config, args.overrides, args.root)
     predictor = FabricPredictor(
         checkpoint=args.ckpt,
         config=cfg,
@@ -55,7 +63,7 @@ def main() -> int:
     out_dir = ensure_dir(args.out)
     source = Path(args.source)
     if source.is_dir():
-        files = [p for p in sorted(source.rglob("*")) if p.suffix.lower() in IMG_EXTS]
+        files = [p for p in sorted(source.rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
     elif source.exists():
         files = [source]
     else:
@@ -66,12 +74,24 @@ def main() -> int:
     from PIL import Image
 
     all_results = {}
+    # 同一子目录里同名不同扩展名的图片也不能覆盖彼此的可视化。
+    overlay_counts = {}
     for path in files:
-        image = Image.open(path).convert("RGB")
+        relative = path.relative_to(source) if source.is_dir() else Path(path.name)
+        key = relative.parent / f"{relative.stem}_pred.png"
+        overlay_counts[key] = overlay_counts.get(key, 0) + 1
+    for path in files:
+        with Image.open(path) as img:
+            image = img.convert("RGB")
         result = predictor.predict(image)
         all_results[str(path)] = {"regions": result["regions"], "image": result["image"]}
         if not args.no_overlay:
-            overlay_path = out_dir / f"{path.stem}_pred.png"
+            relative = path.relative_to(source) if source.is_dir() else Path(path.name)
+            key = relative.parent / f"{relative.stem}_pred.png"
+            if overlay_counts[key] > 1:
+                key = relative.parent / f"{relative.name}_pred.png"
+            overlay_path = out_dir / key
+            ensure_dir(overlay_path.parent)
             predictor.save_overlay(image, result, overlay_path, draw_heatmap=not args.no_heatmap)
         logger.info(
             "%s | score=%.3f | %s(%s %.2f) | regions=%d",

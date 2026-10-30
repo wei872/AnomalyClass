@@ -22,7 +22,6 @@ python tools/eval_scales.py --checkpoint best.pt --scales 0.5,0.65,0.8,1.0 --sam
 
 from __future__ import annotations
 
-import argparse
 import copy
 import sys
 import time
@@ -34,10 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
 
 from fabric_ncd.data.yolo import build_dataloaders, build_reference_loaders  # noqa: E402
-from fabric_ncd.engine import evaluate  # noqa: E402
+from fabric_ncd.engine import _interleave, evaluate  # noqa: E402
 from fabric_ncd.models.fabric_ncd import FabricNCD  # noqa: E402
 from fabric_ncd.ncd import RegionAnalyzer  # noqa: E402
-from fabric_ncd.utils import get_logger, load_yaml, resolve_device  # noqa: E402
+from fabric_ncd.utils import checkpoint_compat_config, get_logger, load_model_weights, model_config_for_weights, resolve_device  # noqa: E402
+from _common import base_parser, load_config  # noqa: E402
 
 LOGGER = get_logger("eval_scales")
 
@@ -53,17 +53,9 @@ def _parse_scales(text: str) -> List[float]:
 
 
 def _build_model(state: Dict[str, Any], cfg: Dict[str, Any], device: torch.device) -> FabricNCD:
-    model = FabricNCD(cfg)
+    model = FabricNCD(model_config_for_weights(cfg))
     key = "ema" if "ema" in state else "model"
-    try:
-        model.load_state_dict(state[key])
-    except RuntimeError:
-        missing, unexpected = model.load_state_dict(state[key], strict=False)
-        LOGGER.warning(
-            "权重与当前结构不完全一致: 跳过 %d 个参数 / %d 个多余参数",
-            len(missing),
-            len(unexpected),
-        )
+    load_model_weights(model, state[key])
     calibration = state.get("calibration") or {}
     scale = float(calibration.get("memory_distance_scale", 0.0) or 0.0)
     if scale > 0:
@@ -72,7 +64,7 @@ def _build_model(state: Dict[str, Any], cfg: Dict[str, Any], device: torch.devic
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="分辨率体检: 扫输入尺度看 pixelAUROC 曲线")
+    ap = base_parser("分辨率体检: 扫输入尺度看 pixelAUROC 曲线")
     ap.add_argument("--checkpoint", required=True, help="训练产出的 best.pt / last.pt")
     ap.add_argument("--scales", default="0.5,0.65,0.8,1.0", help="缩放比例, 逗号分隔 (<=1 表示不放大)")
     ap.add_argument("--samples", type=int, default=0, help="验证集最多用多少张 (0 = 全部)")
@@ -82,7 +74,9 @@ def main() -> int:
 
     device = resolve_device(args.device)
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
+    cfg = checkpoint_compat_config(
+        load_config(args.config, args.overrides, args.root, checkpoint_config=state.get("config")), state
+    )
     cfg.setdefault("experiment", {})["device"] = str(device)
 
     rows = []
@@ -105,15 +99,12 @@ def main() -> int:
             model.memory.reset()
             built = 0
             with torch.no_grad():
-                for loader in reference_loaders:
-                    for batch in loader:
-                        images = batch["image"].to(device)
-                        mask = batch["cloth_mask"].to(device)
-                        model.update_memory(images, mask=mask)
-                        built += 1
-                        if built >= args.memory_batches:
-                            break
-                    if built >= args.memory_batches:
+                for batch in _interleave(reference_loaders):
+                    images = batch["image"].to(device)
+                    mask = batch["cloth_mask"].to(device)
+                    model.update_memory(images, mask=mask)
+                    built += 1
+                    if args.memory_batches > 0 and built >= args.memory_batches:
                         break
 
         hw = resolved_hw

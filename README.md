@@ -10,7 +10,10 @@
 | 计算量 @512×512 | **0.62 GMACs（旧口径，仅 Conv/Linear）**；完整口径见 `tools/bench.py` |
 | CPU 单张延迟（2 核 Intel/AMD，PyTorch） | ≈ **100 ms**（224×224 约 23 ms） |
 | 输出 | 异常热力图 + 布面掩码 + 布边带 + 19 类（可扩展）分类 + 区域框 + 嵌入 |
-| 监督需求 | 有框标注可用；**无标签正常图即可冷启动**（记忆库 + 合成异常） |
+| 监督需求 | 有框标注可用；无标签正常图可用于建库及合成异常训练（效果需实测） |
+
+> 上表及下文中的速度、显存和精度收益是历史测量或设计目标，不代表当前环境或生产数据的保证。
+> 应在目标显卡、相机与真实布料上分别验证精度、阈值、延迟和吞吐。
 
 ```text
 RGB ─► MobileNetV3-Small ─┬─ p2(1/4) ─► Gabor 经纬纹理编码 ─┐
@@ -51,10 +54,10 @@ YOLO 的价值在"闭集、标注充分、产线稳定"的场景；布匹产线�
 ## 2. 关键设计（详见 [docs/DESIGN.md](docs/DESIGN.md)）
 
 1. **经纬纹理先验**（`models/texture.py`）
-   - 固定 8 组 Gabor 核（0°/45°/90°/135° × 2 波长 × 实/虚部），0°/90° 直接对应纬/经纱；
+   - 默认 16 个 Gabor 核（0°/45°/90°/135° × 2 波长 × 实/虚部），0°/90° 对应纬/经纱；
    - 加窗 FFT 估计**织造周期**（经/纬向像素周期 + 各向异性 + 置信度），既做数据侧
      **织造尺度归一化**（把不同布种的经纬间距对齐到同一尺度），又作为全局 token 注入网络；
-   - 换布料种类时，模型看到的是"纹理尺度已归一化 + 相位响应"的表示，而不是某种布的具体外观。
+   - 固定尺寸整图流程的二次 resize 会大体抵消该缩放，不能保证最终周期被对齐；见已知局限。
 
 2. **全局 + 局部双分支**（`models/glocal.py`）
    - 1/32 上做空洞卷积 + **线性注意力**（O(N)，512 输入仅 256 token）建模整幅一致性（纬斜、整幅色差）；
@@ -113,7 +116,7 @@ AnomalyClass/
 │   ├── export_onnx.py  bench.py  prepare_dataset.py  demo.py
 │   ├── resolution.py              # 按原图尺寸 + 实测经纬周期推荐输入分辨率
 │   ├── rt_bench.py                # 实时性基准: 逐段耗时 + FPS + 达标判定
-├── tests/                         # 36 项单元 + 端到端冒烟测试
+├── tests/                         # 单元、回归和端到端冒烟测试
 └── docs/DESIGN.md                 # 方案细节、消融实验计划、调参手册
 ```
 
@@ -123,12 +126,12 @@ AnomalyClass/
 
 ```bash
 pip install -r requirements.txt
-# 可选：ONNX 导出 + 校验
-pip install onnx onnxruntime
+# 可选：安装项目、ONNX 导出/校验和测试依赖（保留兼容的 numpy 约束）
+pip install ".[export,dev]"
 ```
 
-要求 Python ≥ 3.9、PyTorch ≥ 2.0、torchvision ≥ 0.15。CPU 即可跑通全流程；
-GPU（≥ 8 GB）上 512×512、batch 8 训练约需 6–8 GB 显存。
+要求 Python ≥ 3.9、PyTorch ≥ 2.0、torchvision ≥ 0.15。CPU 可以跑通演示；
+Python < 3.13 限制 numpy < 2，以兼容较旧的 PyTorch。GPU 显存取决于模型、尺寸、批量及环境。
 
 ## 5. 先跑个演示（不需要数据集）
 
@@ -145,7 +148,7 @@ python tools/demo.py                # 生成合成布匹数据 -> 训练 -> 评�
 
 ### 6.1 数据准备
 
-按 `dataset/fabric19.yaml` 的约定组织：
+按 `dataset/fabric19.yaml` 的约定组织（缺失或空标注视为正常图，请确认不是标注漏拷贝）：
 
 ```text
 DATASET_ROOT/
@@ -249,7 +252,7 @@ python tools/train.py --config configs/fabric19.yaml \
 
 # 常用覆盖
 python tools/train.py --set train.epochs=100 --set model.backbone.arch=mobilenet_v3_large
-python tools/train.py --resume runs/fabric19_fabricncd_s/last.pt
+python tools/train.py --resume runs/fabric19_fabricncd_s/last.pt --epochs 100  # 总轮数，不是追加轮数
 python tools/train.py --no-pretrained              # 离线环境
 ```
 
@@ -258,7 +261,13 @@ python tools/train.py --no-pretrained              # 离线环境
 1. 用**正常图**建记忆库（无需标签，冷启动）；
 2. 在**正常图**上校准绝对阈值（`pixel_threshold` / `image_threshold`），随 checkpoint 保存；
 3. 每轮验证并记录像素 AUROC / PRO / F1、图像 AUROC / AP、mAP@0.5、分类 Acc / F1；
-4. 按综合分保存 `best.pt`，支持 EMA、早停、AMP、断点续训。
+4. 按综合分保存 `best.pt`，每轮原子保存 `last.pt`；支持 EMA、早停、AMP、断点续训。
+
+续训会恢复优化器、学习率、EMA、AMP scaler、校准、记忆库来源与随机数状态；多 worker 等环境
+不保证逐位复现。训练、评估、推理和导出的配置优先级为：默认值 < checkpoint < 显式 `--config` <
+`--set`/`--root`。旧版 `lite` checkpoint 自动保持原有 1/64 p5 步长；新模型使用 1/32。
+权重文件通过 Python pickle 加载，**只加载可信来源的 checkpoint**。旧模型的训练缺陷不会被新代码
+自动修复，建议重新训练并重新校准。
 
 ### 6.2.1 推荐预设
 
@@ -351,11 +360,15 @@ WARNING 数据集里有 5 种尺寸. 训练会把每张图各自缩放到同一�
 ```bash
 python tools/evaluate.py --ckpt runs/fabric19_fabricncd_s/best.pt
 python tools/evaluate.py --ckpt best.pt --save-preds preds.json   # 逐图区域与阈值
+# 验证部署用切块（尺寸和 overlap 应与推理保持一致）
+python tools/evaluate.py --ckpt best.pt --set eval.tile=true --set eval.tile_size=[832,1600]
 ```
 
 **区域后处理参数只有一处定义**：训练日志、`tools/evaluate.py`、`tools/eval_scales.py`、
 `fabric_ncd/inference.py` 全部通过 `fabric_ncd.engine.analyzer_kwargs(cfg)` 构造 `RegionAnalyzer`，
-读的是 `eval` 段：
+读的是 `eval` 段。`pro` 是 FPR 0–0.3 区间归一化的 AUPRO（含异常图框外的负像素）；
+异常掩码由框生成时，这些像素指标仅是弱标注近似。`eval.analysis_stride` 应与
+`infer.out_stride` 一致，改输入、切块或后处理后应重新校准阈值：
 
 | 键 | 默认 | 作用 | 注意 |
 |---|---|---|---|
@@ -386,7 +399,7 @@ python tools/infer.py --ckpt best.pt --source huge_4096x1024.png --tile --tile-s
 ```bash
 # 先量一下: 逐段耗时 + 流水线 FPS, 会自动判断是否达到 40 FPS 并给降配建议
 python tools/rt_bench.py --ckpt runs/fabric19_fabricncd_s/best.pt \
-    --source /data/fabric/line/*.jpg --frames 300 --fp16
+    --source /data/fabric/line --frames 300 --fp16
 ```
 
 配置里已默认打开实时开关（`infer.out_stride: 4 / probs_mul: 2 / fp16 / prep_gpu /
@@ -397,14 +410,19 @@ from fabric_ncd.inference import FabricPredictor
 from fabric_ncd.realtime import RealtimePipeline
 
 predictor = FabricPredictor("runs/fabric19_fabricncd_s/best.pt", device="cuda", fp16=True)
-pipe = RealtimePipeline(predictor, queue_size=2).start()
-for frame in camera:
-    pipe.submit(frame)
-for res in pipe.results():
-    print(res.index, res.latency_ms, [(r["name"], r["score"]) for r in res.regions])
+with RealtimePipeline(predictor, queue_size=2) as pipe:
+    for frame in camera:
+        pipe.submit(frame)          # 非阻塞：输入队列满时丢最旧的待处理帧
+        while (res := pipe.poll()) is not None:
+            if res.error:
+                print("帧处理失败:", res.error)
+            else:
+                print(res.index, res.latency_ms, res.regions)
 ```
 
-细节（预算拆分、优化清单、降配顺序、精度代价）见 [docs/REALTIME.md](docs/REALTIME.md)。
+需要完整处理有限批次时使用 `block=True`，并在停止前消费所有结果；`stop()` 立即停止，
+不保证清空在途帧。错误帧包含 `error`，非阻塞丢帧数可读 `pipe.dropped`，输出队列须持续消费。
+细节见 [docs/REALTIME.md](docs/REALTIME.md)。
 
 ### 6.5 新类发现（无标签疵点图）
 
@@ -413,7 +431,7 @@ python tools/discover.py --ckpt best.pt --source /data/unlabeled_defects --out o
 ```
 
 输出 `ncd_report.json`、每个簇的样例抠图 `cluster_samples/`，以及
-`discovered_prototypes.pt`（已知原型 + 新类原型，可直接热更新分类器做在线增量）。
+`discovered_prototypes.pt`（已知原型 + 新类原型；扩容分类器和部署需由调用方处理）。
 
 ### 6.6 部署与压测
 
@@ -424,8 +442,10 @@ python tools/export_onnx.py --ckpt best.pt --out model.onnx --size 512 --check
 
 ONNX 输入为 `images (B,3,H,W)` 与 `weave_desc (B,6)`。`weave_desc` 由部署端用
 `fabric_ncd.data.weave.estimate_period`（numpy，无 torch 依赖）计算；不需要时喂 0 即可。
-计算图内**不含**连通域/区域合并等后处理，部署端移植 `fabric_ncd/ncd.py` 中
-`RegionAnalyzer` 的等价逻辑（纯 numpy，无第三方依赖）。
+ONNX 输出的是 `anomaly_logit`、`cloth_logit`、`boundary_logit`、`class_logits` 和 `embedding`；
+图内**不含记忆库查询及融合、阈值/布面门控、连通域和区域合并**。如需复现 Python 推理，部署端
+还须使用 checkpoint 的记忆库和校准参数实现这些步骤。`--dynamic` 可导出动态 H/W，建议用 `--check`
+并在目标运行时、目标尺寸再做数值和精度验证。
 
 ---
 

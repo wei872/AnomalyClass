@@ -27,7 +27,6 @@
 
 from __future__ import annotations
 
-import copy
 import csv
 import sys
 from collections import defaultdict
@@ -470,21 +469,18 @@ def _probe(args) -> int:
     )
     from fabric_ncd.models.fabric_ncd import FabricNCD
     from fabric_ncd.ops import topk_mean
-    from fabric_ncd.utils import load_yaml, resolve_device
-
-    from tools._common import apply_overrides
+    from fabric_ncd.utils import checkpoint_compat_config, load_model_weights, model_config_for_weights, resolve_device
+    from fabric_ncd.engine import _interleave
+    from tools._common import load_config
 
     def _load(ckpt: str, device):
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        cfg = copy.deepcopy(state.get("config") or load_yaml("configs/fabric19.yaml"))
-        LOGGER.info("配置来自 checkpoint 里保存的那一份 (训练时的配置), 可用 --set 覆盖")
-        if args.overrides:
-            cfg = apply_overrides(cfg, args.overrides)
-        if args.root:
-            cfg.setdefault("data", {})["root"] = args.root
+        cfg = load_config(args.config, args.overrides, args.root, checkpoint_config=state.get("config"))
+        LOGGER.info("配置来自 checkpoint；显式 --config/--set 可覆盖")
         LOGGER.info("checkpoint: %s (epoch %s)", ckpt, state.get("epoch", "?"))
-        model = FabricNCD(cfg)
-        model.load_state_dict(state["ema" if "ema" in state else "model"])
+        cfg = checkpoint_compat_config(cfg, state)
+        model = FabricNCD(model_config_for_weights(cfg))
+        load_model_weights(model, state["ema" if "ema" in state else "model"])
         calibration = state.get("calibration") or {}
         scale = float(calibration.get("memory_distance_scale", 0.0) or 0.0)
         if scale > 0:
@@ -507,12 +503,12 @@ def _probe(args) -> int:
     # 同一个东西, 分数就不可比 —— 这是最容易把人带偏的地方.
     memory_source = str(cfg.get("train", {}).get("memory_source", "both")).lower()
     bank_loaders = []
-    if "defect" in memory_source:
+    if "defect" in memory_source or "both" in memory_source:
         bg = build_background_loader(cfg, "train", shuffle=False)
         if bg is not None:
             bank_loaders.append(("疵点图框外布面", bg))
     nl = build_normal_loader(cfg, "train")
-    if nl is not None and ("normal" in memory_source or not bank_loaders):
+    if nl is not None and ("normal" in memory_source or "both" in memory_source or not bank_loaders):
         bank_loaders.append(("良品图", nl))
     bank_images = 0
     bank_src: Dict[str, int] = defaultdict(int)
@@ -521,17 +517,13 @@ def _probe(args) -> int:
         with torch.no_grad():
             for kind, bank_loader in bank_loaders:
                 LOGGER.info("记忆库来源: %s (%d 张)", kind, len(bank_loader.dataset))
-                for i, batch in enumerate(bank_loader):
-                    model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
-                    bank_images += int(batch["image"].shape[0])
-                    for path in batch["path"]:
-                        key = source_of(path, args.group_depth)
-                        bank_src[key] += 1
-                    if args.memory_batches and i + 1 >= args.memory_batches:
-                        break
-                if args.memory_batches and bank_images >= args.memory_batches * int(
-                    cfg.get("data", {}).get("eval_batch_size", 2)
-                ):
+            for i, batch in enumerate(_interleave([loader for _, loader in bank_loaders])):
+                model.update_memory(batch["image"].to(device), mask=batch["cloth_mask"].to(device))
+                bank_images += int(batch["image"].shape[0])
+                for path in batch["path"]:
+                    key = source_of(path, args.group_depth)
+                    bank_src[key] += 1
+                if args.memory_batches and i + 1 >= args.memory_batches:
                     break
         LOGGER.info("记忆库: 用 %d 张参照图建立", bank_images)
 
@@ -550,7 +542,8 @@ def _probe(args) -> int:
             cloth_bin = (cloth_p > 0.5).float()
             masked = score * cloth_bin if gate else score
             learned = F.interpolate(out["learned_score"], size=(h, w), mode="bilinear", align_corners=False)
-            for i in range(score.shape[0]):
+            count = min(score.shape[0], max(0, args.samples - len(rows))) if args.samples else score.shape[0]
+            for i in range(count):
                 path = str(batch["path"][i])
                 raw = score[i, 0].detach().cpu().numpy()
                 mkd = masked[i, 0].detach().cpu().numpy()
@@ -575,7 +568,7 @@ def _probe(args) -> int:
                 }
                 row.update(appearance_stats(path))
                 rows.append(row)
-            if args.samples and len(rows) >= 2 * args.samples:
+            if args.samples and len(rows) >= args.samples:
                 break
 
     val_src: Dict[str, int] = defaultdict(int)

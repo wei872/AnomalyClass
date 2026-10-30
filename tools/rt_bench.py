@@ -22,7 +22,7 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import base_parser, load_config  # noqa: E402
+from _common import base_parser, load_predict_overrides  # noqa: E402
 
 from fabric_ncd.inference import FabricPredictor  # noqa: E402
 from fabric_ncd.realtime import RealtimePipeline, load_rgb_fast, summarize  # noqa: E402
@@ -35,7 +35,7 @@ def _collect(source: str) -> List[Path]:
     path = Path(source)
     if path.is_file():
         return [path]
-    return [p for p in sorted(path.rglob("*")) if p.suffix.lower() in IMG_EXTS]
+    return [p for p in sorted(path.rglob("*")) if p.is_file() and p.suffix.lower() in IMG_EXTS]
 
 
 def _parser():
@@ -59,11 +59,17 @@ def _parser():
 
 
 def main() -> int:
-    args = _parser().parse_args()
-    cfg = load_config(args.config, args.root)
+    parser = _parser()
+    args = parser.parse_args()
+    if args.frames < 1 or args.warmup < 0 or args.target_fps <= 0:
+        parser.error("--frames 和 --target-fps 必须为正，--warmup 必须非负")
+    cfg = load_predict_overrides(args.config, args.overrides, args.root)
     if args.size:
-        raw = [int(v) for v in str(args.size).replace("*", "x").split("x")]
-        cfg.setdefault("data", {})["image_size"] = raw if len(raw) == 2 else [raw[0], raw[0]]
+        from fabric_ncd.inference import as_hw
+        cfg.setdefault("data", {})["image_size"] = list(as_hw(args.size))
+    if args.ckpt is None:
+        print("未提供 checkpoint：使用随机权重，仅测速度。", file=sys.stderr)
+        cfg.setdefault("model", {}).setdefault("backbone", {})["pretrained"] = False
 
     predictor = FabricPredictor(
         checkpoint=args.ckpt,
@@ -147,23 +153,28 @@ def _run_pipeline(predictor: FabricPredictor, images: List[Path], frames: int, w
     pipe = RealtimePipeline(predictor, queue_size=2).start()
     lead = 3
 
-    def run(count: int, start_index: int) -> tuple:
+    def run(count: int, start_index: int) -> List:
         submitted, results = 0, []
         while len(results) < count:
-            if submitted < count + lead:
+            while submitted < count and submitted - len(results) < lead:
                 pipe.submit(images[(start_index + submitted) % len(images)], block=True)
                 submitted += 1
-            item = pipe.poll(timeout=0.05)
-            if item is not None:
-                results.append(item)
+            item = pipe.poll(timeout=30.0)
+            if item is None:
+                raise TimeoutError(f"实时流水线超时；错误: {pipe.errors}")
+            if item.error:
+                raise RuntimeError(item.error)
+            results.append(item)
         return results
 
-    run(warmup, 0)  # 预热
-    t_start = time.perf_counter()
-    results = run(frames, warmup)
-    wall = time.perf_counter() - t_start
-    pipe.stop()
-    return summarize(results, wall)
+    try:
+        run(warmup, 0)  # 预热必须全部完成后再开始计时
+        t_start = time.perf_counter()
+        results = run(frames, warmup)
+        wall = time.perf_counter() - t_start
+        return summarize(results, wall)
+    finally:
+        pipe.stop()
 
 
 def _advice(stats: Dict[str, Any], budget: float, target: float) -> None:
