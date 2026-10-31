@@ -39,7 +39,9 @@ def synthetic(tmp_path_factory):
     for split in ("train", "val"):
         normal = raw / "normal" / "images" / split
         normal.mkdir(parents=True)
-        Image.new("RGB", (32, 32), "gray").save(normal / "good.png")
+        normal_image = Image.new("RGB", (32, 32), "gray")
+        ImageDraw.Draw(normal_image).point((31, 31), fill="white" if split == "val" else "black")
+        normal_image.save(normal / "good.png")
     dataset_yaml = base / "fabric19.yaml"
     original = yaml.safe_load((ROOT / "dataset/fabric19.yaml").read_text(encoding="utf-8"))
     dataset_yaml.write_text(yaml.safe_dump(original, allow_unicode=True), encoding="utf-8")

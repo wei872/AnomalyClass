@@ -94,6 +94,46 @@ python scripts/train_fabricncd.py \
 4. 训练 DINO-MGViT 19 类区域分类器；
 5. 打包端到端 bundle：`detector.pt`、`classifier.pt`、`fabricncd_bundle.json`。
 
+### 报错「train/val 有 N 个完全相同图片」怎么办
+
+这是**数据泄漏保护**，不是程序 bug：`val` 里有图片和 `train` 里的图片逐字节相同（SHA256 一致）。
+增强后再划分数据集时非常常见——同一张原图的不同增强副本被分到了两边。
+带着这种重复训练，验证指标会虚高，无法反映真实泛化能力。
+
+**先审计，看清到底是哪些文件重复：**
+
+```bash
+python scripts/audit_split.py --data-root /实际数据根目录 --report outputs/split_audit.json
+# 加 --perceptual 还能检出「同一原图增强后分到两边」的近似重复（字节不同但内容几乎一样）
+python scripts/audit_split.py --data-root /实际数据根目录 --perceptual
+```
+
+审计会列出每一对 `val` ↔ `train` 文件，同时统计正常图目录；发现完全重复时以退出码 1 结束，便于接入脚本。
+
+**然后三选一：**
+
+| 方式 | 命令 | 说明 |
+| --- | --- | --- |
+| 训练时自动排除（推荐，最省事） | 训练命令加 `--drop-leaked-val` | 预处理阶段把这些 `val` 图片排除，**原始数据一个字节都不改**，剔除数量写入 manifest |
+| 物理隔离后再训练 | `python scripts/audit_split.py --data-root <ROOT> --quarantine <空目录> --apply` | 把重复图片及其标签移出数据集；不加 `--apply` 只预演。可用 `--restore <空目录>/quarantine.json` 完整还原 |
+| 明确接受泄漏 | 训练命令加 `--allow-overlap` | 仅用于临时跑通流程，**指标不可信**，不要用于汇报结果 |
+
+```bash
+# 推荐的完整命令
+python scripts/train_fabricncd.py \
+  --config configs/fabric19.yaml \
+  --data-root /实际数据根目录 \
+  --output-dir outputs/fabricncd_supervised \
+  --drop-leaked-val
+```
+
+`--drop-leaked-val` 与 `--allow-overlap` 互斥，且对检测器数据和区域裁剪**同时生效**，两条链路的 val 集合保持一致。
+`scripts/prepare_data.py` 也支持这两个参数。
+
+> **根本解法仍是按原图/布卷重新划分数据集**：先切分原始图片，再只对 `train` 做增强。
+> 哈希检查只能发现完全相同的文件；旋转、裁剪、调色后的同源副本字节不同，需要用 `--perceptual` 辅助排查，
+> 但它也只是启发式提示，不能替代按来源划分。
+
 ### NCD 模式：已知类 + 新类发现
 
 编辑 `configs/fabric19_ncd.yaml`：
@@ -242,7 +282,7 @@ ruff check anomalyncd scripts tests
 python -m compileall -q anomalyncd scripts
 ```
 
-当前验证：`pytest -q` 为 **31 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、MGViT 梯度、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟。
+当前验证：`pytest -q` 为 **40 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、split 审计与隔离还原、感知哈希近似重复、MGViT 梯度、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟，并在人为注入 13 张重复图片的数据上验证了 `--drop-leaked-val`：检测器与区域两条链路均剔除 13 张、train/val 哈希交集为 0、原始文件未改动，训练与四阶段预测正常完成。
 
 **本仓库当前没有真实 Fabric19 图片，也没有在真实数据/GPU/官方预训练权重上完成训练验证。** 合成测试通过只说明流程和张量/标签逻辑可运行，不代表真实布匹缺陷检测/分类准确率。
 

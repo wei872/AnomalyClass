@@ -17,7 +17,10 @@ def main() -> None:
     parser.add_argument("--check-only", action="store_true", help="只扫描图片和标签，不写裁剪数据")
     parser.add_argument("--overwrite", action="store_true", help="替换本工具之前生成的预处理目录")
     parser.add_argument("--allow-missing-labels", action="store_true", help="将缺标签图片视为背景并跳过；默认报错")
-    parser.add_argument("--allow-overlap", action="store_true", help="显式允许 train/val 完全相同的图片（不推荐）")
+    overlap = parser.add_mutually_exclusive_group()
+    overlap.add_argument("--allow-overlap", action="store_true", help="显式允许 train/val 完全相同的图片（不推荐）")
+    overlap.add_argument("--drop-leaked-val", action="store_true",
+                         help="排除与 train 完全相同的 val 图片（推荐，原始数据不改动）")
     args = parser.parse_args()
     cfg = get_training_config(args)
     output = args.output or Path(cfg["data"]["prepared_root"])
@@ -25,7 +28,8 @@ def main() -> None:
                                args.padding if args.padding is not None else cfg["data"]["padding"],
                                args.min_crop_size if args.min_crop_size is not None else cfg["data"]["min_crop_size"],
                                overwrite=args.overwrite, allow_missing_labels=args.allow_missing_labels,
-                               allow_overlap=args.allow_overlap, check_only=args.check_only)
+                               allow_overlap=args.allow_overlap, drop_leaked_val=args.drop_leaked_val,
+                               check_only=args.check_only)
     if args.check_only:
         print(f"OK: {manifest['nc']} classes; {manifest['stats']['train']['regions']} train / "
               f"{manifest['stats']['val']['regions']} val regions; no crops written")

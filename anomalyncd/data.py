@@ -183,7 +183,8 @@ def _write_json(path: Path, value: object) -> None:
 
 def prepare_dataset(dataset_config: str | Path, output: str | Path, data_root: str | Path | None = None,
                     padding: float = 0.1, min_crop_size: float = 0.1, overwrite: bool = False,
-                    allow_missing_labels: bool = False, allow_overlap: bool = False, check_only: bool = False,
+                    allow_missing_labels: bool = False, allow_overlap: bool = False,
+                    drop_leaked_val: bool = False, check_only: bool = False,
                     progress: Callable[[str], None] = print) -> dict:
     if not math.isfinite(padding) or not 0 <= padding <= 10 or not math.isfinite(min_crop_size) or not 0 <= min_crop_size <= 1:
         raise ValueError("padding 必须在 0..10，min_crop_size 必须在 0..1")
@@ -193,13 +194,32 @@ def prepare_dataset(dataset_config: str | Path, output: str | Path, data_root: s
         entries[split], stats[split] = scan_split(spec, split, allow_missing_labels)
         stats[split]["class_region_counts"] = dict(sorted(Counter(a.class_id for e in entries[split] for a in e.annotations).items()))
         progress(f"{split}: {stats[split]}")
+    if allow_overlap and drop_leaked_val:
+        raise ValueError("--allow-overlap 与 --drop-leaked-val 不能同时使用")
     train_hashes = {e.sha256 for e in entries["train"]}
     overlap = sorted({e.relative for e in entries["val"] if e.sha256 in train_hashes})
     stats["exact_train_val_overlap"] = len(overlap)
-    if overlap and not allow_overlap:
-        raise ValueError(f"train/val 有 {len(overlap)} 个完全相同的图片（例如 {overlap[:3]}），会造成数据泄漏。"
-                         "请按原始布卷/原图重新划分；仅在确认允许时加 --allow-overlap")
-    if overlap:
+    if overlap and drop_leaked_val:
+        before = len(entries["val"])
+        entries["val"] = [e for e in entries["val"] if e.sha256 not in train_hashes]
+        if not entries["val"]:
+            raise ValueError("剔除与 train 重复的图片后 val 为空；请重新划分数据集")
+        stats["val"] = {"images": len(entries["val"]),
+                        "annotated_images": sum(bool(e.annotations) for e in entries["val"]),
+                        "regions": sum(len(e.annotations) for e in entries["val"]),
+                        "missing_labels": stats["val"]["missing_labels"],
+                        "empty_images": sum(not e.annotations for e in entries["val"]),
+                        "class_region_counts": dict(sorted(Counter(
+                            a.class_id for e in entries["val"] for a in e.annotations).items()))}
+        stats["dropped_leaked_val"] = before - len(entries["val"])
+        progress(f"已从 val 剔除 {stats['dropped_leaked_val']} 个与 train 完全相同的图片（原始数据未改动）")
+    elif overlap and not allow_overlap:
+        raise ValueError(
+            f"train/val 有 {len(overlap)} 个完全相同的图片（例如 {overlap[:3]}），会造成数据泄漏。\n"
+            "推荐加 --drop-leaked-val 在预处理时排除这些 val 图片（原始数据不改动）；"
+            "或先用 scripts/audit_split.py 审计并隔离；"
+            "确认接受泄漏风险时才加 --allow-overlap。")
+    elif overlap:
         progress(f"WARNING: 已显式允许 {len(overlap)} 个 train/val 重复图片；指标可能偏高")
     for split in ("train", "val"):
         missing = sorted(set(range(spec.nc)) - set(stats[split]["class_region_counts"]))

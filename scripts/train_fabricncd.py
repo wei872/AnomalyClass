@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--detector-image-size", type=int)
     parser.add_argument("--detector-weights", type=Path, help="本地 YOLO 检测器预训练权重")
     parser.add_argument("--dry-run", action="store_true", help="只验证配置和数据，不训练")
+    overlap = parser.add_mutually_exclusive_group()
+    overlap.add_argument("--drop-leaked-val", action="store_true",
+                         help="预处理时排除与 train 完全相同的 val 图片（推荐，原始数据不改动）")
+    overlap.add_argument("--allow-overlap", action="store_true",
+                         help="显式接受 train/val 重复带来的数据泄漏（指标会偏高，不建议）")
     args = parser.parse_args()
     cfg = get_training_config(args)
     if args.output_dir is None:
@@ -46,7 +51,9 @@ def main() -> None:
     if args.dry_run:
         prepare_detector_dataset(cfg["data"]["dataset_config"], Path(cfg["experiment"]["output_dir"]) / "detector_data",
                                  args.data_root, class_agnostic=detector_cfg.get("class_agnostic", True),
-                                 mode=cfg["mode"], known_class_ids=known_ids, check_only=True)
+                                 mode=cfg["mode"], known_class_ids=known_ids,
+                                 allow_overlap=args.allow_overlap, drop_leaked_val=args.drop_leaked_val,
+                                 check_only=True)
         print(f"OK: end-to-end FabricNCD {cfg['mode']}; classes={len(names)}; detector=class-agnostic defect detector")
         return
 
@@ -57,13 +64,15 @@ def main() -> None:
     detector_data = output / "detector_data"
     prepare_detector_dataset(cfg["data"]["dataset_config"], detector_data, args.data_root,
                              class_agnostic=detector_cfg.get("class_agnostic", True),
-                             mode=cfg["mode"], known_class_ids=known_ids)
+                             mode=cfg["mode"], known_class_ids=known_ids,
+                             allow_overlap=args.allow_overlap, drop_leaked_val=args.drop_leaked_val)
     detector_weights = train_detector(cfg, detector_data / "data.yaml", output / "detector_run",
                                       cfg["experiment"]["device"], args.allow_random_init)
 
     regions = output / "regions"
     prepare_dataset(cfg["data"]["dataset_config"], regions, args.data_root,
-                    padding=cfg["data"]["padding"], min_crop_size=cfg["data"]["min_crop_size"])
+                    padding=cfg["data"]["padding"], min_crop_size=cfg["data"]["min_crop_size"],
+                    allow_overlap=args.allow_overlap, drop_leaked_val=args.drop_leaked_val)
     classifier_cfg = copy.deepcopy(cfg)
     classifier_cfg["data"]["prepared_root"] = str(regions)
     classifier_cfg["experiment"]["output_dir"] = str(output / "classifier")
