@@ -73,8 +73,8 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
             f"{anchors:>8} | {p_train / 1e6:>11.3f} M | {p_fused / 1e6:>11.3f} M | {f_fused:>9.2f} B"
         )
     print("=" * 92)
-    print("说明: 训练态包含双检测头 (one2many + one2one)、经纬条带增强 (FabricStripEnhancer) 与前景对齐分支;")
-    print("      推理/导出 fuse() 后自动剥离前景对齐分支与未启用检测头, 并折叠多尺度缩放系数.")
+    print("说明: 训练态包含双检测头 (one2many + one2one) 与前景对齐监督分支 (ForegroundAlignmentBranch);")
+    print("      推理/导出 fuse() 后自动剥离前景对齐分支与未启用检测头, 并折叠多尺度固定特征缩放系数.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,7 +158,6 @@ def main() -> None:
             workers=args.workers,
             pretrained=_resolve_pretrained_arg(args.pretrained),
             use_normal=args.use_normal,
-            cos_lr=True,
         )
         if args.lr0 is not None:
             train_kwargs["lr0"] = args.lr0

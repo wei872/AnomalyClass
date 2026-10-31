@@ -45,9 +45,9 @@
 
 | 模型配置 | 配置文件 | 预测尺度 (Stride) | Anchor 数 | 训练态参数量 | 推理融合后参数量 | 融合后计算量 (FLOPs) | 适用场景 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准 |
-| **YOLO27n** (布匹增强版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 2.767 M | **2.579 M** | **6.48 B** | 100% 无损继承 `yolo26n.pt` + P2/P3 加宽 + 1×9/9×1 经纬条带增强 + 前景对齐监督（低于官方 3.0M/7.2B 预算） |
-| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 0.855 M | **0.780 M** | **3.00 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
+| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准（强制无 NMS 单正样本头） |
+| **YOLO27n** (官方高精度版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 2.669 M | **2.481 M** | **6.26 B** | 默认一对多密集头+NMS高精度推理 + 无损继承 `yolo26n.pt` + P2/P3 加宽 + 前景对齐监督（低于官方 3.0M/7.2B 预算） |
+| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 0.825 M | **0.751 M** | **2.91 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
 
 ---
 
@@ -83,16 +83,19 @@ python train_yolo27n.py --mode profile
 ```
 
 ### 3. 训练布匹缺陷检测模型
-先将 `dataset/fabric19.yaml` 中的 `path / train / val / normaltrain / normalval` 修改为你机器上的实际数据路径（若 `normaltrain` / `normalval` 目录存在，`YOLO27Trainer` 会自动将其作为纯背景负样本加入训练与验证）：
+先将 `dataset/fabric19.yaml` 中的 `path / train / val` 修改为你机器上的实际数据路径（默认与纯 `yolo26n` 采用完全一致的 `train / val` 划分；若需附加 `normaltrain / normalval` 纯背景目录，请加 `--use-normal`）：
 
 ```bash
-# 推荐：与纯 yolo26n 完全一致的数据集划分 + 零误差 Net2Wider 预训练热启动 + 1x9/9x1 经纬条带增强
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16 --imgsz 640
+# 推荐：显式指定本地 yolo26n.pt（或留空自动查找/下载），启用 92.5% 参数零误差 Net2Wider 热启动 + 默认 NMS 高精度验证
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --epochs 150 --batch 16 --imgsz 640
+
+# 从零随机初始化训练（与纯 YOLO('yolo26n.yaml') 从头训练严格同条件对比）：
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained none --epochs 150 --batch 16 --imgsz 640
 
 # 若需同时把 normaltrain / normalval 无缺陷纯背景目录加入训练与验证，加上 --use-normal：
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --use-normal --epochs 150 --batch 16
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --use-normal --epochs 150 --batch 16
 
-# 或训练双尺度极轻量版 YOLO27n-Lite (0.78M 参数 / 3.0 GFLOPs)
+# 或训练双尺度极轻量版 YOLO27n-Lite (0.75M 参数 / 2.91 GFLOPs)
 python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150 --batch 32 --imgsz 640
 ```
 

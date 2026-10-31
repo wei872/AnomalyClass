@@ -1,4 +1,4 @@
-"""YOLO27n custom detection head, warp/weft strip enhancer, and foreground alignment branch."""
+"""YOLO27n custom detection head and training-only foreground alignment branch."""
 
 from __future__ import annotations
 
@@ -9,37 +9,6 @@ from torch import nn
 
 from ultralytics.nn.modules.conv import Conv, DWConv
 from ultralytics.nn.modules.head import Detect
-
-
-class FabricStripEnhancer(nn.Module):
-    """Zero-initialized orthogonal strip-convolution residual block (1xK + Kx1) for woven fabric defects.
-
-    Captures directional horizontal weft (纬线: 纬斜/断纬/纬线不直) and vertical warp (经线: 稀缝/油点线/多股线)
-    context with wide directional receptive fields while adding negligible parameters (~35K total).
-    Because the final pointwise BatchNorm scale ``gamma`` is initialized to ``0.0``, at step 0 this block
-    is an exact identity ``y = x`` (preserving 100% of ``yolo26n.pt`` pretrained activations), while step-1
-    gradients immediately unlock directional strip features.
-    """
-
-    def __init__(self, c: int, k: int = 9) -> None:
-        super().__init__()
-        p = k // 2
-        self.dw_h = nn.Conv2d(c, c, kernel_size=(1, k), padding=(0, p), groups=c, bias=False)
-        self.dw_v = nn.Conv2d(c, c, kernel_size=(k, 1), padding=(p, 0), groups=c, bias=False)
-        self.bn1 = nn.BatchNorm2d(c)
-        self.act = nn.SiLU(inplace=True)
-        self.pw = Conv(c, c, 1, act=False)
-        self.reset_zero_residual()
-
-    def reset_zero_residual(self) -> None:
-        """Initialize residual projection BN weight & bias to zero so step-0 output equals input ``x``."""
-        if hasattr(self.pw, "bn"):
-            nn.init.zeros_(self.pw.bn.weight)
-            nn.init.zeros_(self.pw.bn.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.bn1(self.dw_h(x) + self.dw_v(x)))
-        return x + self.pw(h)
 
 
 class ForegroundAlignmentBranch(nn.Module):
@@ -75,7 +44,17 @@ class ForegroundAlignmentBranch(nn.Module):
 
 
 class YOLO27Detect(Detect):
-    """YOLO27 detection head with fixed feature scaling, strip-context residual, and foreground branch."""
+    """Official YOLO27 dual-pathway detection head.
+
+    Key properties aligned with Ultralytics YOLO27 specification:
+      1. Defaults to high-accuracy ``one2many + NMS`` inference/validation (``end2end = False``),
+         eliminating single-anchor recall loss and adjacent duplicate false positives on small or
+         elongated fabric defects, while retaining full ``one2one`` weights for optional ``nms=False``
+         end-to-end deployment.
+      2. Fixed multi-scale feature balancing ``scale_factors`` folded into first conv weights on ``fuse()``
+         for zero runtime overhead.
+      3. Training-only ``ForegroundAlignmentBranch`` stripped completely on ``fuse()``.
+    """
 
     def __init__(
         self,
@@ -86,6 +65,8 @@ class YOLO27Detect(Detect):
         scale_factors: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
+        # Official YOLO27 default: train dual heads (one2many + one2one), default eval/infer to one2many + NMS
+        self._end2end = False
         if scale_factors is None:
             if self.nl == 2:
                 scale_factors = (1.0, 1.0 / math.sqrt(2.0))
@@ -95,7 +76,6 @@ class YOLO27Detect(Detect):
             raise ValueError(f"Expected {self.nl} scale_factors for {self.nl} detection scales, got {scale_factors}")
         self.scale_factors: tuple[float, ...] = tuple(float(s) for s in scale_factors)
         self._scale_folded: bool = False
-        self.strip_adapters: nn.ModuleList | None = nn.ModuleList(FabricStripEnhancer(c, k=9) for c in ch)
         self.fg_branch: ForegroundAlignmentBranch | None = ForegroundAlignmentBranch(ch) if end2end else None
 
     @classmethod
@@ -106,12 +86,12 @@ class YOLO27Detect(Detect):
     ) -> YOLO27Detect:
         """Upgrade a parsed Ultralytics ``Detect`` head into ``YOLO27Detect`` while preserving metadata."""
         ch = tuple(branch[0].conv.in_channels for branch in det.cv2)
-        end2end = getattr(det, "one2one_cv2", None) is not None
+        has_dual_heads = getattr(det, "one2one_cv2", None) is not None
         cls.legacy = det.legacy
         new_head = cls(
             nc=det.nc,
             reg_max=det.reg_max,
-            end2end=end2end,
+            end2end=has_dual_heads,
             ch=ch,
             scale_factors=scale_factors,
         )
@@ -122,13 +102,10 @@ class YOLO27Detect(Detect):
         return new_head
 
     def bias_init(self) -> None:
-        """Initialize box, class, foreground alignment biases, and zero-residual strip adapters."""
+        """Initialize box, class, and foreground alignment biases."""
         super().bias_init()
         if getattr(self, "fg_branch", None) is not None:
             self.fg_branch.bias_init(prior_prob=0.01)
-        if getattr(self, "strip_adapters", None) is not None:
-            for adapter in self.strip_adapters:
-                adapter.reset_zero_residual()
 
     def _apply_fixed_scale(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
         """Apply fixed multi-scale feature balancing when not yet folded into conv weights."""
@@ -139,11 +116,7 @@ class YOLO27Detect(Detect):
     def forward(
         self, x: list[torch.Tensor]
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run orthogonal strip enhancement, fixed feature scaling, and dual-pathway detection head."""
-        strip_adapters = getattr(self, "strip_adapters", None)
-        if strip_adapters is not None:
-            x = [adapter(xi) for adapter, xi in zip(strip_adapters, x)]
-
+        """Run fixed multi-scale feature balancing, dual-pathway heads, and training-only fg_branch."""
         x_bal = self._apply_fixed_scale(x)
 
         preds = self.forward_head(x_bal, **self.one2many)

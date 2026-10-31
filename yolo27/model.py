@@ -18,13 +18,12 @@ from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.torch_utils import initialize_weights, unwrap_model
 
 from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
-from .modules import FabricStripEnhancer, ForegroundAlignmentBranch, YOLO27Detect
+from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
 
 if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([
         YOLO27Detect,
-        FabricStripEnhancer,
         ForegroundAlignmentBranch,
     ])
 
@@ -55,19 +54,29 @@ class YOLO27DetectionModel(DetectionModel):
             self.info()
             LOGGER.info("")
 
+    def load(self, weights: dict | torch.nn.Module, verbose: bool = True):
+        """Override ``BaseModel.load`` to always use function-preserving Net2Wider weight transfer."""
+        donor = (weights.get("ema") or weights.get("model")) if isinstance(weights, dict) else weights
+        if donor is not None:
+            transfer_pretrained_weights(donor, self)
+        return self
+
     def init_criterion(self):
-        """Initialize YOLO27E2ELoss (with Foreground Alignment Supervision) for dual-head models."""
+        """Initialize YOLO27E2ELoss (full dual-head + Foreground Alignment Supervision)."""
         head = self.model[-1]
         if getattr(head, "one2one_cv2", None) is not None:
             return YOLO27E2ELoss(self)
         return YOLO27DetectionLoss(self)
 
     def fuse(self, verbose: bool = True, *args: Any, **kwargs: Any):
-        """Ensure ``YOLO27Detect.fuse()`` runs across all Ultralytics versions and ``end2end`` modes."""
-        super().fuse(verbose=verbose, *args, **kwargs)
+        """Ensure ``YOLO27Detect.fuse()`` runs before printing fused summary across all ``end2end`` modes."""
+        already_fused = self.is_fused()
+        super().fuse(verbose=False, *args, **kwargs)
         head = self.model[-1]
         if isinstance(head, YOLO27Detect) and not head._scale_folded:
             head.fuse()
+        if verbose and not already_fused:
+            self.info(verbose=True)
         return self
 
 
@@ -75,8 +84,8 @@ if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([YOLO27DetectionModel])
 
 
-def _compute_inverse_freq_class_weights(labels: list[dict[str, Any]], nc: int, power: float = 0.15) -> torch.Tensor:
-    """Compute gentle dampened inverse-frequency class weights normalized to mean 1.0."""
+def _compute_inverse_freq_class_weights(labels: list[dict[str, Any]], nc: int, power: float = 0.0) -> torch.Tensor:
+    """Compute optional dampened inverse-frequency class weights normalized to mean 1.0."""
     if power <= 0.0 or not labels:
         return torch.ones(nc, dtype=torch.float32)
     cls_list = [lb["cls"].reshape(-1) for lb in labels if "cls" in lb and len(lb["cls"]) > 0]
@@ -99,22 +108,20 @@ def _compute_inverse_freq_class_weights(labels: list[dict[str, Any]], nc: int, p
 class YOLO27Trainer(DetectionTrainer):
     """YOLO27 trainer calibrated to strictly outperform pure ``yolo26n`` on custom fabric datasets.
 
-    Core principles:
-      1. Zero-Error Pretrained Warm-Start: transfers 89%–92% of ``yolo26n.pt`` via function-preserving
-         Net2Wider slicing (``0.000000`` step-0 feature & box error across all scales!), searching
-         cwd/parent/sibling folders and Range-GET downloading automatically.
-      2. Calibrated Multi-Class Optimizer: defaults to Ultralytics ``optimizer='auto'``
-         (``AdamW(lr0=0.000435, momentum=0.9, warmup_bias_lr=0.0)`` for ``nc=19``) + ``cos_lr=True``
-         instead of over-stepping pretrained representations with ``lr0=0.0015``.
-      3. Apples-to-Apples Dataset Protocol: uses ``train`` & ``val`` by default (matching pure ``yolo26n``
-         and avoiding 50% empty-image recall dilution); pass ``use_normal=True`` / ``--use-normal`` to
-         explicitly append ``normaltrain`` / ``normalval``.
+    Core guarantees:
+      1. Intercepts explicit ``pretrained='path/to/yolo26n.pt'`` AND ``pretrained=True`` cleanly via
+         function-preserving Net2Wider transfer (never hijacked by ``BaseModel.load`` ``intersect_dicts``).
+      2. Validates and saves ``best.pt`` using YOLO27's default high-accuracy ``one2many + NMS`` head
+         while simultaneously training the ``one2one`` head for optional ``nms=False`` export.
+      3. Matches ``YOLO('yolo26n.yaml')``'s exact optimizer & linear LR schedule (``optimizer='auto'``,
+         ``cos_lr=False``, ``close_mosaic=10``) so late-epoch localization retains full step size.
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         overrides = dict(overrides or {})
-        self._cls_pw = float(overrides.pop("cls_pw", 0.15))
+        self._cls_pw = float(overrides.pop("cls_pw", 0.0))
         self._use_normal = bool(overrides.pop("use_normal", False))
+        self._donor_weights_path: str | None = overrides.pop("_donor_weights_path", None)
 
         opt_choice = str(overrides.get("optimizer", "auto"))
         overrides.setdefault("optimizer", opt_choice)
@@ -128,16 +135,15 @@ class YOLO27Trainer(DetectionTrainer):
             overrides.setdefault("lrf", 0.05)
             overrides.setdefault("warmup_bias_lr", 0.0)
 
-        overrides.setdefault("cos_lr", True)
+        # Match Ultralytics default linear LR & 10-epoch close_mosaic so late-epoch box refinement is never starved
+        overrides.setdefault("cos_lr", False)
         overrides.setdefault("warmup_epochs", 3.0)
+        overrides.setdefault("close_mosaic", 10)
 
-        # Match yolo26n.pt pretrained loss balance
         overrides.setdefault("box", 7.5)
         overrides.setdefault("cls", 0.5)
         overrides.setdefault("dfl", 1.5)
 
-        # Clean fabric augmentation: preserve warp/weft angles (no flipud/degrees/shear/copy_paste artifacts)
-        overrides.setdefault("erasing", 0.1)
         overrides.setdefault("degrees", 0.0)
         overrides.setdefault("shear", 0.0)
         overrides.setdefault("flipud", 0.0)
@@ -145,7 +151,6 @@ class YOLO27Trainer(DetectionTrainer):
         overrides.setdefault("scale", 0.5)
         overrides.setdefault("mosaic", 1.0)
         overrides.setdefault("copy_paste", 0.0)
-        overrides.setdefault("close_mosaic", 15)
         if hasattr(DEFAULT_CFG, "cls_pw"):
             overrides["cls_pw"] = self._cls_pw
 
@@ -191,7 +196,7 @@ class YOLO27Trainer(DetectionTrainer):
         return model
 
     def get_validator(self):
-        """Build YOLO27Validator, preserve 4-column ``fg_loss`` header, and apply ``class_weights``."""
+        """Build validator, preserve 4-column ``fg_loss`` header, and apply optional ``class_weights``."""
         m_unwrapped = unwrap_model(self.model)
         if getattr(m_unwrapped, "class_weights", None) is None and self._cls_pw > 0.0:
             ds = getattr(getattr(self, "train_loader", None), "dataset", None)
@@ -225,16 +230,24 @@ class YOLO27Trainer(DetectionTrainer):
         weights: torch.nn.Module | None = None,
         verbose: bool = True,
     ) -> YOLO27DetectionModel:
-        """Build ``YOLO27DetectionModel`` and apply function-preserving Net2Wider ``yolo26n.pt`` warm-start."""
+        """Build ``YOLO27DetectionModel`` and apply function-preserving Net2Wider warm-start."""
         model = self.set_model_names_for_load(
             YOLO27DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         )
-        if weights is not None:
+        extra_dirs = [self.data.get("path", ""), str(self.data.get("train", ""))]
+
+        if self._donor_weights_path is not None and not self.resume:
+            donor_path = resolve_donor_checkpoint(self._donor_weights_path, allow_download=True, extra_dirs=extra_dirs)
+            if donor_path is not None:
+                ckpt, _ = torch_safe_load(str(donor_path))
+                donor_model = ckpt.get("ema") or ckpt.get("model")
+                if donor_model is not None:
+                    transfer_pretrained_weights(donor_model, model)
+        elif weights is not None:
             transfer_pretrained_weights(weights, model)
         elif self.args.pretrained and not self.resume:
             scale = model.yaml.get("scale", "n") if isinstance(getattr(model, "yaml", None), dict) else "n"
             donor_name = "yolo26s.pt" if scale == "s" else "yolo26n.pt"
-            extra_dirs = [self.data.get("path", ""), str(self.data.get("train", ""))]
             donor_path = resolve_donor_checkpoint(donor_name, allow_download=True, extra_dirs=extra_dirs)
             if donor_path is not None:
                 ckpt, _ = torch_safe_load(str(donor_path))
@@ -293,6 +306,15 @@ class YOLO27(YOLO):
         }
         return base_map
 
+    def train(self, trainer=None, **kwargs: Any):
+        """Train model, intercepting ``pretrained='path.pt'`` so Net2Wider runs cleanly without Model.load hijack."""
+        train_kwargs = dict(kwargs)
+        pt_arg = train_kwargs.get("pretrained", None)
+        if isinstance(pt_arg, (str, Path)) and str(self.overrides.get("model", "")).endswith((".yaml", ".yml")):
+            train_kwargs["_donor_weights_path"] = str(pt_arg)
+            train_kwargs["pretrained"] = False
+        return super().train(trainer=trainer, **train_kwargs)
+
     def val(self, validator=None, **kwargs: Any):
         """Validate model, supporting ``nms=True/False`` and optional ``use_normal=True``."""
         use_normal = bool(kwargs.pop("use_normal", False))
@@ -307,7 +329,7 @@ class YOLO27(YOLO):
         return super().val(validator=validator, **norm_kwargs)
 
     def predict(self, source=None, stream: bool = False, predictor=None, **kwargs: Any):
-        """Run inference, supporting ``nms=True`` (one2many+NMS) and ``nms=False`` (one2one) across versions."""
+        """Run inference, supporting ``nms=True`` (default one2many+NMS) and ``nms=False`` (one2one)."""
         return super().predict(
             source=source,
             stream=stream,
@@ -316,5 +338,5 @@ class YOLO27(YOLO):
         )
 
     def export(self, **kwargs: Any) -> str:
-        """Export model, supporting ``nms=True`` (one2many) and ``nms=False`` (end-to-end one2one) across versions."""
+        """Export model, supporting ``nms=True`` (one2many) and ``nms=False`` (end-to-end one2one)."""
         return super().export(**_translate_nms_kwarg(kwargs, for_export=True))

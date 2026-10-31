@@ -250,7 +250,10 @@ def _compensate_head_scale_factors(donor_obj: Any, target: nn.Module) -> None:
 @torch.no_grad()
 def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], target: nn.Module) -> dict[str, float]:
     """Transfer exact and function-preserving Net2Wider pretrained weights from ``donor`` into ``target``."""
-    donor_obj = donor["model"] if isinstance(donor, dict) and isinstance(donor.get("model"), nn.Module) else donor
+    if isinstance(donor, dict) and (isinstance(donor.get("ema"), nn.Module) or isinstance(donor.get("model"), nn.Module)):
+        donor_obj: Any = donor.get("ema") or donor.get("model")
+    else:
+        donor_obj = donor
     donor_sd = donor_obj if isinstance(donor_obj, dict) else donor_obj.float().state_dict()
     target_sd = target.state_dict()
     target_mods = getattr(target, "model", None)

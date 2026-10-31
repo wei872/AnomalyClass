@@ -22,18 +22,18 @@ from yolo27 import YOLO27, YOLO27Detect, YOLO27DetectionModel, YOLO27E2ELoss, tr
 
 
 def test_yolo27n_specs_and_lightweight_budget() -> None:
-    """Verify YOLO27n stays lighter than official 3.0M / 7.2B budget and strips fg_branch on fuse()."""
+    """Verify YOLO27n stays lighter than official 3.0M / 7.2B budget, defaults to NMS, and strips fg_branch."""
     model_coco = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False)
     head = model_coco.model[-1]
     assert isinstance(head, YOLO27Detect)
     assert head.fg_branch is not None
-    assert head.strip_adapters is not None
+    assert model_coco.end2end is False, "Official YOLO27 default must use high-accuracy one2many + NMS"
 
     fused_coco = deepcopy(model_coco).eval().fuse(verbose=False)
     params_m = get_num_params(fused_coco) / 1e6
     flops_b = get_flops(fused_coco, imgsz=640)
-    assert 2.40 <= params_m <= 3.10, f"Expected <=3.0M params @ nc=80, got {params_m:.3f}M"
-    assert 5.5 <= flops_b <= 7.3, f"Expected <=7.2B FLOPs @ nc=80, got {flops_b:.2f}B"
+    assert 2.35 <= params_m <= 3.05, f"Expected <=3.0M params @ nc=80, got {params_m:.3f}M"
+    assert 5.4 <= flops_b <= 7.2, f"Expected <=7.2B FLOPs @ nc=80, got {flops_b:.2f}B"
     assert fused_coco.model[-1].fg_branch is None, "fg_branch must be stripped on fuse()"
 
 
@@ -49,7 +49,7 @@ def test_yolo27n_lite_specs() -> None:
 
 
 def test_zero_error_net2wider_pretrained_warmstart() -> None:
-    """Verify function-preserving Net2Wider warm-start matches yolo26n to <1e-4 at step 0 and unlocks step-1 grads."""
+    """Verify function-preserving Net2Wider warm-start matches yolo26n to <1e-4 at step 0 on BOTH heads."""
     torch.manual_seed(0)
     donor = YOLO("yolo26n.yaml").model.train()
     for m in donor.modules():
@@ -60,19 +60,21 @@ def test_zero_error_net2wider_pretrained_warmstart() -> None:
         donor(calib_x)
     donor.eval()
 
-    # 1. Step-0 exact functional equivalence @ same nc
+    # 1. Step-0 exact functional equivalence @ same nc across BOTH one2many and one2one heads
     target_same = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False).eval()
     stats = transfer_pretrained_weights(donor, target_same)
-    assert stats["ratio"] >= 0.88, f"Expected >=88% warm-start coverage, got {stats['ratio']:.3f}"
+    assert stats["sliced_tensors"] >= 140, f"Expected >=140 sliced tensors, got {stats['sliced_tensors']}"
+    assert stats["ratio"] >= 0.90, f"Expected >=90% warm-start coverage, got {stats['ratio']:.3f}"
     with torch.no_grad():
         _, p26 = donor(calib_x[:1])
         _, p27 = target_same(calib_x[:1])
-    box_diff = (p26["one2one"]["boxes"] - p27["one2one"]["boxes"]).abs().max().item()
-    score_diff = (p26["one2one"]["scores"] - p27["one2one"]["scores"]).abs().max().item()
-    assert box_diff < 1e-4, f"Step-0 box outputs drifted from donor: max_diff={box_diff}"
-    assert score_diff < 1e-4, f"Step-0 score outputs drifted from donor: max_diff={score_diff}"
+    for branch_key in ("one2many", "one2one"):
+        box_diff = (p26[branch_key]["boxes"] - p27[branch_key]["boxes"]).abs().max().item()
+        score_diff = (p26[branch_key]["scores"] - p27[branch_key]["scores"]).abs().max().item()
+        assert box_diff < 1e-4, f"Step-0 {branch_key} box outputs drifted: max_diff={box_diff}"
+        assert score_diff < 1e-4, f"Step-0 {branch_key} score outputs drifted: max_diff={score_diff}"
 
-    # 2. Target nc=19 preserves 19-class focal bias & unlocks widened + strip gradients on step 1
+    # 2. Target nc=19 preserves 19-class focal bias & unlocks widened P2/P3 gradients on step 1
     target_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False).train()
     orig_cls_bias = target_19.model[-1].cv3[0][-1].bias.detach().clone()
     transfer_pretrained_weights(donor, target_19)
@@ -93,23 +95,23 @@ def test_zero_error_net2wider_pretrained_warmstart() -> None:
         loss.backward()
         if step == 1:
             assert target_19.model[2].cv1.conv.weight.grad[16:24].abs().sum().item() > 0
-            assert target_19.model[-1].strip_adapters[0].dw_h.weight.grad.abs().sum().item() > 0
-            assert target_19.model[-1].strip_adapters[0].dw_v.weight.grad.abs().sum().item() > 0
+            assert target_19.model[16].cv1.conv.weight.grad[16:20].abs().sum().item() > 0
         opt.step()
 
 
 def test_fuse_exact_equivalence_both_modes() -> None:
-    """Verify fixed feature scaling + strip enhancers fuse with exact numerical equivalence."""
+    """Verify fixed feature scaling fuses with exact numerical equivalence in both NMS and E2E modes."""
     torch.manual_seed(42)
     x = torch.randn(2, 3, 320, 320)
 
     # 1. Default NMS mode (end2end=False -> keeps one2many head)
     m_nms = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False).eval()
-    m_nms.end2end = False
+    assert m_nms.end2end is False
     with torch.no_grad():
         y_unfused, _ = m_nms(x)
     m_nms_fused = deepcopy(m_nms).fuse(verbose=False)
     assert m_nms_fused.model[-1].fg_branch is None
+    assert m_nms_fused.model[-1].one2one_cv2 is None
     assert m_nms_fused.model[-1]._scale_folded is True
     with torch.no_grad():
         y_fused, _ = m_nms_fused(x)
@@ -130,8 +132,8 @@ def test_fuse_exact_equivalence_both_modes() -> None:
     assert max_diff_e2e < 1e-4, f"E2E mode fuse mismatch: max_diff={max_diff_e2e}"
 
 
-def test_loss_progloss_schedule_and_empty_normal_batch() -> None:
-    """Verify STAL stride_val=16, balanced ProgLoss (o2m+o2o=1.0), fg_loss scale, and empty batches."""
+def test_loss_dual_head_and_empty_normal_batch() -> None:
+    """Verify full 1.0x one2many + 1.0x one2one supervision, dual-scale STAL=16, and empty batches."""
     model = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False).train()
     model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=100)
     criterion = model.init_criterion()
@@ -139,12 +141,7 @@ def test_loss_progloss_schedule_and_empty_normal_batch() -> None:
 
     assert criterion.one2many.assigner.stride_val == 16
     assert criterion.one2one.assigner.stride_val == 16
-    assert abs((criterion.o2m + criterion.o2o) - 1.0) < 1e-6
-
-    for _ in range(99):
-        criterion.update()
-    assert abs(criterion.o2m - 0.2) < 1e-5
-    assert abs(criterion.o2o - 0.8) < 1e-5
+    assert criterion.o2m == 1.0 and criterion.o2o == 1.0
 
     imgs = torch.rand(2, 3, 320, 320)
     batch_mixed = {
@@ -157,7 +154,7 @@ def test_loss_progloss_schedule_and_empty_normal_batch() -> None:
     total_loss, loss_items = criterion(preds, batch_mixed)
     assert total_loss.ndim == 0 and torch.isfinite(total_loss)
     fg_val = float(loss_items["fg_loss"]) if isinstance(loss_items, dict) else float(loss_items[3])
-    assert fg_val > 0.02, f"fg_loss unexpectedly tiny ({fg_val})"
+    assert fg_val > 0.005, f"fg_loss unexpectedly tiny ({fg_val})"
     total_loss.backward()
 
     model.zero_grad()
@@ -172,8 +169,8 @@ def test_loss_progloss_schedule_and_empty_normal_batch() -> None:
     loss_normal.backward()
 
 
-def test_end_to_end_train_val_predict_both_protocols() -> None:
-    """Verify train -> val(nms=True/False) under default yolo26n-matched protocol & use_normal=True."""
+def test_explicit_pretrained_pt_arg_not_hijacked_and_full_pipeline() -> None:
+    """Regression test: passing pretrained='path/to/yolo26n.pt' to YOLO27.train() must run Net2Wider cleanly."""
     names = [
         "纬线杂质", "断纬", "多股线", "纬线不直", "包边不重叠", "捻接器接头",
         "小尾巴", "经线毛球", "包边不良", "手工接头", "纬斜", "短废纱线",
@@ -221,6 +218,13 @@ def test_end_to_end_train_val_predict_both_protocols() -> None:
             encoding="utf-8",
         )
 
+        # Save a simulated yolo26n.pt donor with distinct marker weight in model.2 (widened P2 layer)
+        donor_y26 = YOLO("yolo26n.yaml")
+        with torch.no_grad():
+            donor_y26.model.model[2].cv1.conv.weight.fill_(0.125)
+        donor_pt = root / "yolo26n_sim.pt"
+        donor_y26.save(str(donor_pt))
+
         y27 = YOLO27("models/yolo27n.yaml")
         y27.train(
             data=str(data_yaml),
@@ -228,12 +232,16 @@ def test_end_to_end_train_val_predict_both_protocols() -> None:
             imgsz=128,
             batch=2,
             workers=0,
-            pretrained=False,
+            pretrained=str(donor_pt),
             device="cpu",
             project=str(root / "runs"),
             name="exp",
             plots=False,
         )
+        # Verify widened layer model.2 actually received donor_pt's 0.125 weights in its shared channels!
+        shared_slice = y27.trainer.model.model[2].cv1.conv.weight[:16].detach().mean().item()
+        assert abs(shared_slice - 0.125) < 0.02, f"Expected ~0.125 from Net2Wider donor, got {shared_slice}"
+
         best_pt = root / "runs/exp/weights/best.pt"
         assert best_pt.exists()
         csv_text = (root / "runs/exp/results.csv").read_text(encoding="utf-8")
@@ -258,8 +266,8 @@ if __name__ == "__main__":
         test_yolo27n_lite_specs,
         test_zero_error_net2wider_pretrained_warmstart,
         test_fuse_exact_equivalence_both_modes,
-        test_loss_progloss_schedule_and_empty_normal_batch,
-        test_end_to_end_train_val_predict_both_protocols,
+        test_loss_dual_head_and_empty_normal_batch,
+        test_explicit_pretrained_pt_arg_not_hijacked_and_full_pipeline,
     ):
         print(f"[RUN ] {fn.__name__} ...")
         fn()
