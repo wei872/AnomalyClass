@@ -1,17 +1,4 @@
-"""YOLO27n training criterion with Foreground Alignment Supervision.
-
-Implements:
-  - Progressive Loss Balancing (one-to-many -> one-to-one curriculum schedule),
-  - Small-Target-Aware Label Assignment (STAL via Ultralytics TaskAlignedAssigner),
-  - DFL-free CIoU + normalized L1 bounding-box regression loss (reg_max=1),
-  - Foreground Alignment Supervision (YOLO27 N/S key improvement):
-      1) Supervises the auxiliary ``ForegroundAlignmentBranch`` at every anchor
-         location to sharply distinguish foreground objects from background texture
-         (including pure normal defect-free fabric images).
-      2) Aligns the one-to-one head's foreground confidence with the IoU-calibrated
-         foreground target & auxiliary foreground probability, narrowing the
-         one-to-many vs. one-to-one mAP gap at zero inference cost.
-"""
+"""YOLO27n training criterion with Foreground Alignment Supervision."""
 
 from __future__ import annotations
 
@@ -37,6 +24,11 @@ class YOLO27E2ELoss(E2ELoss):
         self.fg_gain = fg_gain
         self.o2o_align_gain = o2o_align_gain
         self.vfl = VarifocalLoss(gamma=2.0, alpha=0.75)
+
+        # 让进度条 / logger 知道多了 fg_loss 这一项
+        base_names = list(getattr(self, "loss_names", ["box_loss", "cls_loss", "dfl_loss"]))
+        if "fg_loss" not in base_names:
+            self.loss_names = base_names + ["fg_loss"]
 
     def _compute_iou_quality(
         self,
@@ -87,10 +79,9 @@ class YOLO27E2ELoss(E2ELoss):
             stride_tensor,
         )
 
-        # 1. Auxiliary Foreground Branch supervision:
-        #    - Sharp peak target at 1-to-1 anchor, soft IoU support on 1-to-many neighbors, 0 on background.
+        # 1. 辅助前景分支监督
         fg_pred = fg_logits.squeeze(1)  # (B, A)
-        fg_pos_mask = (fg_mask_o2m | fg_mask_o2o).float()
+        fg_pos_mask = (fg_mask_o2m.bool() | fg_mask_o2o.bool()).float()
         fg_target = torch.maximum(q_o2o, 0.5 * q_o2m).detach()
         fg_norm = fg_target.sum().clamp(min=1.0)
         loss_fg_branch = (
@@ -102,15 +93,12 @@ class YOLO27E2ELoss(E2ELoss):
             / fg_norm
         )
 
-        # 2. One-to-One Foreground Consistency Alignment:
-        #    Since sigmoid is strictly monotonic, max_c(logit_c) is the exact logit of max_c(sigmoid(logit_c)).
-        #    Aligns one2one's foreground peak at fg_mask_o2o with the auxiliary foreground branch while
-        #    strictly suppressing non-selected duplicate/background anchors for NMS-free deployment.
+        # 2. one-to-one 前景一致性对齐
         o2o_fg_logit = o2o_scores.amax(dim=1)  # (B, A)
         fg_prob_detached = fg_pred.detach().sigmoid()
-        o2o_pos_mask = fg_mask_o2o.float()
+        o2o_pos_mask = fg_mask_o2o.bool().float()
         o2o_fg_target = torch.where(
-            fg_mask_o2o,
+            fg_mask_o2o.bool(),
             0.5 * q_o2o + 0.5 * fg_prob_detached,
             torch.zeros_like(q_o2o),
         ).detach()
@@ -126,7 +114,7 @@ class YOLO27E2ELoss(E2ELoss):
 
         return loss_fg_branch + self.o2o_align_gain * loss_o2o_align
 
-    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute total progressive dual-head loss + foreground alignment supervision loss."""
         parsed = self.one2many.parse_output(preds)
         one2many = parsed["one2many"]
@@ -141,9 +129,10 @@ class YOLO27E2ELoss(E2ELoss):
         fg_loss = self._foreground_alignment_loss(fg_logits, one2one, o2m_assign, o2o_assign)
         fg_loss_scaled = fg_loss * self.fg_gain * bs
 
-        total_loss = torch.cat([det_loss, fg_loss_scaled.view(1)])
-        loss_items = {
-            **loss_items_o2o,
-            "fg_loss": (fg_loss.detach() * self.fg_gain),
-        }
+        # total_loss 必须是标量，trainer 里会做 loss.backward()
+        total_loss = det_loss.sum() + fg_loss_scaled.sum()
+
+        # loss_items_o2o 是 Tensor（[box_loss, cls_loss, dfl_loss]），不能 ** 展开成 dict
+        fg_item = (fg_loss.detach() * self.fg_gain).flatten().to(loss_items_o2o.dtype)
+        loss_items = torch.cat([loss_items_o2o.detach().flatten(), fg_item])
         return total_loss, loss_items

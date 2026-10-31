@@ -103,6 +103,21 @@ class YOLO27Trainer(DetectionTrainer):
                 LOGGER.info(f"YOLO27Trainer: attached defect-free background directory '{normal_key}' -> {normal_dir}")
         return data
 
+    def set_model_names_for_load(self, model: YOLO27DetectionModel) -> YOLO27DetectionModel:
+        """Align model class names with dataset names before optional weight loading.
+
+        This hook exists so that when ``model.load(weights)`` is called, the model's
+        detection head ``names`` already matches the dataset YAML, which avoids
+        class-name mismatch warnings / head re-initialization surprises.
+        """
+        names = self.data.get("names")
+        if names is not None and hasattr(model, "names"):
+            try:
+                model.names = names
+            except Exception as e:  # pragma: no cover - defensive
+                LOGGER.warning(f"YOLO27Trainer: failed to set model names before load: {e}")
+        return model
+
     def get_model(
         self,
         cfg: str | dict | None = None,

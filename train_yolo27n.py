@@ -100,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use NMS-free one-to-one head (nms=False) for inference/validation/export",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Dataloader worker processes (Windows 建议 0 或 4)",
+    )
     return parser.parse_args()
 
 
@@ -119,6 +125,7 @@ def main() -> None:
             batch=args.batch,
             imgsz=args.imgsz,
             optimizer=args.optimizer,
+            workers=args.workers,  # 新增
             close_mosaic=10,
             mosaic=1.0,
             copy_paste=0.1,
@@ -129,7 +136,7 @@ def main() -> None:
         model.train(**train_kwargs)
 
     elif args.mode == "val":
-        val_kwargs = dict(data=args.data, imgsz=args.imgsz, batch=args.batch, nms=nms_flag)
+        val_kwargs = dict(data=args.data, imgsz=args.imgsz, batch=args.batch, nms=nms_flag, workers=args.workers)
         if args.device:
             val_kwargs["device"] = args.device
         model.val(**val_kwargs)
@@ -137,7 +144,7 @@ def main() -> None:
     elif args.mode == "predict":
         if not args.source:
             raise ValueError("--source is required when --mode predict")
-        pred_kwargs = dict(source=args.source, imgsz=args.imgsz, nms=nms_flag, save=True)
+        pred_kwargs = dict(source=args.source, imgsz=args.imgsz, nms=nms_flag, save=True, workers=args.workers)
         if args.device:
             pred_kwargs["device"] = args.device
         model.predict(**pred_kwargs)
