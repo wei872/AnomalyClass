@@ -29,7 +29,7 @@ def test_yolo27n_official_specs_and_dual_scale() -> None:
     assert head.stride.tolist() == [8.0, 32.0], f"Expected strides [8.0, 32.0], got {head.stride.tolist()}"
     assert head.fg_branch is not None, "Training model must carry ForegroundAlignmentBranch"
 
-    fused_coco = deepcopy(model_coco).eval().fuse(verbose=False, imgsz=640)
+    fused_coco = deepcopy(model_coco).eval().fuse(verbose=False)
     params_m = get_num_params(fused_coco) / 1e6
     flops_b = get_flops(fused_coco, imgsz=640)
     assert 2.85 <= params_m <= 3.15, f"Expected ~3.0M params @ nc=80, got {params_m:.3f}M"
@@ -40,7 +40,7 @@ def test_yolo27n_official_specs_and_dual_scale() -> None:
 def test_yolo27n_lite_specs() -> None:
     """Verify YOLO27n-Lite ultra-lightweight variant builds and fuses cleanly (< 1.0M params, ~3.0 GFLOPs @ nc=19)."""
     model_lite = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False)
-    fused_lite = deepcopy(model_lite).eval().fuse(verbose=False, imgsz=640)
+    fused_lite = deepcopy(model_lite).eval().fuse(verbose=False)
     params_m = get_num_params(fused_lite) / 1e6
     flops_b = get_flops(fused_lite, imgsz=640)
     assert params_m < 1.0, f"Expected <1.0M params for YOLO27n-Lite, got {params_m:.3f}M"
@@ -71,7 +71,7 @@ def test_fuse_exact_equivalence_both_modes() -> None:
     m_nms.end2end = False
     with torch.no_grad():
         y_unfused, _ = m_nms(x)
-    m_nms_fused = deepcopy(m_nms).fuse(verbose=False, imgsz=320)
+    m_nms_fused = deepcopy(m_nms).fuse(verbose=False)
     assert m_nms_fused.model[-1].fg_branch is None
     assert m_nms_fused.model[-1]._scale_folded is True
     with torch.no_grad():
@@ -84,7 +84,7 @@ def test_fuse_exact_equivalence_both_modes() -> None:
     m_e2e.end2end = True
     with torch.no_grad():
         y_e2e_unfused, _ = m_e2e(x)
-    m_e2e_fused = deepcopy(m_e2e).fuse(verbose=False, imgsz=320)
+    m_e2e_fused = deepcopy(m_e2e).fuse(verbose=False)
     assert m_e2e_fused.model[-1].fg_branch is None
     assert m_e2e_fused.model[-1].cv2 is None
     with torch.no_grad():
@@ -129,8 +129,12 @@ def test_loss_convergence_fixes_and_empty_normal_batch() -> None:
     assert total_loss.ndim == 0 and torch.isfinite(total_loss)
     if isinstance(loss_items, dict):
         assert "fg_loss" in loss_items
+        fg_val = float(loss_items["fg_loss"])
     else:
         assert loss_items.numel() == 4
+        fg_val = float(loss_items[3])
+    # Ensure fg_loss is O(0.1~2.0), NOT attenuated 6800x to ~1e-4 by VarifocalLoss.mean(1)
+    assert fg_val > 0.05, f"fg_loss unexpectedly tiny ({fg_val}), check anchor normalization"
     total_loss.backward()
 
     head = model.model[-1]
@@ -216,11 +220,21 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
         )
         best_pt = root / "runs/exp/weights/best.pt"
         assert best_pt.exists(), "Expected best.pt checkpoint to be saved"
+        csv_text = (root / "runs/exp/results.csv").read_text(encoding="utf-8")
+        assert "train/fg_loss" in csv_text and "val/fg_loss" in csv_text, f"Missing fg_loss in CSV: {csv_text}"
 
-        loaded = YOLO27(best_pt)
+        # Validate both NMS (one2many) and E2E (one2one) pathways from saved best.pt
+        m_val_nms = YOLO27(best_pt)
+        m_val_nms.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=True, plots=False)
+        assert m_val_nms.model.end2end is False
+
+        m_val_e2e = YOLO27(best_pt)
+        m_val_e2e.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=False, plots=False)
+        assert m_val_e2e.model.end2end is True
+
         sample_img = str(root / "images/val/def_0.jpg")
-        res_nms = loaded.predict(sample_img, imgsz=128, nms=True, verbose=False)
-        res_e2e = loaded.predict(sample_img, imgsz=128, nms=False, verbose=False)
+        res_nms = YOLO27(best_pt).predict(sample_img, imgsz=128, nms=True, verbose=False)
+        res_e2e = YOLO27(best_pt).predict(sample_img, imgsz=128, nms=False, verbose=False)
         assert len(res_nms) == 1 and len(res_e2e) == 1
 
 

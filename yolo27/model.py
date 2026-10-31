@@ -5,18 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ultralytics.models import yolo
-from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.modules.head import Detect
 from ultralytics.nn.tasks import DetectionModel, torch_safe_load
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
-from ultralytics.utils.loss import v8DetectionLoss
-from ultralytics.utils.torch_utils import initialize_weights
+from ultralytics.utils.torch_utils import initialize_weights, unwrap_model
 
-from .loss import YOLO27E2ELoss
+from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
 
@@ -60,11 +60,40 @@ class YOLO27DetectionModel(DetectionModel):
         head = self.model[-1]
         if getattr(head, "one2one_cv2", None) is not None:
             return YOLO27E2ELoss(self)
-        return v8DetectionLoss(self)
+        return YOLO27DetectionLoss(self)
+
+    def fuse(self, verbose: bool = True, *args: Any, **kwargs: Any):
+        """Ensure ``YOLO27Detect.fuse()`` runs even when ``end2end=False`` on Ultralytics <= 8.4.33."""
+        super().fuse(verbose=verbose, *args, **kwargs)
+        head = self.model[-1]
+        if isinstance(head, YOLO27Detect) and not head._scale_folded:
+            head.fuse()
+        return self
 
 
 if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([YOLO27DetectionModel])
+
+
+def _compute_inverse_freq_class_weights(labels: list[dict[str, Any]], nc: int, power: float = 0.25) -> torch.Tensor:
+    """Compute dampened inverse-frequency class weights normalized to mean 1.0 for long-tail classes."""
+    if power <= 0.0 or not labels:
+        return torch.ones(nc, dtype=torch.float32)
+    cls_list = [lb["cls"].reshape(-1) for lb in labels if "cls" in lb and len(lb["cls"]) > 0]
+    if not cls_list:
+        return torch.ones(nc, dtype=torch.float32)
+    all_cls = np.concatenate(cls_list, axis=0).astype(np.int64)
+    counts = np.bincount(all_cls[all_cls < nc], minlength=nc).astype(np.float64)
+    present = counts > 0
+    if not np.any(present):
+        return torch.ones(nc, dtype=torch.float32)
+    weights = np.ones(nc, dtype=np.float64)
+    raw = (1.0 / np.where(present, counts, 1.0)) ** power
+    mean_present = float(raw[present].mean())
+    weights[present] = raw[present]
+    weights[~present] = mean_present
+    weights /= float(weights.mean())
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 class YOLO27Trainer(DetectionTrainer):
@@ -72,18 +101,19 @@ class YOLO27Trainer(DetectionTrainer):
 
     Convergence optimizations enabled by default:
       1. Smart Pretrained Warm-Start: automatically transfers exact + channel-sliced weights
-         from ``yolo26n.pt`` (or ``yolo26s.pt``) into widened YOLO27n layers (~75%–84% params).
+         from ``yolo26n.pt`` (or ``yolo26s.pt``) into widened YOLO27n layers (~79%–88% params).
       2. Stable Optimizer & Warmup: uses ``AdamW`` (``lr0=0.0015``, ``cos_lr=True``) and locks
          ``warmup_bias_lr=0.0`` so negative focal biases never blow up in early epochs.
       3. DFL-free L1 Box Gain Calibration: sets ``dfl=6.0`` (matching Ultralytics YOLO26/27
          ``reg_max=1`` recipe) instead of legacy ``1.5`` to accelerate tight IoU convergence.
-      4. Small-Defect Safe Augmentation: sets ``erasing=0.0`` (prevents random erasing from
-         wiping out tiny defects while keeping labels), ``flipud=0.5``, ``scale=0.35``,
-         and ``close_mosaic=20``.
+      4. Long-Tail Class Balancing & Small-Defect Safe Augmentation: applies dampened inverse
+         frequency ``class_weights`` (``power=0.25`` across Ultralytics 8.4.33+ and 8.4.194+),
+         ``erasing=0.0``, ``flipud=0.5``, ``scale=0.35``, and ``close_mosaic=30``.
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         overrides = dict(overrides or {})
+        self._cls_pw = float(overrides.pop("cls_pw", 0.25))
 
         opt_choice = str(overrides.get("optimizer", "AdamW"))
         overrides.setdefault("optimizer", opt_choice)
@@ -104,15 +134,17 @@ class YOLO27Trainer(DetectionTrainer):
         overrides.setdefault("cls", 0.5)
         overrides.setdefault("dfl", 6.0)
 
-        # Fabric-defect friendly data augmentation (do NOT erase tiny defects!)
+        # Fabric-defect friendly data augmentation (do NOT erase tiny defects or distort weft-skew angle!)
         overrides.setdefault("erasing", 0.0)
+        overrides.setdefault("degrees", 0.0)
+        overrides.setdefault("shear", 0.0)
         overrides.setdefault("flipud", 0.5)
         overrides.setdefault("fliplr", 0.5)
         overrides.setdefault("scale", 0.35)
         overrides.setdefault("mosaic", 1.0)
-        overrides.setdefault("close_mosaic", 20)
+        overrides.setdefault("close_mosaic", 30)
         if hasattr(DEFAULT_CFG, "cls_pw"):
-            overrides.setdefault("cls_pw", 0.25)
+            overrides["cls_pw"] = self._cls_pw
 
         super().__init__(cfg, overrides, _callbacks)
 
@@ -153,11 +185,32 @@ class YOLO27Trainer(DetectionTrainer):
                 LOGGER.warning(f"YOLO27Trainer: failed to set model names before load: {e}")
         return model
 
+    def get_validator(self):
+        """Build YOLO27Validator, attach ``fg_loss`` column name, and apply long-tail ``class_weights``."""
+        m_unwrapped = unwrap_model(self.model)
+        if getattr(m_unwrapped, "class_weights", None) is None and self._cls_pw > 0.0:
+            ds = getattr(getattr(self, "train_loader", None), "dataset", None)
+            label_list = getattr(ds, "labels", None)
+            if label_list:
+                cw = _compute_inverse_freq_class_weights(label_list, self.data["nc"], power=self._cls_pw)
+                m_unwrapped.class_weights = cw
+                LOGGER.info(
+                    f"YOLO27Trainer: applied inverse-frequency class_weights (power={self._cls_pw}): "
+                    f"{cw.numpy().round(3)}"
+                )
+
+        super().get_validator()
+        if getattr(self, "loss_names", None) and len(self.loss_names) == 3:
+            self.loss_names = (*self.loss_names, "fg_loss")
+        from copy import copy
+
+        return YOLO27Validator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+
     def set_model_attributes(self) -> None:
-        """Attach dataset metadata and align ``loss_names`` across older and newer Ultralytics versions."""
+        """Attach dataset metadata and ``fg_loss`` column name."""
         super().set_model_attributes()
-        # Older Ultralytics versions pre-populate self.loss_names = ('box_loss', 'cls_loss', 'dfl_loss') here;
-        # append 'fg_loss' when pre-populated so 4-item Tensor loss_items matches validator & CSV columns.
         if getattr(self, "loss_names", None) and len(self.loss_names) == 3:
             self.loss_names = (*self.loss_names, "fg_loss")
 
@@ -185,6 +238,34 @@ class YOLO27Trainer(DetectionTrainer):
         return model
 
 
+class YOLO27Validator(DetectionValidator):
+    """DetectionValidator that also attaches ``normalval`` / ``normaltrain`` during standalone ``val()``."""
+
+    def get_dataloader(self, dataset_path: Any, batch_size: int):
+        if isinstance(self.data, dict):
+            normal_key = "normalval" if getattr(self.args, "split", "val") == "val" else "normaltrain"
+            normal_dir = YOLO27Trainer._resolve_optional_dir(self.data, normal_key)
+            if normal_dir is not None:
+                cur_list = list(dataset_path) if isinstance(dataset_path, (list, tuple)) else [dataset_path]
+                if normal_dir not in cur_list:
+                    dataset_path = [*cur_list, normal_dir]
+                    LOGGER.info(
+                        f"YOLO27Validator: attached defect-free background directory '{normal_key}' -> {normal_dir}"
+                    )
+        return super().get_dataloader(dataset_path, batch_size)
+
+
+def _translate_nms_kwarg(kwargs: dict[str, Any], for_export: bool = False) -> dict[str, Any]:
+    """Bridge ``nms=True/False`` and ``end2end=False/True`` across Ultralytics 8.4.33 and 8.4.194+."""
+    out = dict(kwargs)
+    if "nms" in out and hasattr(DEFAULT_CFG, "end2end"):
+        use_nms = bool(out.pop("nms"))
+        out.setdefault("end2end", not use_nms)
+        if for_export:
+            out.setdefault("nms", False)
+    return out
+
+
 class YOLO27(YOLO):
     """Unified Ultralytics-compatible interface for YOLO27n / YOLO27n-Lite / YOLO27s models."""
 
@@ -197,7 +278,24 @@ class YOLO27(YOLO):
         base_map["detect"] = {
             "model": YOLO27DetectionModel,
             "trainer": YOLO27Trainer,
-            "validator": yolo.detect.DetectionValidator,
+            "validator": YOLO27Validator,
             "predictor": yolo.detect.DetectionPredictor,
         }
         return base_map
+
+    def val(self, validator=None, **kwargs: Any):
+        """Validate model, supporting ``nms=True`` (one2many+NMS) and ``nms=False`` (one2one) across versions."""
+        return super().val(validator=validator, **_translate_nms_kwarg(kwargs, for_export=False))
+
+    def predict(self, source=None, stream: bool = False, predictor=None, **kwargs: Any):
+        """Run inference, supporting ``nms=True`` (one2many+NMS) and ``nms=False`` (one2one) across versions."""
+        return super().predict(
+            source=source,
+            stream=stream,
+            predictor=predictor,
+            **_translate_nms_kwarg(kwargs, for_export=False),
+        )
+
+    def export(self, **kwargs: Any) -> str:
+        """Export model, supporting ``nms=True`` (one2many) and ``nms=False`` (end-to-end one2one) across versions."""
+        return super().export(**_translate_nms_kwarg(kwargs, for_export=True))

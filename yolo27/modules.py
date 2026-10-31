@@ -160,8 +160,11 @@ class YOLO27Detect(Detect):
         # 1. Strip training-only Foreground Alignment Supervision branch (zero deployment cost)
         self.fg_branch = None
 
-        # 2. Remove unused one-to-one or one-to-many detection head per super().fuse()
-        super().fuse()
+        # 2. Remove unused one-to-one or one-to-many detection head (compatible with Ultralytics 8.4.33 & 8.4.194+)
+        if self.end2end:
+            self.cv2 = self.cv3 = None
+        else:
+            self.one2one_cv2 = self.one2one_cv3 = None
 
         # 3. Fold fixed dual-scale feature scaling constants into surviving head's first Conv2d weights
         if not self._scale_folded:

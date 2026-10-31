@@ -50,7 +50,7 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
     m26 = YOLO("yolo26n.yaml")
     m26.model = m26.task_map["detect"]["model"]("yolo26n.yaml", nc=nc, verbose=False)
     p26_train = get_num_params(m26.model)
-    m26_fused = deepcopy(m26.model).eval().fuse(verbose=False, imgsz=imgsz)
+    m26_fused = deepcopy(m26.model).eval().fuse(verbose=False)
     p26_fused = get_num_params(m26_fused)
     f26_fused = get_flops(m26_fused, imgsz=imgsz)
     anchors_26 = sum((imgsz // int(s)) ** 2 for s in m26.model.stride.tolist())
@@ -68,7 +68,7 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
         if m27.model.model[-1].nc != nc:
             m27.model = m27.task_map["detect"]["model"](cfg, nc=nc, verbose=False)
         p_train = get_num_params(m27.model)
-        m27_fused = deepcopy(m27.model).eval().fuse(verbose=False, imgsz=imgsz)
+        m27_fused = deepcopy(m27.model).eval().fuse(verbose=False)
         p_fused = get_num_params(m27_fused)
         f_fused = get_flops(m27_fused, imgsz=imgsz)
         strides = [int(s) for s in m27.model.stride.tolist()]
@@ -93,8 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="models/yolo27n.yaml", help="Model YAML or .pt checkpoint path")
     parser.add_argument("--data", default="dataset/fabric19.yaml", help="Dataset YAML path")
     parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs")
-    parser.add_argument("--batch", type=int, default=32, help="Batch size")
-    parser.add_argument("--imgsz", type=int, default=640, help="Input image size")
+    parser.add_argument("--batch", type=int, default=16, help="Batch size (8GB 显存推荐 16 或 32)")
+    parser.add_argument("--imgsz", type=int, default=640, help="Input image size (微小瑕疵可尝试 768 或 800)")
     parser.add_argument("--device", default="", help="Device, e.g. '0' or 'cpu'")
     parser.add_argument(
         "--optimizer",
@@ -164,12 +164,14 @@ def main() -> None:
             cls=0.5,
             dfl=6.0,
             erasing=0.0,
+            degrees=0.0,
+            shear=0.0,
             flipud=0.5,
             fliplr=0.5,
             scale=0.35,
             mosaic=1.0,
             copy_paste=0.1,
-            close_mosaic=20,
+            close_mosaic=30,
         )
         if args.lr0 is not None:
             train_kwargs["lr0"] = args.lr0
