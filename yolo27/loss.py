@@ -1,4 +1,4 @@
-"""YOLO27n training criterion with Foreground Alignment Supervision and fast convergence fixes."""
+"""YOLO27n training criterion with Foreground Alignment Supervision and calibrated ProgLoss."""
 
 from __future__ import annotations
 
@@ -19,13 +19,7 @@ def _varifocal_sum(
     gamma: float = 2.0,
     alpha: float = 0.75,
 ) -> torch.Tensor:
-    """Compute elementwise-summed Varifocal Loss without ``.mean(1)`` anchor-count attenuation.
-
-    Note: Ultralytics ``VarifocalLoss.forward`` applies ``.mean(1).sum()`` (designed for RT-DETR
-    queries where the caller multiplies back by ``num_queries``). Calling it directly on ``(B, 6800, 1)``
-    dense anchors divides the foreground alignment loss by ``6800`` (~8e-5). Summing directly over anchors
-    and normalizing by ``fg_norm`` keeps ``fg_loss`` properly scaled (~0.15–0.5) alongside ``cls_loss``.
-    """
+    """Compute elementwise-summed Varifocal Loss without ``.mean(1)`` anchor-count attenuation."""
     pred_f = pred_logits.float()
     gt_f = gt_score.float()
     mask_f = pos_mask.float()
@@ -53,7 +47,6 @@ class YOLO27DetectionLoss(v8DetectionLoss):
         if self._base_handles_class_weights or self._custom_class_weights is None:
             return super().get_assigned_targets_and_loss(preds, batch, **assign_kwargs)
 
-        # Ultralytics <= 8.4.33 path with inverse-frequency class_weights applied to BCE classification loss
         loss = torch.zeros(3, device=self.device)
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
@@ -109,40 +102,39 @@ class YOLO27DetectionLoss(v8DetectionLoss):
 
 
 class YOLO27E2ELoss(E2ELoss):
-    """End-to-end dual-head loss with Foreground Alignment Supervision for YOLO27n/s.
+    """End-to-end dual-head loss with Foreground Alignment Supervision and balanced ProgLoss.
 
-    Key convergence improvements over stock ``E2ELoss`` on dual-scale custom datasets:
-      1. Full unattenuated ``o2m = 1.0`` and ``o2o = 1.0`` gradients throughout training:
-         because ``one2one`` detaches neck features (``x.detach()``), ``one2many`` is the sole
-         detection gradient source for the backbone & neck, while ``one2one`` is the end-to-end
-         head. Keeping both at ``1.0`` avoids backbone gradient starvation and early ``one2one`` lag.
-      2. Dual-scale STAL ``stride_val`` fix: restores ``stride_val = 2 * stride[0] = 16`` (instead
-         of ``stride[1] = 32`` on ``[8, 32]``) with ``tal_topk = 13`` for tiny/elongated defects.
-      3. Properly normalized Foreground Alignment Supervision (fixing ``VarifocalLoss.mean(1)``
-         anchor-count division that previously shrank ``fg_loss`` by ``6800x``).
+    Key design:
+      1. Balanced ProgLoss (``o2m + o2o = 1.0``, ``o2m: 0.8 -> 0.2``, ``o2o: 0.2 -> 0.8``):
+         matches Ultralytics ``optimizer='auto'`` gradient norm scale (never doubling step size),
+         keeps a ``2x`` healthier late-epoch gradient floor (``0.2`` vs ``0.1``) for widened P2/P3
+         and strip-enhancer layers, and stabilizes neck features in late epochs so detached
+         ``one2one`` converges cleanly.
+      2. STAL ``stride_val = 2 * stride[0] = 16`` & ``tal_topk = 13`` for small/elongated defects.
+      3. Properly normalized Foreground Alignment Supervision (``fg_gain = 0.15``).
     """
 
     def __init__(
         self,
         model: torch.nn.Module,
         loss_fn=YOLO27DetectionLoss,
-        fg_gain: float = 0.35,
+        fg_gain: float = 0.15,
         o2o_align_gain: float = 0.25,
     ) -> None:
         super().__init__(model, loss_fn=loss_fn)
         self.one2many = loss_fn(model, tal_topk=13)
         self.one2one = loss_fn(model, tal_topk=7, tal_topk2=1)
 
-        # Fix dual-scale [8, 32] STAL minimum candidate box size: 2 * P3_stride = 16 px (not P5_stride = 32 px!)
         fine_stride_floor = int(self.one2many.stride[0].item() * 2)
         self.one2many.assigner.stride_val = fine_stride_floor
         self.one2one.assigner.stride_val = fine_stride_floor
 
-        # Keep both o2m = 1.0 and o2o = 1.0 at full strength throughout training
-        self.o2m = 1.0
-        self.init_o2o = 1.0
-        self.final_o2o = 1.0
-        self.o2o = self.init_o2o
+        # ProgLoss with total = 1.0: o2m decays 0.8 -> 0.2 while o2o ramps 0.2 -> 0.8
+        self.total = 1.0
+        self.o2m = 0.8
+        self.o2m_copy = 0.8
+        self.final_o2m = 0.2
+        self.o2o = self.total - self.o2m
 
         self.fg_gain = fg_gain
         self.o2o_align_gain = o2o_align_gain
@@ -152,14 +144,6 @@ class YOLO27E2ELoss(E2ELoss):
             self.loss_names = tuple([*base_names, "fg_loss"])
         else:
             self.loss_names = tuple(base_names)
-
-    def update(self) -> None:
-        """Keep ``o2m = 1.0`` and ``o2o = 1.0`` at full gradient throughout training."""
-        self.updates += 1
-        max_ep = max(getattr(self.one2one.hyp, "epochs", 100) - 1, 1)
-        prog = min(max(self.updates / max_ep, 0.0), 1.0)
-        self.o2m = 1.0
-        self.o2o = self.init_o2o + prog * (self.final_o2o - self.init_o2o)
 
     def _compute_iou_quality(
         self,
@@ -188,7 +172,7 @@ class YOLO27E2ELoss(E2ELoss):
         o2m_assign: tuple[torch.Tensor, ...],
         o2o_assign: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        """Compute Foreground Alignment Supervision loss across all dual-scale anchors."""
+        """Compute Foreground Alignment Supervision loss across all detection anchors."""
         o2o_scores = one2one["scores"]  # (B, nc, A)
         if fg_logits is None:
             return o2o_scores.sum() * 0.0
@@ -211,14 +195,14 @@ class YOLO27E2ELoss(E2ELoss):
             stride_tensor,
         )
 
-        # 1. Auxiliary Foreground Branch supervision (sharpens neck features & suppresses normal-fabric FPs)
+        # 1. Auxiliary Foreground Branch supervision
         fg_pred = fg_logits.squeeze(1)  # (B, A)
         fg_pos_mask = (fg_mask_o2m.bool() | fg_mask_o2o.bool()).float()
         fg_target = torch.maximum(q_o2o, 0.75 * q_o2m).detach()
         fg_norm = fg_target.sum().clamp(min=1.0)
         loss_fg_branch = _varifocal_sum(fg_pred, fg_target, fg_pos_mask) / fg_norm
 
-        # 2. One-to-One Foreground Consistency Alignment (closes recall gap between one2one and one2many)
+        # 2. One-to-One Foreground Consistency Alignment
         o2o_fg_logit = o2o_scores.amax(dim=1)  # (B, A)
         fg_prob_detached = fg_pred.detach().sigmoid()
         o2o_pos_mask = fg_mask_o2o.bool().float()
@@ -249,7 +233,6 @@ class YOLO27E2ELoss(E2ELoss):
         fg_loss = self._foreground_alignment_loss(fg_logits, one2many, one2one, o2m_assign, o2o_assign)
         fg_loss_scaled = fg_loss * self.fg_gain * bs
 
-        # Scalar total_loss works across all Ultralytics versions (both scaler.scale(loss).backward() and loss.sum())
         total_loss = det_loss.sum() + fg_loss_scaled.sum()
 
         fg_scalar = fg_loss.detach() * self.fg_gain

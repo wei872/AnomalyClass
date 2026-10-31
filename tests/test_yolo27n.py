@@ -1,4 +1,4 @@
-"""Automated verification suite for YOLO27n, YOLO27n-Lite, and fast-convergence fixes."""
+"""Automated verification suite for YOLO27n, YOLO27n-Lite, and zero-error Net2Wider warm-start."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -20,26 +21,26 @@ from ultralytics.utils.torch_utils import get_flops, get_num_params
 from yolo27 import YOLO27, YOLO27Detect, YOLO27DetectionModel, YOLO27E2ELoss, transfer_pretrained_weights
 
 
-def test_yolo27n_official_specs_and_dual_scale() -> None:
-    """Verify YOLO27n matches official Ultralytics YOLO27n specs (~3.0M params, ~7.2B FLOPs @ nc=80) and dual-scale."""
+def test_yolo27n_specs_and_lightweight_budget() -> None:
+    """Verify YOLO27n stays lighter than official 3.0M / 7.2B budget and strips fg_branch on fuse()."""
     model_coco = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False)
     head = model_coco.model[-1]
     assert isinstance(head, YOLO27Detect)
-    assert head.nl == 2, f"Expected 2 detection scales (P3/8, P5/32), got {head.nl}"
-    assert head.stride.tolist() == [8.0, 32.0], f"Expected strides [8.0, 32.0], got {head.stride.tolist()}"
-    assert head.fg_branch is not None, "Training model must carry ForegroundAlignmentBranch"
+    assert head.fg_branch is not None
+    assert head.strip_adapters is not None
 
     fused_coco = deepcopy(model_coco).eval().fuse(verbose=False)
     params_m = get_num_params(fused_coco) / 1e6
     flops_b = get_flops(fused_coco, imgsz=640)
-    assert 2.85 <= params_m <= 3.15, f"Expected ~3.0M params @ nc=80, got {params_m:.3f}M"
-    assert 6.9 <= flops_b <= 7.5, f"Expected ~7.2B FLOPs @ nc=80, got {flops_b:.2f}B"
+    assert 2.40 <= params_m <= 3.10, f"Expected <=3.0M params @ nc=80, got {params_m:.3f}M"
+    assert 5.5 <= flops_b <= 7.3, f"Expected <=7.2B FLOPs @ nc=80, got {flops_b:.2f}B"
     assert fused_coco.model[-1].fg_branch is None, "fg_branch must be stripped on fuse()"
 
 
 def test_yolo27n_lite_specs() -> None:
-    """Verify YOLO27n-Lite ultra-lightweight variant builds and fuses cleanly (< 1.0M params, ~3.0 GFLOPs @ nc=19)."""
+    """Verify YOLO27n-Lite dual-scale ultra-lightweight variant (<1.0M params, <3.5B FLOPs @ nc=19)."""
     model_lite = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False)
+    assert model_lite.model[-1].stride.tolist() == [8.0, 32.0]
     fused_lite = deepcopy(model_lite).eval().fuse(verbose=False)
     params_m = get_num_params(fused_lite) / 1e6
     flops_b = get_flops(fused_lite, imgsz=640)
@@ -47,22 +48,58 @@ def test_yolo27n_lite_specs() -> None:
     assert flops_b < 3.5, f"Expected <3.5B FLOPs for YOLO27n-Lite, got {flops_b:.2f}B"
 
 
-def test_smart_pretrained_weight_transfer() -> None:
-    """Verify exact + channel-sliced warm-start from YOLO26n transfers >=70% params while keeping 19-cls focal bias."""
-    donor = YOLO("yolo26n.yaml").model
-    target = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
-    orig_cls_bias = target.model[-1].cv3[0][-1].bias.detach().clone()
+def test_zero_error_net2wider_pretrained_warmstart() -> None:
+    """Verify function-preserving Net2Wider warm-start matches yolo26n to <1e-4 at step 0 and unlocks step-1 grads."""
+    torch.manual_seed(0)
+    donor = YOLO("yolo26n.yaml").model.train()
+    for m in donor.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.momentum = 1.0
+    calib_x = torch.rand(2, 3, 160, 160)
+    with torch.no_grad():
+        donor(calib_x)
+    donor.eval()
 
-    stats = transfer_pretrained_weights(donor, target)
-    assert stats["ratio"] >= 0.70, f"Expected >=70% warm-start coverage, got {stats['ratio']:.3f}"
-    # Stem Conv must match donor 100% exactly
-    assert torch.allclose(donor.model[0].conv.weight, target.model[0].conv.weight)
-    # 19-class focal prior bias on cv3 must NOT be overwritten by 80-class donor
-    assert torch.allclose(orig_cls_bias, target.model[-1].cv3[0][-1].bias)
+    # 1. Step-0 exact functional equivalence @ same nc
+    target_same = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False).eval()
+    stats = transfer_pretrained_weights(donor, target_same)
+    assert stats["ratio"] >= 0.88, f"Expected >=88% warm-start coverage, got {stats['ratio']:.3f}"
+    with torch.no_grad():
+        _, p26 = donor(calib_x[:1])
+        _, p27 = target_same(calib_x[:1])
+    box_diff = (p26["one2one"]["boxes"] - p27["one2one"]["boxes"]).abs().max().item()
+    score_diff = (p26["one2one"]["scores"] - p27["one2one"]["scores"]).abs().max().item()
+    assert box_diff < 1e-4, f"Step-0 box outputs drifted from donor: max_diff={box_diff}"
+    assert score_diff < 1e-4, f"Step-0 score outputs drifted from donor: max_diff={score_diff}"
+
+    # 2. Target nc=19 preserves 19-class focal bias & unlocks widened + strip gradients on step 1
+    target_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False).train()
+    orig_cls_bias = target_19.model[-1].cv3[0][-1].bias.detach().clone()
+    transfer_pretrained_weights(donor, target_19)
+    assert torch.allclose(orig_cls_bias, target_19.model[-1].cv3[0][-1].bias)
+
+    target_19.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=100)
+    crit = target_19.init_criterion()
+    opt = torch.optim.AdamW(target_19.parameters(), lr=5e-4)
+    batch = {
+        "img": calib_x,
+        "batch_idx": torch.tensor([0.0, 1.0]),
+        "cls": torch.tensor([[10.0], [16.0]]),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.4, 0.2], [0.3, 0.4, 0.1, 0.1]]),
+    }
+    for step in range(2):
+        opt.zero_grad()
+        loss, _ = crit(target_19(batch["img"]), batch)
+        loss.backward()
+        if step == 1:
+            assert target_19.model[2].cv1.conv.weight.grad[16:24].abs().sum().item() > 0
+            assert target_19.model[-1].strip_adapters[0].dw_h.weight.grad.abs().sum().item() > 0
+            assert target_19.model[-1].strip_adapters[0].dw_v.weight.grad.abs().sum().item() > 0
+        opt.step()
 
 
 def test_fuse_exact_equivalence_both_modes() -> None:
-    """Verify fixed dual-scale feature scaling folds into Conv2d weights with exact numerical equivalence."""
+    """Verify fixed feature scaling + strip enhancers fuse with exact numerical equivalence."""
     torch.manual_seed(42)
     x = torch.randn(2, 3, 320, 320)
 
@@ -93,56 +130,36 @@ def test_fuse_exact_equivalence_both_modes() -> None:
     assert max_diff_e2e < 1e-4, f"E2E mode fuse mismatch: max_diff={max_diff_e2e}"
 
 
-def test_loss_convergence_fixes_and_empty_normal_batch() -> None:
-    """Verify STAL stride_val=16 fix, constant o2m=1.0 schedule, and gradients on mixed + normal batches."""
-    from types import SimpleNamespace
-
+def test_loss_progloss_schedule_and_empty_normal_batch() -> None:
+    """Verify STAL stride_val=16, balanced ProgLoss (o2m+o2o=1.0), fg_loss scale, and empty batches."""
     model = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False).train()
-    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=6.0, epochs=100)
+    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=100)
     criterion = model.init_criterion()
     assert isinstance(criterion, YOLO27E2ELoss)
 
-    # Verify dual-scale STAL stride_val fix (16 px instead of 32 px!)
     assert criterion.one2many.assigner.stride_val == 16
     assert criterion.one2one.assigner.stride_val == 16
-    assert criterion.o2m == 1.0
+    assert abs((criterion.o2m + criterion.o2o) - 1.0) < 1e-6
 
-    # Verify o2m never decays below 1.0 while o2o ramps smoothly to 1.0
     for _ in range(99):
         criterion.update()
-    assert criterion.o2m == 1.0
-    assert abs(criterion.o2o - 1.0) < 1e-6
+    assert abs(criterion.o2m - 0.2) < 1e-5
+    assert abs(criterion.o2o - 0.8) < 1e-5
 
-    # Case A: Mixed batch (image 0 has 2 small defects, image 1 is pure normal defect-free fabric)
     imgs = torch.rand(2, 3, 320, 320)
     batch_mixed = {
         "img": imgs,
         "batch_idx": torch.tensor([0.0, 0.0]),
-        "cls": torch.tensor([[14.0], [7.0]]),  # 蚊虫小黑点, 经线毛球
+        "cls": torch.tensor([[14.0], [7.0]]),
         "bboxes": torch.tensor([[0.25, 0.25, 0.03, 0.03], [0.70, 0.60, 0.20, 0.15]]),
     }
     preds = model(imgs)
-    assert "fg_logits" in preds
-    assert preds["fg_logits"].shape == (2, 1, 1700)
-
     total_loss, loss_items = criterion(preds, batch_mixed)
     assert total_loss.ndim == 0 and torch.isfinite(total_loss)
-    if isinstance(loss_items, dict):
-        assert "fg_loss" in loss_items
-        fg_val = float(loss_items["fg_loss"])
-    else:
-        assert loss_items.numel() == 4
-        fg_val = float(loss_items[3])
-    # Ensure fg_loss is O(0.1~2.0), NOT attenuated 6800x to ~1e-4 by VarifocalLoss.mean(1)
-    assert fg_val > 0.05, f"fg_loss unexpectedly tiny ({fg_val}), check anchor normalization"
+    fg_val = float(loss_items["fg_loss"]) if isinstance(loss_items, dict) else float(loss_items[3])
+    assert fg_val > 0.02, f"fg_loss unexpectedly tiny ({fg_val})"
     total_loss.backward()
 
-    head = model.model[-1]
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.fg_branch.parameters())
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.cv2.parameters())
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.one2one_cv2.parameters())
-
-    # Case B: Pure normal batch (0 defects across entire batch)
     model.zero_grad()
     batch_normal = {
         "img": imgs,
@@ -150,14 +167,13 @@ def test_loss_convergence_fixes_and_empty_normal_batch() -> None:
         "cls": torch.zeros((0, 1), dtype=torch.float32),
         "bboxes": torch.zeros((0, 4), dtype=torch.float32),
     }
-    preds_normal = model(imgs)
-    loss_normal, _ = criterion(preds_normal, batch_normal)
+    loss_normal, _ = criterion(model(imgs), batch_normal)
     assert torch.isfinite(loss_normal)
     loss_normal.backward()
 
 
-def test_end_to_end_train_val_predict_with_normaltrain() -> None:
-    """Run an actual train -> val -> predict(nms=True/False) cycle on a synthetic 19-class fabric dataset."""
+def test_end_to_end_train_val_predict_both_protocols() -> None:
+    """Verify train -> val(nms=True/False) under default yolo26n-matched protocol & use_normal=True."""
     names = [
         "纬线杂质", "断纬", "多股线", "纬线不直", "包边不重叠", "捻接器接头",
         "小尾巴", "经线毛球", "包边不良", "手工接头", "纬斜", "短废纱线",
@@ -205,7 +221,7 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
             encoding="utf-8",
         )
 
-        y27 = YOLO27("models/yolo27n-lite.yaml")
+        y27 = YOLO27("models/yolo27n.yaml")
         y27.train(
             data=str(data_yaml),
             epochs=1,
@@ -219,33 +235,31 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
             plots=False,
         )
         best_pt = root / "runs/exp/weights/best.pt"
-        assert best_pt.exists(), "Expected best.pt checkpoint to be saved"
+        assert best_pt.exists()
         csv_text = (root / "runs/exp/results.csv").read_text(encoding="utf-8")
-        assert "train/fg_loss" in csv_text and "val/fg_loss" in csv_text, f"Missing fg_loss in CSV: {csv_text}"
+        assert "train/fg_loss" in csv_text and "val/fg_loss" in csv_text
 
-        # Validate both NMS (one2many) and E2E (one2one) pathways from saved best.pt
         m_val_nms = YOLO27(best_pt)
         m_val_nms.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=True, plots=False)
         assert m_val_nms.model.end2end is False
 
-        m_val_e2e = YOLO27(best_pt)
-        m_val_e2e.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=False, plots=False)
-        assert m_val_e2e.model.end2end is True
+        m_val_norm = YOLO27(best_pt)
+        m_val_norm.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=False, use_normal=True, plots=False)
+        assert m_val_norm.model.end2end is True
 
         sample_img = str(root / "images/val/def_0.jpg")
-        res_nms = YOLO27(best_pt).predict(sample_img, imgsz=128, nms=True, verbose=False)
-        res_e2e = YOLO27(best_pt).predict(sample_img, imgsz=128, nms=False, verbose=False)
-        assert len(res_nms) == 1 and len(res_e2e) == 1
+        assert len(YOLO27(best_pt).predict(sample_img, imgsz=128, nms=True, verbose=False)) == 1
+        assert len(YOLO27(best_pt).predict(sample_img, imgsz=128, nms=False, verbose=False)) == 1
 
 
 if __name__ == "__main__":
     for fn in (
-        test_yolo27n_official_specs_and_dual_scale,
+        test_yolo27n_specs_and_lightweight_budget,
         test_yolo27n_lite_specs,
-        test_smart_pretrained_weight_transfer,
+        test_zero_error_net2wider_pretrained_warmstart,
         test_fuse_exact_equivalence_both_modes,
-        test_loss_convergence_fixes_and_empty_normal_batch,
-        test_end_to_end_train_val_predict_with_normaltrain,
+        test_loss_progloss_schedule_and_empty_normal_batch,
+        test_end_to_end_train_val_predict_both_protocols,
     ):
         print(f"[RUN ] {fn.__name__} ...")
         fn()

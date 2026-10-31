@@ -2,23 +2,20 @@
 """YOLO27n / YOLO27n-Lite training, validation, inference, profiling & export script for fabric19.yaml.
 
 Usage examples:
-  1. Profile model parameters, FLOPs & dual-scale structure:
+  1. Profile model parameters, FLOPs & structure:
        python train_yolo27n.py --mode profile
 
-  2. Train YOLO27n (fast convergence: auto warm-starts from yolo26n.pt + AdamW + cos_lr):
-       python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150
+  2. Train YOLO27n (apples-to-apples with pure yolo26n + zero-error Net2Wider warm-start + StripEnhancer):
+       python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16
 
-  3. Train YOLO27n-Lite (extreme lightweight, ~0.75M params / 3.0 GFLOPs):
-       python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150
+  3. Train with normaltrain/normalval defect-free background folders also included:
+       python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --use-normal
 
-  4. Specify local donor checkpoint explicitly (e.g. D:/weights/yolo26n.pt) or disable warm-start (--pretrained none):
-       python train_yolo27n.py --mode train --model models/yolo27n.yaml --pretrained yolo26n.pt
+  4. Run validation (default high-accuracy one2many+NMS vs. --no-nms end-to-end one2one):
+       python train_yolo27n.py --mode val --model runs/detect/train/weights/best.pt --data dataset/fabric19.yaml
+       python train_yolo27n.py --mode val --model runs/detect/train/weights/best.pt --data dataset/fabric19.yaml --no-nms
 
-  5. Run inference (default NMS mode vs. NMS-free end-to-end mode):
-       python train_yolo27n.py --mode predict --model runs/detect/train/weights/best.pt --source sample.jpg
-       python train_yolo27n.py --mode predict --model runs/detect/train/weights/best.pt --source sample.jpg --no-nms
-
-  6. Export fused NMS-free ONNX model (fg_branch & unused head automatically stripped):
+  5. Export fused ONNX model:
        python train_yolo27n.py --mode export --model runs/detect/train/weights/best.pt --format onnx --no-nms
 """
 
@@ -46,7 +43,6 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
     print(header)
     print("-" * 92)
 
-    # 1. YOLO26n baseline (3-scale P3/P4/P5)
     m26 = YOLO("yolo26n.yaml")
     m26.model = m26.task_map["detect"]["model"]("yolo26n.yaml", nc=nc, verbose=False)
     p26_train = get_num_params(m26.model)
@@ -59,9 +55,8 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
         f"{anchors_26:>8} | {p26_train / 1e6:>11.3f} M | {p26_fused / 1e6:>11.3f} M | {f26_fused:>9.2f} B"
     )
 
-    # 2. YOLO27n & YOLO27n-Lite (2-scale P3/P5 + Widened Early Stage + Foreground Alignment Branch)
     for label, cfg in [
-        ("YOLO27n (标准版)", "models/yolo27n.yaml"),
+        ("YOLO27n (增强版)", "models/yolo27n.yaml"),
         ("YOLO27n-Lite(极轻)", "models/yolo27n-lite.yaml"),
     ]:
         m27 = YOLO27(cfg)
@@ -78,8 +73,8 @@ def profile_models(imgsz: int = 640, nc: int = 19) -> None:
             f"{anchors:>8} | {p_train / 1e6:>11.3f} M | {p_fused / 1e6:>11.3f} M | {f_fused:>9.2f} B"
         )
     print("=" * 92)
-    print("说明: 训练态包含双检测头 (one2many + one2one) 与前景对齐监督分支 (ForegroundAlignmentBranch);")
-    print("      推理/导出 fuse() 后自动剥离前景对齐分支与未启用检测头, 并折叠双尺度固定缩放系数 (零额外部署开销).")
+    print("说明: 训练态包含双检测头 (one2many + one2one)、经纬条带增强 (FabricStripEnhancer) 与前景对齐分支;")
+    print("      推理/导出 fuse() 后自动剥离前景对齐分支与未启用检测头, 并折叠多尺度缩放系数.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,24 +88,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="models/yolo27n.yaml", help="Model YAML or .pt checkpoint path")
     parser.add_argument("--data", default="dataset/fabric19.yaml", help="Dataset YAML path")
     parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size (8GB 显存推荐 16 或 32)")
-    parser.add_argument("--imgsz", type=int, default=640, help="Input image size (微小瑕疵可尝试 768 或 800)")
+    parser.add_argument("--batch", type=int, default=16, help="Batch size (默认 16, 对齐官方 YOLO26n 默认配置)")
+    parser.add_argument("--imgsz", type=int, default=640, help="Input image size")
     parser.add_argument("--device", default="", help="Device, e.g. '0' or 'cpu'")
     parser.add_argument(
         "--optimizer",
-        default="AdamW",
-        help="Optimizer (recommended: AdamW for fast custom-dataset convergence; or MuSGD)",
+        default="auto",
+        help="Optimizer (默认 'auto': 自动匹配 Ultralytics 多类别最优 lr0=0.000435 + momentum=0.9)",
     )
     parser.add_argument(
         "--lr0",
         type=float,
         default=None,
-        help="Initial learning rate (defaults to 0.0015 for AdamW, 0.004 for MuSGD)",
+        help="Initial learning rate override (默认由 optimizer='auto' 自动计算)",
     )
     parser.add_argument(
         "--pretrained",
         default="auto",
-        help="Pretrained donor weights: 'auto' (default, uses yolo26n.pt), path to a .pt file, or 'none'",
+        help="Pretrained donor weights: 'auto' (自动查找本地/相邻目录或下载 yolo26n.pt), .pt 路径, 或 'none'",
+    )
+    parser.add_argument(
+        "--use-normal",
+        action="store_true",
+        help="额外挂载 normaltrain / normalval 无缺陷背景目录（默认关闭，与纯 yolo26n 保持完全一致的数据划分）",
     )
     parser.add_argument("--source", default="", help="Image/folder source for predict mode")
     parser.add_argument("--format", default="onnx", help="Export format (onnx, engine, torchscript, etc.)")
@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=4,
-        help="Dataloader worker processes (Windows 建议 0 或 4)",
+        help="Dataloader worker processes",
     )
     return parser.parse_args()
 
@@ -157,21 +157,8 @@ def main() -> None:
             optimizer=args.optimizer,
             workers=args.workers,
             pretrained=_resolve_pretrained_arg(args.pretrained),
+            use_normal=args.use_normal,
             cos_lr=True,
-            warmup_epochs=3.0,
-            warmup_bias_lr=0.0,
-            box=7.5,
-            cls=0.5,
-            dfl=6.0,
-            erasing=0.0,
-            degrees=0.0,
-            shear=0.0,
-            flipud=0.5,
-            fliplr=0.5,
-            scale=0.35,
-            mosaic=1.0,
-            copy_paste=0.1,
-            close_mosaic=30,
         )
         if args.lr0 is not None:
             train_kwargs["lr0"] = args.lr0
@@ -180,7 +167,14 @@ def main() -> None:
         model.train(**train_kwargs)
 
     elif args.mode == "val":
-        val_kwargs = dict(data=args.data, imgsz=args.imgsz, batch=args.batch, nms=nms_flag, workers=args.workers)
+        val_kwargs = dict(
+            data=args.data,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            nms=nms_flag,
+            use_normal=args.use_normal,
+            workers=args.workers,
+        )
         if args.device:
             val_kwargs["device"] = args.device
         model.val(**val_kwargs)

@@ -45,9 +45,9 @@
 
 | 模型配置 | 配置文件 | 预测尺度 (Stride) | Anchor 数 | 训练态参数量 | 推理融合后参数量 | 融合后计算量 (FLOPs) | 适用场景 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.33 B | 前代三尺度基准 |
-| **YOLO27n** (官方标准版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 32]` | **6,800** | 3.123 M | **2.986 M** | **7.16 B** | 兼顾微小瑕疵高精度与低延迟（对齐官方 3.0M/7.2B 规格） |
-| **YOLO27n-Lite** (极轻量版) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 0.825 M | **0.751 M** | **2.97 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
+| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准 |
+| **YOLO27n** (布匹增强版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 2.767 M | **2.579 M** | **6.48 B** | 100% 无损继承 `yolo26n.pt` + P2/P3 加宽 + 1×9/9×1 经纬条带增强 + 前景对齐监督（低于官方 3.0M/7.2B 预算） |
+| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 0.855 M | **0.780 M** | **3.00 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
 
 ---
 
@@ -86,14 +86,14 @@ python train_yolo27n.py --mode profile
 先将 `dataset/fabric19.yaml` 中的 `path / train / val / normaltrain / normalval` 修改为你机器上的实际数据路径（若 `normaltrain` / `normalval` 目录存在，`YOLO27Trainer` 会自动将其作为纯背景负样本加入训练与验证）：
 
 ```bash
-# 推荐：将 yolo26n.pt 放在项目根目录（或联网自动下载），自动启用 ~80% 参数热启动 + AdamW 快速收敛配方
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 32 --imgsz 640
+# 推荐：与纯 yolo26n 完全一致的数据集划分 + 零误差 Net2Wider 预训练热启动 + 1x9/9x1 经纬条带增强
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16 --imgsz 640
 
-# 显式指定本地预训练权重路径（例如 Windows 本地已有权重）
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --epochs 150 --batch 32
+# 若需同时把 normaltrain / normalval 无缺陷纯背景目录加入训练与验证，加上 --use-normal：
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --use-normal --epochs 150 --batch 16
 
-# 或训练极轻量版 YOLO27n-Lite (0.75M 参数)
-python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150 --batch 64 --imgsz 640
+# 或训练双尺度极轻量版 YOLO27n-Lite (0.78M 参数 / 3.0 GFLOPs)
+python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150 --batch 32 --imgsz 640
 ```
 
 也可以直接在 Python 中调用（与官方 `YOLO` API 完全一致）：
