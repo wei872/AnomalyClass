@@ -1,0 +1,7 @@
+torch>=2.1
+numpy>=1.24
+opencv-python>=4.8        # 服务器无 GUI 环境可换 opencv-python-headless
+PyYAML>=6.0
+Pillow>=9.0
+onnx>=1.14                # 导出校验 (可选)
+onnxruntime>=1.15         # ONNX 部署后端 (可选, GPU 版用 onnxruntime-gpu)
