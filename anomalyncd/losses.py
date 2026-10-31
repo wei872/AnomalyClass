@@ -22,11 +22,15 @@ class SupConLoss(nn.Module):
         batch, views = features.shape[:2]
         if batch == 0:
             return features.sum() * 0
+        # reshape([B, V, D]) is SAMPLE-major: [s0v0, s0v1, s1v0, ...].
+        # The label mask must use the same order; tiling the [B, B] mask with
+        # .repeat(views, views) would be view-major and pair the wrong samples.
         flat = F.normalize(features.reshape(batch*views, -1), dim=-1)
         similarity = flat @ flat.T / self.temperature
         eye = torch.eye(batch*views, dtype=torch.bool, device=features.device)
         similarity = similarity.masked_fill(eye, torch.finfo(similarity.dtype).min)
-        positives = (labels[:, None] == labels[None, :]).repeat(views, views) & ~eye
+        flat_labels = labels.repeat_interleave(views)
+        positives = (flat_labels[:, None] == flat_labels[None, :]) & ~eye
         log_prob = similarity - torch.logsumexp(similarity, dim=1, keepdim=True)
         counts = positives.sum(dim=1)
         valid = counts > 0

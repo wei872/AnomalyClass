@@ -282,7 +282,7 @@ ruff check anomalyncd scripts tests
 python -m compileall -q anomalyncd scripts
 ```
 
-当前验证：`pytest -q` 为 **40 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、split 审计与隔离还原、感知哈希近似重复、MGViT 梯度、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟，并在人为注入 13 张重复图片的数据上验证了 `--drop-leaked-val`：检测器与区域两条链路均剔除 13 张、train/val 哈希交集为 0、原始文件未改动，训练与四阶段预测正常完成。
+当前验证：`pytest -q` 为 **42 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、split 审计与隔离还原、感知哈希近似重复、MGViT 梯度、SupCon 正样本配对顺序、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟，并在人为注入 13 张重复图片的数据上验证了 `--drop-leaked-val`：检测器与区域两条链路均剔除 13 张、train/val 哈希交集为 0、原始文件未改动，训练与四阶段预测正常完成。
 
 **本仓库当前没有真实 Fabric19 图片，也没有在真实数据/GPU/官方预训练权重上完成训练验证。** 合成测试通过只说明流程和张量/标签逻辑可运行，不代表真实布匹缺陷检测/分类准确率。
 

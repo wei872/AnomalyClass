@@ -121,3 +121,43 @@ def test_local_checkpoint_strict_loading_and_model_geometry_validation(tmp_path,
     cfg["model"]["mask_layers"] = 5
     with pytest.raises(ValueError, match="mask_layers"):
         validate_model_config(cfg)
+
+
+def test_supcon_positives_use_sample_major_order():
+    """Regression: reshape([B,V,D]) is sample-major, so must the label mask.
+
+    Tiling the [B,B] mask with .repeat(V,V) is view-major and pairs different
+    samples as positives, which inverts the objective (well-separated classes
+    scored worse than random features).
+    """
+    import torch
+
+    from anomalyncd.losses import SupConLoss
+    torch.manual_seed(0)
+    loss_fn = SupConLoss(0.07)
+    batch, views, dim, n_classes = 8, 2, 16, 4
+    labels = torch.arange(batch) % n_classes
+    prototypes = torch.randn(n_classes, dim)
+    # Same-class samples cluster; the two views are nearly identical.
+    good = torch.stack([prototypes[labels] + 0.05*torch.randn(batch, dim)
+                        for _ in range(views)], dim=1)
+    bad = torch.randn(batch, views, dim)
+    good_loss = float(loss_fn(good, labels))
+    bad_loss = float(loss_fn(bad, labels))
+    assert good_loss < bad_loss, (good_loss, bad_loss)
+    assert good_loss < 2.0, good_loss
+    assert torch.isfinite(torch.tensor([good_loss, bad_loss])).all()
+
+
+def test_supcon_identical_views_and_single_class_is_finite():
+    import torch
+
+    from anomalyncd.losses import SupConLoss
+    loss_fn = SupConLoss(0.07)
+    features = torch.randn(4, 2, 8)
+    # Every sample shares one label: all off-diagonal entries are positives.
+    loss = loss_fn(features, torch.zeros(4, dtype=torch.long))
+    assert torch.isfinite(loss)
+    # Distinct labels still leave the two views of each sample as positives.
+    loss = loss_fn(features, torch.arange(4))
+    assert torch.isfinite(loss) and float(loss) > 0
