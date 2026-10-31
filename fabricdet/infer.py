@@ -222,8 +222,12 @@ class Detector:
         for p in preds:
             x1, y1, x2, y2 = [int(v) for v in p["box"]]
             color = (0, 0, 255) if p["cls"] == UNKNOWN_CLS else (0, 200, 0)
+            nm = p.get("name") or (UNKNOWN_NAME if p["cls"] == UNKNOWN_CLS
+                                   else self.names[p["cls"]] if 0 <= p["cls"] < len(self.names) else "?")
+            nm_en = p.get("name_en") or (UNKNOWN_NAME_EN if p["cls"] == UNKNOWN_CLS
+                                         else self.names_en[p["cls"]] if p["cls"] < len(self.names_en) else nm)
             label = f"{'?' if p['cls'] == UNKNOWN_CLS else p['cls']} " \
-                    f"{p['name_en'] if pil is None else p['name']} {p['score']:.2f}"
+                    f"{nm_en if pil is None else nm} {p['score']:.2f}"
             if pil is not None:
                 draw.rectangle([x1, y1, x2, y2], outline=color[::-1], width=2)
                 draw.text((x1 + 2, max(y1 - 18, 0)), label, fill=color[::-1], font=font)

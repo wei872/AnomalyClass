@@ -2,7 +2,6 @@
 """训练引擎: AMP/EMA/余弦调度/骨干分阶段解冻 + 阈值自动标定 + 部署级评估。"""
 from __future__ import annotations
 
-import copy
 import math
 import time
 
@@ -10,7 +9,7 @@ import numpy as np
 import torch
 
 from .metrics import evaluate_ap
-from .postprocess import DEFAULT_THRESHOLDS, UNKNOWN_CLS, postprocess
+from .postprocess import DEFAULT_THRESHOLDS, postprocess
 
 
 class EMA:

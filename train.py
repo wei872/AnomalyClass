@@ -145,7 +145,7 @@ def main():
             print(f"[train] epoch {ep}: val mAP50 = {m50:.4f} "
                   f"(tp={extra['tp'].sum()} fp={extra['fp'].sum()} fn={extra['fn'].sum()}) "
                   f"[{time.time() - t0:.0f}s]", flush=True)
-            if m50 > best_map:
+            if (m50, ep) > (best_map, best_ep):   # 同分时取更晚 epoch (训练更充分)
                 best_map, best_ep = m50, ep
                 save_ckpt(out / "best.pt", {k: v.clone() for k, v in ema.shadow.items()},
                           extra={"val_map50": round(m50, 4), "best_epoch": ep})
