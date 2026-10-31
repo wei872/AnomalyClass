@@ -1,0 +1,63 @@
+# =============================================================================
+# Ultralytics YOLO27 (CNN Dual-Scale Architecture for N / S scales)
+# Reference: https://docs.ultralytics.com/zh/models/yolo27
+# Dataset default: dataset/fabric19.yaml (19 fabric defect classes)
+#
+# Key YOLO27 N/S Architectural Improvements over YOLO26:
+#   1. Widened Early High-Resolution Stage:
+#      P2/4 C3k2 widened (256 -> 384) + P3/8 fine head widened (256 -> 320)
+#      to preserve fine-grained texture details for tiny defects (小黑点/毛球/小尾巴).
+#   2. Dual-Scale Detection Head (P3/8 Fine + P5/32 Coarse):
+#      Drops the intermediate P4/16 prediction head (anchors: 8400 -> 6800 @ 640),
+#      predicting only on P3/8 (80x80) and P5/32 (20x20) with fixed scale
+#      balancing on fused features (folded at zero cost during fuse()).
+#   3. Foreground Alignment Supervision (Training-Only Auxiliary Branch):
+#      Attached via YOLO27Detect during training to bridge dense one-to-many
+#      supervision and NMS-free one-to-one inference; stripped during fuse()/export.
+#   4. Inherited YOLO26 Foundations:
+#      DFL-free direct box regression (reg_max: 1) + native dual-head end2end
+#      support (nms=True default one-to-many; nms=False one-to-one NMS-free).
+# =============================================================================
+
+# Parameters
+nc: 19 # number of classes (fabric19 default; overridden automatically by data.yaml)
+end2end: True # dual-head training (one-to-many + one-to-one); supports nms=True and nms=False
+reg_max: 1 # DFL-free direct ltrb regression (1 bin = direct coordinate distance)
+scales: # compound scaling constants: [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # YOLO27n: ~3.00M params, ~7.2 GFLOPs (fused @ nc=80); ~2.94M / ~7.2 GFLOPs (@ nc=19)
+  s: [0.50, 0.50, 1024] # YOLO27s: ~11.9M params, ~28.3 GFLOPs (fused @ nc=80)
+
+# YOLO27n/s streamlined CNN backbone (with widened early high-resolution stage)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2   (320x320)
+  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   (160x160)
+  - [-1, 2, C3k2, [384, False, 0.25]]  # 2-P2/4   widened early high-res stage (YOLO26: 256 -> YOLO27: 384)
+  - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   (80x80)
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   high-resolution small-object feature stage
+  - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  (40x40)
+  - [-1, 2, C3k2, [768, True]]         # 6-P4/16  intermediate semantic transition stage
+  - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  (20x20)
+  - [-1, 2, C3k2, [1024, True]]        # 8-P5/32  deep semantic stage
+  - [-1, 1, SPPF, [1024, 5, 3, True]]  # 9-P5/32  multi-scale receptive field pooling with residual shortcut
+  - [-1, 2, C2PSA, [1024]]             # 10-P5/32 position-sensitive spatial attention
+
+# YOLO27n/s dual-scale FPN/PAN neck + dual-scale Detect head (P3/8 fine + P5/32 coarse)
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]                  # 12: cat backbone P4/16
+  - [-1, 2, C3k2, [512, True]]                 # 13: top-down P4 fusion
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]                  # 15: cat backbone P3/8
+  - [-1, 2, C3k2, [320, True]]                 # 16: P3/8-fine output (widened: 256 -> 320 for small defects)
+
+  - [-1, 1, Conv, [320, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]                 # 18: cat neck P4/16 (bridges fine -> coarse without P4 Detect head)
+  - [-1, 2, C3k2, [768, True]]                 # 19: bottom-up P4 relay
+
+  - [-1, 1, Conv, [768, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]                 # 21: cat backbone C2PSA P5/32
+  - [-1, 2, C3k2, [1024, True, 0.5, True]]     # 22: P5/32-coarse output (attention-enhanced for large/long defects)
+
+  - [[16, 22], 1, Detect, [nc]]                # 23: Dual-Scale Detect(P3/8-fine, P5/32-coarse) — P4/16 head dropped

@@ -1,0 +1,55 @@
+# =============================================================================
+# YOLO27n (Nano) — Official-Spec Lightest Scale in the YOLO27 Family
+# Reference: https://docs.ultralytics.com/zh/models/yolo27
+#
+# Complexity @ 640x640 (Fused, Conv+BN folded, fg_branch & unused head stripped):
+#   - COCO (nc=80):   3.00M params | 7.2 GFLOPs  (matches official table: 3.0M / 7.2B)
+#   - Fabric (nc=19): 2.94M params | 7.2 GFLOPs
+#
+# Actual Scaled Channels for Nano [depth=0.50, width=0.25, max_channels=1024]:
+#   - P1/2 (320x320): 16 ch
+#   - P2/4 (160x160): 32 -> 96 ch  (widened from 64 ch in YOLO26n, +50% width)
+#   - P3/8 (80x80):   64 -> 128 ch (backbone) | 80 ch (fine head, widened from 64 ch)
+#   - P4/16 (40x40):  128 -> 192 ch (neck relay only, NO P4 detection head)
+#   - P5/32 (20x20):  256 ch (SPPF + C2PSA + C3k2-Attn coarse head)
+# =============================================================================
+
+nc: 19
+scale: n
+end2end: True
+reg_max: 1
+scales:
+  n: [0.50, 0.25, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2   -> 16 ch, 320x320
+  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   -> 32 ch, 160x160
+  - [-1, 2, C3k2, [384, False, 0.25]]  # 2-P2/4   -> 96 ch, 160x160 (widened early stage for tiny defects)
+  - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   -> 64 ch, 80x80
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   -> 128 ch, 80x80
+  - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  -> 128 ch, 40x40
+  - [-1, 2, C3k2, [768, True]]         # 6-P4/16  -> 192 ch, 40x40
+  - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  -> 256 ch, 20x20
+  - [-1, 2, C3k2, [1024, True]]        # 8-P5/32  -> 256 ch, 20x20
+  - [-1, 1, SPPF, [1024, 5, 3, True]]  # 9-P5/32  -> 256 ch, 20x20
+  - [-1, 2, C2PSA, [1024]]             # 10-P5/32 -> 256 ch, 20x20
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]                  # 12: 256 + 192 = 448 ch (40x40)
+  - [-1, 2, C3k2, [512, True]]                 # 13: 128 ch (40x40)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]                  # 15: 128 + 128 = 256 ch (80x80)
+  - [-1, 2, C3k2, [320, True]]                 # 16: 80 ch (80x80, P3/8-fine prediction feature map)
+
+  - [-1, 1, Conv, [320, 3, 2]]                 # 17: 80 ch (40x40)
+  - [[-1, 13], 1, Concat, [1]]                 # 18: 80 + 128 = 208 ch (40x40)
+  - [-1, 2, C3k2, [768, True]]                 # 19: 192 ch (40x40)
+
+  - [-1, 1, Conv, [768, 3, 2]]                 # 20: 192 ch (20x20)
+  - [[-1, 10], 1, Concat, [1]]                 # 21: 192 + 256 = 448 ch (20x20)
+  - [-1, 2, C3k2, [1024, True, 0.5, True]]     # 22: 256 ch (20x20, P5/32-coarse prediction feature map)
+
+  - [[16, 22], 1, Detect, [nc]]                # 23: Dual-Scale Detect(P3/8, P5/32) -> upgraded to YOLO27Detect

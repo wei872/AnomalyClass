@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Ultralytics / PyTorch training & export artifacts
+runs/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.torchscript
+*.mlpackage/
+*.tflite
+*.cache
+
+# IDE & OS
+.idea/*
+!.idea/.gitignore
+.vscode/
+.DS_Store
+Thumbs.db
