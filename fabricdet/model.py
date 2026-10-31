@@ -80,8 +80,9 @@ class FabricDefectNet(nn.Module):
         self.emb_dim = emb_dim
         self.input_size = input_size
         self.stride = 7                      # backbone 14 / neck 上采样 2
-        self.backbone = DINOv2ViT(img_size=518, patch_size=14, embed_dim=384, depth=12, num_heads=6)
-        self.neck = Neck(384, 256, 128)
+        self.backbone = DINOv2ViT(img_size=518, patch_size=14, embed_dim=384, depth=12,
+                                      num_heads=6, out_indices=(7, 11))
+        self.neck = Neck(384 * 2, 256, 128)   # 中层+末层 ViT 特征拼接
         self.head = Head(128, emb_dim)
         self.prototypes = nn.Parameter(torch.randn(num_classes, emb_dim) * 0.02)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.1)))

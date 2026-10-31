@@ -9,6 +9,7 @@
   布匹图 (任意分辨率)   │  滑窗 tile (默认 448, 重叠 25%, 跨 tile 合并) │
         └──────────────►                                              │
                        │  DINOv2 ViT-S/14  (21.9M, 自监督预训练)       │ stride 14
+                       │     (block8 + block12 特征拼接: 细纹理+语义)  │
                        │      └─ 1x1 投影 + 2x 上采样 轻量 Neck        │ stride 7
                        │           └─ 共享卷积 trunk (GroupNorm)       │
                        │               ├─ obj  分支: 置信度 (FCOS 式)  │
@@ -25,7 +26,7 @@
 
 | 需求 | 方案 |
 |---|---|
-| 轻量 + 实时 | ViT-S/14 是 DINOv2 最轻量档；单尺度 stride-7 密集头，无 ROI/无解码器堆叠；448 输入约 45 GFLOPs，GPU FP16/TensorRT 下轻松 >100 FPS(tile)，滑窗并行可跑满产线相机 |
+| 轻量 + 实时 | ViT-S/14 是 DINOv2 最轻量档；单尺度 stride-7 密集头，无 ROI/无解码器堆叠；全模型 23.0M 参数 / 69 GFLOPs@448（336 输入仅 ~39G），GPU FP16/TensorRT 下单 tile 毫秒级，滑窗并行可跑满产线相机；追求更高帧率可 `--set input_size=336` |
 | 泛化强（不用 YOLO） | DINOv2 自监督特征 + 监督对比学习(SupCon) 度量嵌入 + 强增广（随机窗口裁剪/光照/噪声/离焦/小角度旋转）；锚自由设计无 anchor 先验偏差 |
 | 没见过的缺陷也要分类 | 分类头是「嵌入 ↔ 类原型」余弦度量而非 softmax 全连接：已知类聚成紧簇，未见过的缺陷落在所有原型之外 → 判为 `未知缺陷` 并照常给框；阈值 `tau_unknown` 训练结束在 val 上自动标定 |
 | 精准检测+定位+分类 | 端到端单网络：GIoU+L1 回归框、focal 置信度、余弦 CE+SupCon 分类，一次前向全输出 |
@@ -110,6 +111,10 @@ trtexec --onnx=runs/fabric19/deploy/best.onnx --saveEngine=best.fp16.trt --fp16
 ## 自检（无真实数据时验证环境/流水线）
 
 ```bash
+# 一键全链路自检 (合成数据->训练->标定->导出->双后端一致性->开集规则->mAP 指标), 全过打印 ALL PASS
+python tools/selftest.py
+
+# 或手动: 合成数据 + 短训练
 python tools/make_synthetic_dataset.py --out data/synthetic_fabric19 --train 60 --val 12
 python train.py --data data/synthetic_fabric19/synthetic_fabric19.yaml --set epochs=20
 ```

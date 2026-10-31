@@ -99,7 +99,7 @@ class DINOv2ViT(nn.Module):
 
     def __init__(self, img_size: int = 518, patch_size: int = 14, in_chans: int = 3,
                  embed_dim: int = 384, depth: int = 12, num_heads: int = 6,
-                 out_indices: tuple = (11,)):
+                 out_indices: tuple = (7, 11)):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -150,9 +150,10 @@ class DINOv2ViT(nn.Module):
         return [o[:, 1:] for o in outs], (H // self.patch_size, W // self.patch_size)
 
     def forward(self, x):
-        (tok,), grid = self.forward_features(x)
+        toks, grid = self.forward_features(x)
+        tok = torch.cat(toks, dim=-1)                      # 中层+末层特征拼接 (细纹理+语义)
         B, _, D = tok.shape
-        return tok.transpose(1, 2).reshape(B, D, grid[0], grid[1])   # (B, D, h, w)
+        return tok.transpose(1, 2).reshape(B, D, grid[0], grid[1])   # (B, D*len(out), h, w)
 
 
 def _sha256(path: Path) -> str:
