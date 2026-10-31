@@ -20,7 +20,8 @@ l1_w: 0.5
 cls_w: 1.0
 supcon_w: 0.3
 focal_gamma: 2.0
-focal_alpha: 0.5
+focal_alpha: 0.75
+cls_temp: 0.1        # 原型余弦温度 (InfoNCE), 固定不学习
 # 推理/标定
 tile: 448
 overlap: 0.25

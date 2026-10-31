@@ -17,8 +17,6 @@ tau_unknown 与 conf 阈值在训练结束时用 val 集自动标定, 写进权�
 """
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,7 +83,6 @@ class FabricDefectNet(nn.Module):
         self.neck = Neck(384 * 2, 256, 128)   # 中层+末层 ViT 特征拼接
         self.head = Head(128, emb_dim)
         self.prototypes = nn.Parameter(torch.randn(num_classes, emb_dim) * 0.02)
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.1)))
         self._grid_cache: dict = {}
 
     # ---------------------------------------------------------------- grid

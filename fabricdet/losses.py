@@ -116,8 +116,10 @@ class FabricLoss:
         self.w_cls = cfg.get("cls_w", 1.0)
         self.w_sc = cfg.get("supcon_w", 0.3)
         self.gamma = cfg.get("focal_gamma", 2.0)
-        self.alpha = cfg.get("focal_alpha", 0.5)
-        self.scale = cfg.get("logit_scale_init", 10.0)
+        self.alpha = cfg.get("focal_alpha", 0.75)
+        # 固定温度: 余弦 logits = cos/tau (原型 InfoNCE)。
+        # 可学习 scale 会走"放大 scale 而不对齐嵌入"的捷径, 导致开集失效, 故固定。
+        self.temp = float(cfg.get("cls_temp", 0.1))
         cw = torch.ones(num_classes) if class_weight is None else class_weight
         self.register = cw  # placeholder, moved to device lazily
         self._cw_dev = None
@@ -127,7 +129,7 @@ class FabricLoss:
             self._cw_dev = self.register.to(device)
         return self._cw_dev
 
-    def __call__(self, model, obj, box, emb, targets, scale=None):
+    def __call__(self, model, obj, box, emb, targets):
         B, _, H, W = obj.shape
         device = obj.device
         obj_l = obj.reshape(B, H * W)
@@ -167,8 +169,7 @@ class FabricLoss:
             # cls (余弦原型 + 可学习温度)
             e = torch.nn.functional.normalize(emb_p[b][pos], dim=-1)
             proto = torch.nn.functional.normalize(model.prototypes, dim=-1)
-            s = scale if scale is not None else model.logit_scale.exp()
-            logits = e @ proto.t() * s
+            logits = e @ proto.t() / self.temp
             ce = torch.nn.functional.cross_entropy(logits, gcls[g], weight=cw, reduction="none")
             ce_losses.append((ce * cnp).sum() / cnp.sum())
             pos_ws.append(cw[gcls[g]])

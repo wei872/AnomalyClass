@@ -220,8 +220,8 @@ class FabricDataset(Dataset):
             img = cv2.GaussianBlur(img, (k, k), 0)
         if random.random() < 0.3:
             # 光照渐变/暗角 (产线相机常见, 参考真实布匹图的边缘衰减)
-            gx = np.linspace(-1, 1, img.shape[1], dtype=np.float32)[None, :]
-            gy = np.linspace(-1, 1, img.shape[0], dtype=np.float32)[:, None]
+            gx = np.linspace(-1, 1, img.shape[1], dtype=np.float32)[None, :, None]
+            gy = np.linspace(-1, 1, img.shape[0], dtype=np.float32)[:, None, None]
             img *= (1 + random.uniform(-0.2, 0.2) * gx + random.uniform(-0.2, 0.2) * gy)
         if random.random() < 0.2:
             f = random.choice([2, 3])
