@@ -98,27 +98,60 @@ def reset_sched_counter():
 
 
 @torch.no_grad()
-def fast_eval(model, val_ds, device, conf=0.1, tau=0.35, max_images=10000):
-    """整图 letterbox 快速 mAP50 (仅用于训练中挑 best)。"""
+def fast_eval(model, val_ds, device, conf=0.1, tau=0.35, max_images=64):
+    """部署同尺度快速 mAP50 (仅用于训练中挑 best):
+    每张 val 图取一个 tile 大小窗口 (有 gt 时以首个 gt 为中心), 与训练/部署尺度一致。
+    整图 letterbox 会把缺陷缩到亚像素, 不能反映真实部署性能, 故弃用。
+    """
+    from .data import imread_unicode, letterbox, read_labels
+    from .infer import _preprocess_crop
     model.eval()
-    from torch.utils.data import DataLoader, SequentialSampler
-    from .data import collate
-    loader = DataLoader(val_ds, batch_size=4, sampler=SequentialSampler(val_ds),
-                        collate_fn=collate, num_workers=0)
-    gt_by, pred_by = {}, {}
+    size = model.input_size
     th = dict(DEFAULT_THRESHOLDS, conf=conf, tau_unknown=tau)
-    for xs, ts, metas in loader:
-        xs = xs.to(device)
+    gt_by, pred_by = {}, {}
+    pending = []
+
+    def flush():
+        nonlocal pending
+        if not pending:
+            return
+        xs = torch.from_numpy(np.stack([p[0] for p in pending])).to(device)
         boxes, obj, sims = model.forward_deploy(xs)
-        boxes, obj, sims = boxes.cpu().numpy(), obj.cpu().numpy(), sims.cpu().numpy()
-        for b in range(xs.shape[0]):
-            sc = metas[b]["scale"]
-            preds = postprocess(boxes[b], obj[b], sims[b], th)
-            for p in preds:
-                p["box"] = (p["box"] / sc).astype(np.float32)
-            gt = [(int(row[0]), row[1:5].numpy() / sc) for row in ts[b]]
-            gt_by[metas[b]["path"]] = gt
-            pred_by[metas[b]["path"]] = preds
+        boxes, obj, sims = boxes.float().cpu().numpy(), obj.float().cpu().numpy(), sims.float().cpu().numpy()
+        for j, (_, key) in enumerate(pending):
+            pred_by[key] = postprocess(boxes[j], obj[j], sims[j], th)
+        pending = []
+
+    n = 0
+    for ip, lp in val_ds.samples:
+        if n >= max_images:
+            break
+        img = imread_unicode(ip)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        gt = [(c, np.array([x1 * w, y1 * h, x2 * w, y2 * h], np.float32))
+              for c, x1, y1, x2, y2 in read_labels(lp, set())]
+        if gt:
+            cx, cy = (gt[0][1][0] + gt[0][1][2]) / 2, (gt[0][1][1] + gt[0][1][3]) / 2
+        else:
+            cx, cy = w / 2, h / 2
+        x0 = int(min(max(cx - size / 2, 0), max(w - size, 0)))
+        y0 = int(min(max(cy - size / 2, 0), max(h - size, 0)))
+        crop = img[y0:y0 + size, x0:x0 + size]
+        sc = 1.0
+        if crop.shape[0] != size or crop.shape[1] != size:
+            crop, sc, _ = letterbox(crop, size)
+        off = np.array([x0, y0, x0, y0], np.float32)
+        gt_local = [(c, (b - off) / sc) for c, b in gt
+                    if x0 <= (b[0] + b[2]) / 2 < x0 + size and y0 <= (b[1] + b[3]) / 2 < y0 + size]
+        key = f"{ip}#{n}"
+        gt_by[key] = gt_local
+        pending.append((_preprocess_crop(crop, size), key))
+        n += 1
+        if len(pending) == 4:
+            flush()
+    flush()
     _, map50, extra = evaluate_ap(gt_by, pred_by, model.num_classes, 0.5)
     return map50, extra
 
