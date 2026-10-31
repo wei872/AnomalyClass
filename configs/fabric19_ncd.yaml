@@ -9,3 +9,7 @@ experiment:
   output_dir: outputs/fabric19_ncd
 training:
   eval_every: 0              # 0: 仅最终评估，避免用 val 反复选 NCD 模型
+# 新类由 anomaly 特征库负责发现，而不是靠检测器：
+#   含新类缺陷的图片会整张从检测器 train 中排除（重标为背景会教模型「新类是正常」）；
+#   推理时 source=anomaly_map 且 novel_candidate=true 的区域即未知类别候选。
+# 因此 NCD 模式下不要加 --skip-anomaly-bank，否则失去新类检出能力。

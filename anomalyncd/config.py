@@ -121,6 +121,46 @@ def validate_config(cfg: dict) -> None:
             raise ValueError("detector.class_agnostic 必须是布尔值")
         if cfg["mode"] == "discovery" and not detector.get("class_agnostic", True):
             raise ValueError("NCD 模式要求 detector.class_agnostic=true，避免使用新类 ID")
+    anomaly = cfg.get("anomaly")
+    if anomaly is not None:
+        if not isinstance(anomaly, dict):
+            raise ValueError("anomaly 必须是映射")
+        if not isinstance(anomaly.get("enabled", False), bool):
+            raise ValueError("anomaly.enabled 必须是布尔值")
+        for key in ("image_size", "bank_size", "max_candidates", "knn", "min_area",
+                    "max_regions", "threshold_steps", "neighborhood"):
+            if key in anomaly and (not isinstance(anomaly[key], int) or anomaly[key] <= 0):
+                raise ValueError(f"anomaly.{key} 必须是正整数")
+        if "image_size" in anomaly:
+            patch = 16 if str(cfg["model"]["backbone"]).endswith("16") else 8
+            if anomaly["image_size"] % patch:
+                raise ValueError(f"anomaly.image_size 必须能被 patch_size={patch} 整除")
+        if "neighborhood" in anomaly and anomaly["neighborhood"] % 2 == 0:
+            raise ValueError("anomaly.neighborhood 必须是奇数")
+        if "coreset" in anomaly and not isinstance(anomaly["coreset"], bool):
+            raise ValueError("anomaly.coreset 必须是布尔值")
+        for key in ("smooth_sigma",):
+            if key in anomaly:
+                _number(anomaly[key], f"anomaly.{key}", 0, 100)
+        if "topk_ratio" in anomaly:
+            value = anomaly["topk_ratio"]
+            if not isinstance(value, (int, float)) or not 0 < value <= 1:
+                raise ValueError("anomaly.topk_ratio 必须在 (0, 1]")
+        layers = anomaly.get("layers")
+        if layers is not None:
+            if not isinstance(layers, (list, tuple)) or not layers:
+                raise ValueError("anomaly.layers 必须是非空列表")
+            depth = 4 if cfg["model"]["backbone"] == "tiny_vit" else 12
+            if any(not isinstance(x, int) or not 0 <= x < depth for x in layers):
+                raise ValueError(f"anomaly.layers 必须在 0..{depth-1}")
+        if "max_area_ratio" in anomaly:
+            value = anomaly["max_area_ratio"]
+            if not isinstance(value, (int, float)) or not 0 < value <= 1:
+                raise ValueError("anomaly.max_area_ratio 必须在 (0, 1]")
+        if "fuse_iou" in anomaly:
+            _number(anomaly["fuse_iou"], "anomaly.fuse_iou", 0, 1)
+        if "score_threshold" in anomaly:
+            _number(anomaly["score_threshold"], "anomaly.score_threshold", 0, 10)
 
 
 def load_class_names(path: str | Path) -> list[str]:

@@ -165,6 +165,42 @@ def make_crop(image: Image.Image, bbox: tuple[float, float, float, float], paddi
     return crop, mask_crop, crop_box, area
 
 
+def mask_to_bbox(mask) -> tuple[float, float, float, float]:
+    """Normalised YOLO cx,cy,w,h of a pixel mask's bounding box."""
+    import numpy as np
+
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        raise ValueError("空缺陷掩码，无法求外接框")
+    height, width = mask.shape[:2]
+    x0, x1 = float(xs.min()), float(xs.max()+1)
+    y0, y1 = float(ys.min()), float(ys.max()+1)
+    return ((x0+x1)/2/width, (y0+y1)/2/height, (x1-x0)/width, (y1-y0)/height)
+
+
+def make_crop_from_mask(image: Image.Image, mask, padding: float, min_crop_size: float):
+    """Context crop that keeps the *actual* defect mask, not its rectangle.
+
+    A rectangular mask leaves most normal weave inside the guided-attention
+    window; a segmentation-shaped mask lets the classifier attend to the defect
+    itself.  Returns (crop, mask_crop, crop_box, area, bbox_normalized).
+    """
+    import numpy as np
+
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape[:2] != (image.height, image.width):
+        raise ValueError("掩码尺寸与原图不一致")
+    bbox = mask_to_bbox(mask)
+    image = image.convert("RGB")
+    crop_box, _ = crop_geometry(image.size, bbox, padding, min_crop_size)
+    mask_image = Image.fromarray(mask.astype(np.uint8)*255, mode="L")
+    crop, mask_crop = image.crop(crop_box), mask_image.crop(crop_box)
+    area = sum(mask_crop.histogram()[1:])
+    if area == 0:
+        raise ValueError(f"裁剪后掩码为空: bbox={bbox}, crop={crop_box}")
+    return crop, mask_crop, crop_box, area, bbox
+
+
 def _metadata_fingerprint(spec: DatasetSpec, entries: dict[str, list[ImageEntry]], padding: float, min_crop_size: float) -> str:
     digest = hashlib.sha256()
     digest.update(json.dumps([spec.names, padding, min_crop_size, SCHEMA_VERSION], ensure_ascii=False).encode())

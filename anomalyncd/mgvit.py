@@ -334,6 +334,30 @@ class MaskedGuidedVisionTransformer(nn.Module):
                 # return attention of the last block
                 return blk(x, mask_patch, return_attention=True)
 
+    def get_patch_tokens(self, x, layers):
+        """Patch tokens (no CLS) from the requested block indices, unmasked.
+
+        Anomaly detection compares a test image against a bank of normal patch
+        features, so no region may be suppressed: an all-ones mask makes the
+        masked blocks behave exactly like ordinary self-attention.
+        Returns (tokens [B, len(layers), N, D], grid_side).
+        """
+        depth = len(self.blocks)
+        wanted = sorted(set(int(layer) for layer in layers))
+        if not wanted or wanted[0] < 0 or wanted[-1] >= depth:
+            raise ValueError(f"layers must be within 0..{depth-1}")
+        side = self.patch_embed.img_size // self.patch_size
+        x = self.prepare_tokens(x)
+        full = torch.ones((x.shape[0], 1, self.patch_embed.img_size, self.patch_embed.img_size),
+                          device=x.device, dtype=self.patch_embed.proj.weight.dtype)
+        mask_patch = self.prepare_mask(full)
+        collected = []
+        for index, block in enumerate(self.blocks):
+            x = block(x) if index < depth - self.active_depth else block(x, mask_patch)
+            if index in wanted:
+                collected.append(self.norm(x)[:, 1:])
+        return torch.stack(collected, dim=1), side
+
     def get_intermediate_layers(self, x, mask, n=1):
         x = self.prepare_tokens(x)
         # we return the output tokens from the `n` last blocks

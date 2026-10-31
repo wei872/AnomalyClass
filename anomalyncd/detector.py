@@ -83,8 +83,37 @@ def prepare_detector_dataset(dataset_config: str | Path, output: str | Path,
 
     nc = 1 if class_agnostic else spec.nc
     names = ["defect"] if class_agnostic else spec.names
+    known = set(known_class_ids) if known_class_ids is not None else None
+    if mode == "discovery" and known is None:
+        raise ValueError("NCD 模式必须提供 known_class_ids，否则无法隐藏新类")
+    stats["novel_class_ids"] = (sorted(set(range(spec.nc))-known) if mode == "discovery" else [])
+    # Honest NCD: an image containing a novel-class box is removed from detector
+    # training entirely.  Relabelling it "defect" would leak the novel class, and
+    # relabelling it background would actively teach YOLO that novel defects are
+    # normal -- destroying the very open-set recall we are trying to measure.
+    for split in ("train", "val"):
+        if mode != "discovery":
+            break
+        stats[split]["novel_boxes"] = sum(1 for e in entries[split] for a in e.annotations
+                                          if a.class_id not in known)
+        if split != "train":
+            continue
+        kept = [e for e in entries[split]
+                if all(a.class_id in known for a in e.annotations)]
+        stats[split]["dropped_novel_images"] = len(entries[split])-len(kept)
+        if not kept:
+            raise ValueError("隐藏新类后检测器 train 为空；请增加已知类或已知类样本")
+        if stats[split]["dropped_novel_images"]:
+            progress(f"检测器 train 排除 {stats[split]['dropped_novel_images']} 张含新类缺陷的图片"
+                     f"（新类 {stats['novel_class_ids']} 不参与检测器训练）")
+        entries[split] = kept
+        stats[split]["images"] = len(kept)
+        stats[split]["annotated_images"] = sum(bool(e.annotations) for e in kept)
+        stats[split]["regions"] = sum(len(e.annotations) for e in kept)
     manifest = {"format": DETECTOR_FORMAT, "schema_version": 1, "nc": nc, "names": names,
-                "class_agnostic": class_agnostic, "mode": mode, "stats": stats, "splits": {}}
+                "class_agnostic": class_agnostic, "mode": mode,
+                "known_class_ids": sorted(known) if known is not None else None,
+                "stats": stats, "splits": {}}
     if check_only:
         return manifest
     output.mkdir(parents=True, exist_ok=True)

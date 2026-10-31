@@ -55,6 +55,26 @@ detector:
   iou_threshold: 0.45
   anomaly_threshold: 0.25        # 图像异常分数阈值
 
+# 仅用正常图训练的 DINO patch 特征库 -> 像素级异常图 -> 自适应二值化 -> 掩码。
+# 这是未知类别检出能力的来源：特征库里没有任何缺陷，所以没见过的缺陷也会偏离正常分布。
+anomaly:
+  enabled: true
+  image_size: 448             # 比分类用的 224 更高，小缺陷定位更准；必须能被 patch_size 整除
+  layers: [3, 5, 7]           # DINO 中层特征，兼顾纹理与语义
+  neighborhood: 3             # patch 网格局部平均，抑制单点噪声（奇数）
+  bank_size: 8192             # coreset 后保留的正常特征数
+  max_candidates: 40000       # coreset 前的随机降采样上限
+  coreset: true               # 贪心 k-center；设为 false 则随机采样（快，覆盖略差）
+  knn: 3                      # 每个 patch 取 k 近邻平均距离
+  smooth_sigma: 4.0           # 异常图高斯平滑（原图像素单位）
+  topk_ratio: 0.01            # 图像分数 = 最高 1% patch 距离的均值，比单点 max 稳
+  min_area: 24                # 小于该像素面积的连通域视为噪声
+  max_area_ratio: 0.35        # 超过全图 35% 的连通域是阈值失败，不是缺陷
+  max_regions: 20
+  threshold_steps: 24         # MEBin 式阈值扫描步数
+  score_threshold: 1.0        # 归一化图像分数阈值；1.0 = 正常图上界（由 normalval 标定）
+  fuse_iou: 0.3               # 与 YOLO 框的融合 IoU 阈值
+
 inference:
   area_temperature: 50.0
   image_threshold: null       # null: 每图 top-1；设为 0~1 数值则多标签输出

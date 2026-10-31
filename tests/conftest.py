@@ -59,6 +59,12 @@ def smoke_config(synthetic, tmp_path):
         "training": {"batch_size": 5, "num_workers": 0, "epochs": 2, "accumulation_steps": 2,
                      "amp": False, "eval_every": 1, "lr": 0.001, "min_lr": 0.00001},
         "loss": {"warmup_teacher_temp_epochs": 1},
+        # tiny_vit has depth 4 and patch 8: the production anomaly defaults
+        # (layers 3,5,7 @ 448px) are invalid here and must be scaled down too.
+        "anomaly": {"enabled": True, "image_size": 32, "layers": [1, 2, 3], "neighborhood": 3,
+                    "bank_size": 64, "max_candidates": 512, "coreset": True, "knn": 3,
+                    "smooth_sigma": 1.0, "topk_ratio": 0.05, "min_area": 4,
+                    "max_regions": 5, "threshold_steps": 12},
         "experiment": {"device": "cpu", "output_dir": str(tmp_path / "run"), "print_freq": 10},
     })
     return cfg

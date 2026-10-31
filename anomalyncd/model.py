@@ -103,9 +103,17 @@ def resize_checkpoint_pos_embed(state: dict, target: torch.Tensor) -> dict:
     return state
 
 
-def load_model(cfg: dict, n_classes: int, load_pretrained: bool = True,
-               allow_random_init: bool = False) -> AnomalyNCDModel:
-    settings = cfg["model"]
+def build_backbone(cfg: dict, load_pretrained: bool = True, allow_random_init: bool = False,
+                   image_size: int | None = None) -> MaskedGuidedVisionTransformer:
+    """Frozen DINO backbone alone, optionally at a different input resolution.
+
+    Anomaly detection needs patch tokens from the *pretrained* backbone, not from
+    the class-finetuned one, so it builds its own copy through this helper.
+    """
+    settings = dict(cfg["model"])
+    if image_size is not None:
+        settings["image_size"] = image_size
+    cfg = {**cfg, "model": settings}
     name = settings["backbone"]
     spec = validate_model_config(cfg)
     backbone = MaskedGuidedVisionTransformer(
@@ -137,6 +145,15 @@ def load_model(cfg: dict, n_classes: int, load_pretrained: bool = True,
             backbone.load_state_dict(state, strict=True)
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
+    backbone.eval()
+    return backbone
+
+
+def load_model(cfg: dict, n_classes: int, load_pretrained: bool = True,
+               allow_random_init: bool = False) -> AnomalyNCDModel:
+    settings = cfg["model"]
+    spec = validate_model_config(cfg)
+    backbone = build_backbone(cfg, load_pretrained, allow_random_init)
     for parameter_name, parameter in backbone.named_parameters():
         if parameter_name.startswith("blocks."):
             block = int(parameter_name.split(".")[1])
