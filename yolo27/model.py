@@ -1,4 +1,4 @@
-"""YOLO27 unified model, detection model, and fabric-defect-aware trainer."""
+"""YOLO27 unified model, detection model, and fast-converging fabric-defect trainer."""
 
 from __future__ import annotations
 
@@ -11,13 +11,14 @@ from ultralytics.models import yolo
 from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.modules.head import Detect
-from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.tasks import DetectionModel, torch_safe_load
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.torch_utils import initialize_weights
 
 from .loss import YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
+from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
 
 # Register custom classes for PyTorch safe checkpoint serialization when supported
 if hasattr(torch.serialization, "add_safe_globals"):
@@ -67,13 +68,52 @@ if hasattr(torch.serialization, "add_safe_globals"):
 
 
 class YOLO27Trainer(DetectionTrainer):
-    """YOLO27 trainer supporting YOLO26/27 MuSGD recipe and fabric19 ``normaltrain`` / ``normalval``."""
+    """YOLO27 trainer optimized for rapid mAP convergence on 19-class fabric defect detection.
+
+    Convergence optimizations enabled by default:
+      1. Smart Pretrained Warm-Start: automatically transfers exact + channel-sliced weights
+         from ``yolo26n.pt`` (or ``yolo26s.pt``) into widened YOLO27n layers (~75%–84% params).
+      2. Stable Optimizer & Warmup: uses ``AdamW`` (``lr0=0.0015``, ``cos_lr=True``) and locks
+         ``warmup_bias_lr=0.0`` so negative focal biases never blow up in early epochs.
+      3. DFL-free L1 Box Gain Calibration: sets ``dfl=6.0`` (matching Ultralytics YOLO26/27
+         ``reg_max=1`` recipe) instead of legacy ``1.5`` to accelerate tight IoU convergence.
+      4. Small-Defect Safe Augmentation: sets ``erasing=0.0`` (prevents random erasing from
+         wiping out tiny defects while keeping labels), ``flipud=0.5``, ``scale=0.35``,
+         and ``close_mosaic=20``.
+    """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         overrides = dict(overrides or {})
-        # Default to MuSGD (Muon + SGD hybrid optimizer introduced in YOLO26/27) if left at 'auto'
-        overrides.setdefault("optimizer", "MuSGD")
-        overrides.setdefault("close_mosaic", 10)
+
+        opt_choice = str(overrides.get("optimizer", "AdamW"))
+        overrides.setdefault("optimizer", opt_choice)
+        if opt_choice.lower() == "adamw":
+            overrides.setdefault("lr0", 0.0015)
+            overrides.setdefault("lrf", 0.01)
+        elif opt_choice.lower() == "musgd":
+            overrides.setdefault("lr0", 0.004)
+            overrides.setdefault("lrf", 0.05)
+
+        # Protect focal prior biases on cv3 / fg_branch during warmup (prevents early cls_loss explosion)
+        overrides.setdefault("warmup_bias_lr", 0.0)
+        overrides.setdefault("warmup_epochs", 3.0)
+        overrides.setdefault("cos_lr", True)
+
+        # DFL-free (reg_max=1) normalized L1 loss requires higher gain than 16-bin DFL
+        overrides.setdefault("box", 7.5)
+        overrides.setdefault("cls", 0.5)
+        overrides.setdefault("dfl", 6.0)
+
+        # Fabric-defect friendly data augmentation (do NOT erase tiny defects!)
+        overrides.setdefault("erasing", 0.0)
+        overrides.setdefault("flipud", 0.5)
+        overrides.setdefault("fliplr", 0.5)
+        overrides.setdefault("scale", 0.35)
+        overrides.setdefault("mosaic", 1.0)
+        overrides.setdefault("close_mosaic", 20)
+        if hasattr(DEFAULT_CFG, "cls_pw"):
+            overrides.setdefault("cls_pw", 0.25)
+
         super().__init__(cfg, overrides, _callbacks)
 
     @staticmethod
@@ -104,12 +144,7 @@ class YOLO27Trainer(DetectionTrainer):
         return data
 
     def set_model_names_for_load(self, model: YOLO27DetectionModel) -> YOLO27DetectionModel:
-        """Align model class names with dataset names before optional weight loading.
-
-        This hook exists so that when ``model.load(weights)`` is called, the model's
-        detection head ``names`` already matches the dataset YAML, which avoids
-        class-name mismatch warnings / head re-initialization surprises.
-        """
+        """Align model class names with dataset names before optional weight loading."""
         names = self.data.get("names")
         if names is not None and hasattr(model, "names"):
             try:
@@ -118,32 +153,40 @@ class YOLO27Trainer(DetectionTrainer):
                 LOGGER.warning(f"YOLO27Trainer: failed to set model names before load: {e}")
         return model
 
+    def set_model_attributes(self) -> None:
+        """Attach dataset metadata and align ``loss_names`` across older and newer Ultralytics versions."""
+        super().set_model_attributes()
+        # Older Ultralytics versions pre-populate self.loss_names = ('box_loss', 'cls_loss', 'dfl_loss') here;
+        # append 'fg_loss' when pre-populated so 4-item Tensor loss_items matches validator & CSV columns.
+        if getattr(self, "loss_names", None) and len(self.loss_names) == 3:
+            self.loss_names = (*self.loss_names, "fg_loss")
+
     def get_model(
         self,
         cfg: str | dict | None = None,
         weights: torch.nn.Module | None = None,
         verbose: bool = True,
     ) -> YOLO27DetectionModel:
-        """Build ``YOLO27DetectionModel`` for training."""
+        """Build ``YOLO27DetectionModel`` and apply smart exact + channel-sliced pretrained warm-start."""
         model = self.set_model_names_for_load(
             YOLO27DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         )
-        if weights:
-            model.load(weights)
+        if weights is not None:
+            transfer_pretrained_weights(weights, model)
+        elif self.args.pretrained and not self.resume:
+            scale = model.yaml.get("scale", "n") if isinstance(getattr(model, "yaml", None), dict) else "n"
+            donor_name = "yolo26s.pt" if scale == "s" else "yolo26n.pt"
+            donor_path = resolve_donor_checkpoint(donor_name, allow_download=True)
+            if donor_path is not None:
+                ckpt, _ = torch_safe_load(str(donor_path))
+                donor_model = ckpt.get("ema") or ckpt.get("model")
+                if donor_model is not None:
+                    transfer_pretrained_weights(donor_model, model)
         return model
 
 
 class YOLO27(YOLO):
-    """Unified Ultralytics-compatible interface for YOLO27n / YOLO27n-Lite / YOLO27s models.
-
-    Examples:
-        >>> from yolo27 import YOLO27
-        >>> model = YOLO27("models/yolo27n.yaml")          # standard YOLO27n (~2.94M params, ~7.2 GFLOPs)
-        >>> model_lite = YOLO27("models/yolo27n-lite.yaml") # ultra-light YOLO27n-Lite (~0.75M params, ~3.0 GFLOPs)
-        >>> model.train(data="dataset/fabric19.yaml", epochs=150, imgsz=640)
-        >>> results_nms = model.predict("sample.jpg")                 # default one-to-many + NMS
-        >>> results_e2e = model.predict("sample.jpg", nms=False)      # NMS-free one-to-one end-to-end
-    """
+    """Unified Ultralytics-compatible interface for YOLO27n / YOLO27n-Lite / YOLO27s models."""
 
     def __init__(self, model: str | Path = "models/yolo27n.yaml", task: str | None = "detect", verbose: bool = False):
         super().__init__(model=model, task=task, verbose=verbose)

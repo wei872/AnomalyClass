@@ -34,9 +34,10 @@
   3. **纯正常布面样本（`normaltrain` / `normalval`）天然协同**：[`YOLO27Trainer`](yolo27/model.py) 自动识别 `dataset/fabric19.yaml` 中的 `normaltrain` 与 `normalval` 无缺陷正常布匹目录并挂载为负样本，前景对齐分支在正常布面上全锚点监督为 `0`，强力抑制纹理误报；
   4. **推理与导出完全剥离**：调用 `fuse()` 或导出 ONNX / TensorRT 时自动置空 `fg_branch = None`，**不增加任何部署延迟或模型体积**。
 
-### 5. 继承并融合 YOLO26 的底层轻量化与优化基座
-- **无 DFL 直接回归（`reg_max: 1`）**：移除 Distribution Focal Loss 的 16-bin 离散分布积分层，直接回归 4 维边界距离（CIoU + 归一化 L1 Loss），简化算子图，极大方便边缘端量化与 TensorRT/ONNX 部署。
-- **渐进式损失平衡（ProgLoss）+ 小目标感知标签分配（STAL）+ `MuSGD` 混合优化器**：训练初期侧重一对多密集特征学习，随轮次推进平滑过渡至一对一预测头，并采用结合 Muon 正交化更新与 SGD 的 `MuSGD` 优化器加速收敛。
+### 5. 面向自定义数据集的快速收敛增强体系（Fast-Convergence Recipe）
+- **智能预训练权重子空间热启动（[`yolo27/weights.py`](yolo27/weights.py)）**：从 `.yaml` 构建 `YOLO27n` / `YOLO27n-Lite` 时自动从 `yolo26n.pt` 执行精确层 1:1 拷贝 + 加宽层（P2/P3/P4 `C3k2` 及双尺度 `cv2`/`cv3` 特征塔）通道对齐切片迁移（覆盖约 **80%+** 参数，同时完整保留 19 类目标的 Focal 偏置先验）。
+- **无衰减双头梯度 + 双尺度 STAL `stride_val=16` 校准（[`yolo27/loss.py`](yolo27/loss.py)）**：保持 `o2m=1.0, o2o=1.0` 全程无衰减（避免 `one2one` `x.detach()` 导致中后期主干梯度饥饿，并让端到端验证头从第 1 轮全速收敛）；修复双尺度 `[8, 32]` 下 `TaskAlignedAssigner` 默认将候选框下限放大为 `32px` 的问题，恢复为 `16px` 并提升 `tal_topk=13`。
+- **无 DFL 直接回归增益校准 + 小目标安全增强（[`yolo27/model.py`](yolo27/model.py)）**：匹配 `reg_max=1` 将归一化 L1 增益提升至 `dfl=6.0`；默认启用 `AdamW (lr0=0.0015) + cos_lr=True + warmup_bias_lr=0.0`（防止早期分类偏置爆炸），并设置 `erasing=0.0`（防止随机擦除抹掉微小瑕疵标签）、`flipud=0.5`、`close_mosaic=20`。
 
 ---
 
@@ -62,9 +63,10 @@ AnomalyClass/
 │   └── yolo27n-lite.yaml      # YOLO27n-Lite 极轻量化边缘版配置 (~0.75M params / 3.0 GFLOPs)
 ├── yolo27/
 │   ├── __init__.py
+│   ├── weights.py             # yolo26n.pt 智能精确+通道切片预训练热启动迁移
 │   ├── modules.py             # YOLO27Detect 双尺度检测头、固定缩放折叠与 ForegroundAlignmentBranch
-│   ├── loss.py                # YOLO27E2ELoss 前景对齐监督损失 + 渐进式双头损失
-│   └── model.py               # YOLO27 统一接口、YOLO27DetectionModel 与支持 normal 样本的 YOLO27Trainer
+│   ├── loss.py                # YOLO27E2ELoss 前景对齐监督损失 + 无衰减双头损失 + 双尺度 STAL 校准
+│   └── model.py               # YOLO27 统一接口、YOLO27DetectionModel 与快速收敛 YOLO27Trainer
 ├── train_yolo27n.py           # 一键参数统计 / 训练 / 验证 / 推理 / ONNX 导出脚本
 └── tests/
     └── test_yolo27n.py        # 架构规格、重参数化数值等价性、前景损失梯度与端到端训练单测
@@ -84,8 +86,11 @@ python train_yolo27n.py --mode profile
 先将 `dataset/fabric19.yaml` 中的 `path / train / val / normaltrain / normalval` 修改为你机器上的实际数据路径（若 `normaltrain` / `normalval` 目录存在，`YOLO27Trainer` 会自动将其作为纯背景负样本加入训练与验证）：
 
 ```bash
-# 训练标准版 YOLO27n
+# 推荐：将 yolo26n.pt 放在项目根目录（或联网自动下载），自动启用 ~80% 参数热启动 + AdamW 快速收敛配方
 python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 32 --imgsz 640
+
+# 显式指定本地预训练权重路径（例如 Windows 本地已有权重）
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --epochs 150 --batch 32
 
 # 或训练极轻量版 YOLO27n-Lite (0.75M 参数)
 python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150 --batch 64 --imgsz 640

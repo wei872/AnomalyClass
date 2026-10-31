@@ -1,4 +1,4 @@
-"""Automated verification suite for YOLO27n and YOLO27n-Lite."""
+"""Automated verification suite for YOLO27n, YOLO27n-Lite, and fast-convergence fixes."""
 
 from __future__ import annotations
 
@@ -7,16 +7,17 @@ from pathlib import Path
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import cv2
 import numpy as np
 import torch
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ultralytics import YOLO
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
-from yolo27 import YOLO27, YOLO27Detect, YOLO27DetectionModel, YOLO27E2ELoss
+from yolo27 import YOLO27, YOLO27Detect, YOLO27DetectionModel, YOLO27E2ELoss, transfer_pretrained_weights
 
 
 def test_yolo27n_official_specs_and_dual_scale() -> None:
@@ -44,6 +45,20 @@ def test_yolo27n_lite_specs() -> None:
     flops_b = get_flops(fused_lite, imgsz=640)
     assert params_m < 1.0, f"Expected <1.0M params for YOLO27n-Lite, got {params_m:.3f}M"
     assert flops_b < 3.5, f"Expected <3.5B FLOPs for YOLO27n-Lite, got {flops_b:.2f}B"
+
+
+def test_smart_pretrained_weight_transfer() -> None:
+    """Verify exact + channel-sliced warm-start from YOLO26n transfers >=70% params while keeping 19-cls focal bias."""
+    donor = YOLO("yolo26n.yaml").model
+    target = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
+    orig_cls_bias = target.model[-1].cv3[0][-1].bias.detach().clone()
+
+    stats = transfer_pretrained_weights(donor, target)
+    assert stats["ratio"] >= 0.70, f"Expected >=70% warm-start coverage, got {stats['ratio']:.3f}"
+    # Stem Conv must match donor 100% exactly
+    assert torch.allclose(donor.model[0].conv.weight, target.model[0].conv.weight)
+    # 19-class focal prior bias on cv3 must NOT be overwritten by 80-class donor
+    assert torch.allclose(orig_cls_bias, target.model[-1].cv3[0][-1].bias)
 
 
 def test_fuse_exact_equivalence_both_modes() -> None:
@@ -78,14 +93,25 @@ def test_fuse_exact_equivalence_both_modes() -> None:
     assert max_diff_e2e < 1e-4, f"E2E mode fuse mismatch: max_diff={max_diff_e2e}"
 
 
-def test_foreground_alignment_loss_and_empty_normal_batch() -> None:
-    """Verify YOLO27E2ELoss gradients flow into backbone, one2many, one2one, and fg_branch (incl. pure normal images)."""
+def test_loss_convergence_fixes_and_empty_normal_batch() -> None:
+    """Verify STAL stride_val=16 fix, constant o2m=1.0 schedule, and gradients on mixed + normal batches."""
     from types import SimpleNamespace
 
     model = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False).train()
-    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
+    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=6.0, epochs=100)
     criterion = model.init_criterion()
     assert isinstance(criterion, YOLO27E2ELoss)
+
+    # Verify dual-scale STAL stride_val fix (16 px instead of 32 px!)
+    assert criterion.one2many.assigner.stride_val == 16
+    assert criterion.one2one.assigner.stride_val == 16
+    assert criterion.o2m == 1.0
+
+    # Verify o2m never decays below 1.0 while o2o ramps smoothly to 1.0
+    for _ in range(99):
+        criterion.update()
+    assert criterion.o2m == 1.0
+    assert abs(criterion.o2o - 1.0) < 1e-6
 
     # Case A: Mixed batch (image 0 has 2 small defects, image 1 is pure normal defect-free fabric)
     imgs = torch.rand(2, 3, 320, 320)
@@ -93,18 +119,19 @@ def test_foreground_alignment_loss_and_empty_normal_batch() -> None:
         "img": imgs,
         "batch_idx": torch.tensor([0.0, 0.0]),
         "cls": torch.tensor([[14.0], [7.0]]),  # 蚊虫小黑点, 经线毛球
-        "bboxes": torch.tensor([[0.25, 0.25, 0.04, 0.04], [0.70, 0.60, 0.20, 0.15]]),
+        "bboxes": torch.tensor([[0.25, 0.25, 0.03, 0.03], [0.70, 0.60, 0.20, 0.15]]),
     }
     preds = model(imgs)
     assert "fg_logits" in preds
-    # 320x320 -> P3/8 is 40x40=1600, P5/32 is 10x10=100 -> 1700 anchors
     assert preds["fg_logits"].shape == (2, 1, 1700)
 
-    loss_vec, loss_items = criterion(preds, batch_mixed)
-    assert set(loss_items.keys()) == {"box_loss", "cls_loss", "l1_loss", "fg_loss"}
-    total = loss_vec.sum()
-    assert torch.isfinite(total)
-    total.backward()
+    total_loss, loss_items = criterion(preds, batch_mixed)
+    assert total_loss.ndim == 0 and torch.isfinite(total_loss)
+    if isinstance(loss_items, dict):
+        assert "fg_loss" in loss_items
+    else:
+        assert loss_items.numel() == 4
+    total_loss.backward()
 
     head = model.model[-1]
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.fg_branch.parameters())
@@ -120,14 +147,13 @@ def test_foreground_alignment_loss_and_empty_normal_batch() -> None:
         "bboxes": torch.zeros((0, 4), dtype=torch.float32),
     }
     preds_normal = model(imgs)
-    loss_normal, items_normal = criterion(preds_normal, batch_normal)
-    assert torch.isfinite(loss_normal.sum())
-    assert items_normal["fg_loss"] >= 0
-    loss_normal.sum().backward()
+    loss_normal, _ = criterion(preds_normal, batch_normal)
+    assert torch.isfinite(loss_normal)
+    loss_normal.backward()
 
 
 def test_end_to_end_train_val_predict_with_normaltrain() -> None:
-    """Run an actual 1-epoch train -> val -> predict(nms=True/False) on a synthetic 19-class fabric dataset."""
+    """Run an actual train -> val -> predict(nms=True/False) cycle on a synthetic 19-class fabric dataset."""
     names = [
         "纬线杂质", "断纬", "多股线", "纬线不直", "包边不重叠", "捻接器接头",
         "小尾巴", "经线毛球", "包边不良", "手工接头", "纬斜", "短废纱线",
@@ -135,10 +161,16 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        for sub in ("images/train", "images/val", "labels/train", "labels/val", "normal/images/train", "normal/images/val"):
+        for sub in (
+            "images/train",
+            "images/val",
+            "labels/train",
+            "labels/val",
+            "normal/images/train",
+            "normal/images/val",
+        ):
             (root / sub).mkdir(parents=True, exist_ok=True)
 
-        # Create synthetic defective images + YOLO labels
         rng = np.random.default_rng(0)
         for split in ("train", "val"):
             for i in range(4):
@@ -148,7 +180,6 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
                 cls_id = i % 19
                 (root / f"labels/{split}/def_{i}.txt").write_text(f"{cls_id} 0.273 0.273 0.234 0.234\n", encoding="utf-8")
 
-            # Create synthetic defect-free normal fabric images (no .txt label files)
             for i in range(2):
                 norm_img = rng.integers(120, 180, size=(128, 128, 3), dtype=np.uint8)
                 cv2.imwrite(str(root / f"normal/images/{split}/norm_{i}.jpg"), norm_img)
@@ -177,6 +208,7 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
             imgsz=128,
             batch=2,
             workers=0,
+            pretrained=False,
             device="cpu",
             project=str(root / "runs"),
             name="exp",
@@ -185,7 +217,6 @@ def test_end_to_end_train_val_predict_with_normaltrain() -> None:
         best_pt = root / "runs/exp/weights/best.pt"
         assert best_pt.exists(), "Expected best.pt checkpoint to be saved"
 
-        # Reload checkpoint via YOLO27 and run both NMS and NMS-free inference
         loaded = YOLO27(best_pt)
         sample_img = str(root / "images/val/def_0.jpg")
         res_nms = loaded.predict(sample_img, imgsz=128, nms=True, verbose=False)
@@ -197,8 +228,9 @@ if __name__ == "__main__":
     for fn in (
         test_yolo27n_official_specs_and_dual_scale,
         test_yolo27n_lite_specs,
+        test_smart_pretrained_weight_transfer,
         test_fuse_exact_equivalence_both_modes,
-        test_foreground_alignment_loss_and_empty_normal_batch,
+        test_loss_convergence_fixes_and_empty_normal_batch,
         test_end_to_end_train_val_predict_with_normaltrain,
     ):
         print(f"[RUN ] {fn.__name__} ...")

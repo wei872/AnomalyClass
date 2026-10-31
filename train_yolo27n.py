@@ -5,17 +5,20 @@ Usage examples:
   1. Profile model parameters, FLOPs & dual-scale structure:
        python train_yolo27n.py --mode profile
 
-  2. Train YOLO27n (official-spec nano, ~2.94M params) on 19-class fabric defects:
+  2. Train YOLO27n (fast convergence: auto warm-starts from yolo26n.pt + AdamW + cos_lr):
        python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150
 
   3. Train YOLO27n-Lite (extreme lightweight, ~0.75M params / 3.0 GFLOPs):
        python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150
 
-  4. Run inference (default NMS mode vs. NMS-free end-to-end mode):
+  4. Specify local donor checkpoint explicitly (e.g. D:/weights/yolo26n.pt) or disable warm-start (--pretrained none):
+       python train_yolo27n.py --mode train --model models/yolo27n.yaml --pretrained yolo26n.pt
+
+  5. Run inference (default NMS mode vs. NMS-free end-to-end mode):
        python train_yolo27n.py --mode predict --model runs/detect/train/weights/best.pt --source sample.jpg
        python train_yolo27n.py --mode predict --model runs/detect/train/weights/best.pt --source sample.jpg --no-nms
 
-  5. Export fused NMS-free ONNX model (fg_branch & unused head automatically stripped):
+  6. Export fused NMS-free ONNX model (fg_branch & unused head automatically stripped):
        python train_yolo27n.py --mode export --model runs/detect/train/weights/best.pt --format onnx --no-nms
 """
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from pathlib import Path
 
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import get_flops, get_num_params
@@ -92,7 +96,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=32, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Input image size")
     parser.add_argument("--device", default="", help="Device, e.g. '0' or 'cpu'")
-    parser.add_argument("--optimizer", default="MuSGD", help="Optimizer (default: MuSGD)")
+    parser.add_argument(
+        "--optimizer",
+        default="AdamW",
+        help="Optimizer (recommended: AdamW for fast custom-dataset convergence; or MuSGD)",
+    )
+    parser.add_argument(
+        "--lr0",
+        type=float,
+        default=None,
+        help="Initial learning rate (defaults to 0.0015 for AdamW, 0.004 for MuSGD)",
+    )
+    parser.add_argument(
+        "--pretrained",
+        default="auto",
+        help="Pretrained donor weights: 'auto' (default, uses yolo26n.pt), path to a .pt file, or 'none'",
+    )
     parser.add_argument("--source", default="", help="Image/folder source for predict mode")
     parser.add_argument("--format", default="onnx", help="Export format (onnx, engine, torchscript, etc.)")
     parser.add_argument(
@@ -103,10 +122,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
+        default=4,
         help="Dataloader worker processes (Windows 建议 0 或 4)",
     )
     return parser.parse_args()
+
+
+def _resolve_pretrained_arg(val: str) -> bool | str:
+    low = val.strip().lower()
+    if low in {"none", "false", "0", "no"}:
+        return False
+    if low in {"auto", "true", "1", "yes"}:
+        return True
+    if Path(val).is_file():
+        return val
+    return val
 
 
 def main() -> None:
@@ -119,18 +149,30 @@ def main() -> None:
     nms_flag = False if args.no_nms else True
 
     if args.mode == "train":
-        train_kwargs = dict(
+        train_kwargs: dict[str, object] = dict(
             data=args.data,
             epochs=args.epochs,
             batch=args.batch,
             imgsz=args.imgsz,
             optimizer=args.optimizer,
-            workers=args.workers,  # 新增
-            close_mosaic=10,
+            workers=args.workers,
+            pretrained=_resolve_pretrained_arg(args.pretrained),
+            cos_lr=True,
+            warmup_epochs=3.0,
+            warmup_bias_lr=0.0,
+            box=7.5,
+            cls=0.5,
+            dfl=6.0,
+            erasing=0.0,
+            flipud=0.5,
+            fliplr=0.5,
+            scale=0.35,
             mosaic=1.0,
             copy_paste=0.1,
-            scale=0.5,
+            close_mosaic=20,
         )
+        if args.lr0 is not None:
+            train_kwargs["lr0"] = args.lr0
         if args.device:
             train_kwargs["device"] = args.device
         model.train(**train_kwargs)
