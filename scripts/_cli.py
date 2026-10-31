@@ -48,6 +48,8 @@ def training_overrides(args: argparse.Namespace) -> dict:
         train["amp"] = args.amp
     if getattr(args, "class_balanced", False):
         train["class_balanced_sampler"] = True
+    if getattr(args, "persistent_workers", None) is not None:
+        train["persistent_workers"] = args.persistent_workers
     for key in ("seed", "device", "output_dir"):
         if getattr(args, key, None) is not None:
             experiment[key] = str(Path(getattr(args, key)).expanduser().resolve()) if key == "output_dir" else getattr(args, key)
@@ -83,6 +85,9 @@ def add_training_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--class-balanced", action="store_true")
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=None,
+                        help="复用 DataLoader worker，避免每 epoch 重启进程；"
+                             "开启后增强随机流与非复用模式不同（采样顺序不变）")
     decisions = parser.add_mutually_exclusive_group()
     decisions.add_argument("--image-threshold", type=float, help="图像多标签阈值；默认沿用配置")
     decisions.add_argument("--top1", action="store_true", help="每图仅输出概率最高的缺陷类")

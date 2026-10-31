@@ -83,9 +83,15 @@ def make_loader(dataset: FabricRegions, cfg: dict, training: bool, device: torch
             weights = [1.0] * len(labels)
         sampler = WeightedRandomSampler(torch.DoubleTensor(weights), len(labels), replacement=True, generator=generator)
     workers = cfg["training"]["num_workers"]
+    # Opt-in. Reusing workers avoids re-spawning them every epoch (with spawn on
+    # Windows that dominated wall time: ~44s of a 54s epoch). It is OFF by
+    # default because worker RNG is seeded once instead of per epoch, so the
+    # augmentation stream on a resumed run differs from a non-persistent run.
+    # Sampling ORDER is unaffected: it comes from the main-process generator.
+    persistent = bool(cfg["training"].get("persistent_workers", False)) and workers > 0
     return DataLoader(dataset, batch_size=cfg["training"]["batch_size"], shuffle=training and sampler is None,
                       sampler=sampler, num_workers=workers, pin_memory=device.type == "cuda",
-                      drop_last=False, persistent_workers=False,
+                      drop_last=False, persistent_workers=persistent,
                       worker_init_fn=worker_init_fn, generator=generator,
                       multiprocessing_context="spawn" if workers and workers > 0 else None)
 

@@ -121,13 +121,19 @@ def _greedy_coreset(features: torch.Tensor, target: int, progress=lambda _: None
     count = features.shape[0]
     if target >= count:
         return torch.arange(count, device=features.device)
+    # ||x-c||^2 = ||x||^2 - 2 x.c + ||c||^2 via a matvec.  The naive
+    # (features-c)**2 form allocates a [N, D] temporary on every one of the
+    # `target` iterations (176 MiB x 8192 at production scale).
+    # The ||c||^2 term MUST be kept: min_distance compares across iterations,
+    # so dropping a per-centre constant would corrupt the selection.
+    norms = (features*features).sum(dim=1)
     centre = features.mean(dim=0)
-    index = int(torch.argmax(((features-centre)**2).sum(dim=1)))
+    index = int(torch.argmax(norms - 2*(features @ centre) + (centre*centre).sum()))
     chosen = [index]
     min_distance = torch.full((count,), float("inf"), device=features.device)
     picked = torch.zeros(count, dtype=torch.bool, device=features.device)
     for step in range(1, target):
-        distance = ((features-features[index])**2).sum(dim=1)
+        distance = (norms - 2*(features @ features[index]) + norms[index]).clamp_min_(0)
         min_distance = torch.minimum(min_distance, distance)
         picked[index] = True
         min_distance = min_distance.masked_fill(picked, -1.0)
@@ -159,25 +165,34 @@ def build_bank(normal_root: str | Path, output: str | Path, cfg: dict, device_na
     settings = encoder.settings
     progress(f"编码 {len(paths)} 张正常图 @ {settings['image_size']}px, layers={settings['layers']}")
 
+    # Subsample per image WHILE encoding. Materialising every patch first would
+    # need 320 x 3136 x 1152 x 4B = 4.3 GiB of host RAM (twice that during
+    # concatenate) and then the same 4.3 GiB on the GPU before downsampling --
+    # an OOM on 8 GB cards. A per-image quota also guarantees every normal image
+    # contributes, which global random sampling does not.
+    per_image = max(1, -(-settings["max_candidates"] // len(paths)))
+    patches_per_image = encoder.side**2
+    total = len(paths)*patches_per_image
+    rng = np.random.default_rng(0)
     collected = []
     for start in range(0, len(paths), batch_size):
         images = []
         for path in paths[start:start+batch_size]:
             with Image.open(path) as handle:
                 images.append(handle.convert("RGB"))
-        collected.append(encoder.encode(images, batch_size))
+        features = encoder.encode(images, batch_size)
+        keep = min(per_image, features.shape[1])
+        for index in range(features.shape[0]):
+            pick = rng.choice(features.shape[1], size=keep, replace=False)
+            collected.append(features[index, pick])
         if (start // batch_size) % 10 == 0:
             progress(f"encoded {min(start+batch_size, len(paths))}/{len(paths)}")
-    features = np.concatenate(collected, axis=0).reshape(-1, collected[0].shape[-1])
-    total = features.shape[0]
-    progress(f"正常 patch 特征: {total} x {features.shape[1]}")
-
-    pool = torch.from_numpy(features).to(device)
-    if total > settings["max_candidates"]:
-        generator = torch.Generator(device="cpu").manual_seed(0)
-        pick = torch.randperm(total, generator=generator)[:settings["max_candidates"]].to(device)
-        pool = pool[pick]
-        progress(f"随机降采样至 {pool.shape[0]} 个候选")
+    candidates = np.concatenate(collected, axis=0)
+    if candidates.shape[0] > settings["max_candidates"]:
+        pick = rng.choice(candidates.shape[0], size=settings["max_candidates"], replace=False)
+        candidates = candidates[pick]
+    progress(f"正常 patch 总数 {total:,}；分层采样候选 {candidates.shape[0]} x {candidates.shape[1]}")
+    pool = torch.from_numpy(candidates).to(device)
     if settings["coreset"] and pool.shape[0] > settings["bank_size"]:
         indices = _greedy_coreset(pool, settings["bank_size"], progress)
         pool = pool[indices]

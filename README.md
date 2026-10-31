@@ -215,6 +215,9 @@ python scripts/train_fabricncd.py \
 
 - 特征库**只含正常图**，所以不需要缺陷标注，也不会限制能检出的缺陷种类；
 - 贪心 coreset（`bank_size: 8192`）在 GPU 上通常需要几分钟；急用可加 `--no-coreset` 或调小 `--bank-size`；
+- 建库采用**按图分层采样**：每张正常图分配 `max_candidates / 图片数` 个 patch 配额，边编码边采样。
+  320 张 @448px 的 patch 总数是 1,003,520，若先全量驻留再降采样需要 4.31 GiB 显存（`concatenate` 期间翻倍），
+  8GB 显卡会 OOM；分层采样把候选峰值压到约 176 MiB，同时保证每张正常图都有贡献；
 - `--anomaly-image-size` 只改异常图分辨率，不影响分类器的 `model.image_size`；
 - 特征库记录了骨干权重指纹与分辨率/层号，**换了权重或参数必须重建**，否则会被直接拦下（不同权重的距离没有可比性）；
 - 未标定（`--skip-calibration`）时异常分数没有绝对含义，部署前务必标定；
@@ -349,6 +352,34 @@ anomaly:
 
 区域分类仍使用 MGViT、双视图增强、多头原型、SupCon/自蒸馏/InfoNCE/ME-Max 等思路。多 head 用累计训练损失选择，不用 val 标签挑 NCD head。checkpoint 使用 `torch.load(weights_only=True)`。
 
+### 训练吞吐：`--persistent-workers`
+
+Windows/macOS 用 `spawn` 启动 DataLoader worker。默认每个 epoch 重建 worker，实测一个 54s 的 epoch 里
+约 **44s 花在进程启动上**（21s train + 23s val），真正计算只有 10s：
+
+```bash
+python scripts/train_fabricncd.py --config configs/fabric19.yaml \
+  --data-root /实际数据根目录 --epochs 20 --persistent-workers \
+  --output-dir outputs/fabricncd_v2
+```
+
+默认**关闭**，因为开启后 worker 的 RNG 只初始化一次，续训时的数据增强随机流与关闭时不同。
+采样顺序不受影响（仍由主进程 `generator` 决定），指标可比，但不是逐 batch 位级可复现。
+`num_workers: 0` 时该开关自动失效。
+
+### 检测器分辨率：实测 1280 不如 640
+
+同一 val（177 图 / 103 实例）上的实测对比：
+
+| image_size | P | R | mAP50 | mAP50-95 | 100 epoch 耗时 |
+| --- | --- | --- | --- | --- | --- |
+| 640 | 0.908 | 0.865 | 0.930 | **0.650** | **0.26 h** |
+| 1280 | 0.909 | 0.869 | 0.929 | 0.638 | 0.734 h |
+
+分辨率翻倍花了 **2.82 倍**时间，mAP50-95 反而降了 0.012，其余指标在噪声内。
+说明当前瓶颈不是输入分辨率，而是样本量（492 个训练区域）与标注一致性。
+**建议保持 `detector.image_size: 640`**，把算力花在开集异常定位和增加数据上。
+
 ## 6. 仅区域分类/评估的旧接口
 
 如果已经有外部检测框，只想做区域分类，仍可使用：
@@ -372,7 +403,7 @@ ruff check anomalyncd scripts tests
 python -m compileall -q anomalyncd scripts
 ```
 
-当前验证：`pytest -q` 为 **53 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、split 审计与隔离还原、感知哈希近似重复、MGViT 梯度、SupCon 正样本配对顺序、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护、异常图定位注入缺陷/正常图零区域、退化连通域拒绝、特征库权重指纹与参数一致性拦截、掩码裁剪保留缺陷形状、融合来源与未知类候选标记、检测器真正排除含新类图片、以及**完全没有 YOLO 参与时仅靠异常图检出缺陷**的端到端链路。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟，并在人为注入 13 张重复图片的数据上验证了 `--drop-leaked-val`：检测器与区域两条链路均剔除 13 张、train/val 哈希交集为 0、原始文件未改动，训练与四阶段预测正常完成。
+当前验证：`pytest -q` 为 **56 passed**，`ruff check` 通过。合成数据 CPU 测试覆盖：默认轻量配置、检测器数据构建/正常背景/NCD 类别隔离、端到端四阶段输出、正常图不强行分类、中文路径、Windows 根目录重定位、标签/泄漏检查、split 审计与隔离还原、感知哈希近似重复、MGViT 梯度、SupCon 正样本配对顺序、监督/NCD 训练评估、中断续训、安全 checkpoint、位置编码插值、CLI 和推理输入保护、异常图定位注入缺陷/正常图零区域、退化连通域拒绝、特征库权重指纹与参数一致性拦截、掩码裁剪保留缺陷形状、融合来源与未知类候选标记、检测器真正排除含新类图片、以及**完全没有 YOLO 参与时仅靠异常图检出缺陷**的端到端链路、coreset 快速距离式与朴素式的选点等价性、建库候选数上限、`persistent_workers` 默认关闭。另已完成随机初始化 YOLOv8n + tiny MGViT 的端到端训练/打包/原图预测 CPU 冒烟，并在人为注入 13 张重复图片的数据上验证了 `--drop-leaked-val`：检测器与区域两条链路均剔除 13 张、train/val 哈希交集为 0、原始文件未改动，训练与四阶段预测正常完成。
 
 **本仓库当前没有真实 Fabric19 图片，也没有在真实数据/GPU/官方预训练权重上完成训练验证。** 合成测试通过只说明流程和张量/标签逻辑可运行，不代表真实布匹缺陷检测/分类准确率。
 

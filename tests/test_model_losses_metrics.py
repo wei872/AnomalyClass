@@ -161,3 +161,25 @@ def test_supcon_identical_views_and_single_class_is_finite():
     # Distinct labels still leave the two views of each sample as positives.
     loss = loss_fn(features, torch.arange(4))
     assert torch.isfinite(loss) and float(loss) > 0
+
+
+def test_persistent_workers_is_opt_in(smoke_config, synthetic):
+    """Default must stay off: enabling it changes the augmentation RNG stream."""
+    import torch
+
+    from anomalyncd.data import FabricRegions
+    from anomalyncd.engine import make_loader
+
+    cfg = copy.deepcopy(smoke_config)
+    order = list(range(19))
+    data = FabricRegions(cfg["data"]["prepared_root"], "val", order, 19, "supervised",
+                         evaluation=True)
+    device = torch.device("cpu")
+    cfg["training"]["num_workers"] = 2
+    cfg["training"].pop("persistent_workers", None)
+    assert make_loader(data, cfg, False, device).persistent_workers is False
+    cfg["training"]["persistent_workers"] = True
+    assert make_loader(data, cfg, False, device).persistent_workers is True
+    # num_workers=0 cannot have persistent workers.
+    cfg["training"]["num_workers"] = 0
+    assert make_loader(data, cfg, False, device).persistent_workers is False

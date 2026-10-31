@@ -82,6 +82,8 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("eval_every/print_freq 必须是整数")
     if not isinstance(train["class_balanced_sampler"], bool) or not isinstance(train["amp"], bool):
         raise ValueError("amp/class_balanced_sampler 必须是布尔值")
+    if not isinstance(train.get("persistent_workers", False), bool):
+        raise ValueError("training.persistent_workers 必须是布尔值")
     if not isinstance(model["grad_from_block"], int) or not 0 <= model["grad_from_block"] <= 12:
         raise ValueError("grad_from_block 必须是 0..12 的整数")
     if train["eval_every"] < 0 or cfg["experiment"]["print_freq"] <= 0:

@@ -22,6 +22,9 @@ training:
   batch_size: 8               # 每个样本另有两个视图；按显存调整
   accumulation_steps: 2
   num_workers: 4
+  persistent_workers: false   # true 可复用 worker，Windows/spawn 下大幅提速；
+                              # 代价：worker RNG 只初始化一次，续训的增强随机流与 false 时不同
+                              # （采样顺序不受影响，仍由主进程 generator 决定）
   epochs: 50
   lr: 0.003
   min_lr: 0.000003

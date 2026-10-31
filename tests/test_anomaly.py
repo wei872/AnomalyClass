@@ -209,3 +209,45 @@ def test_bundle_requires_detector_or_bank(smoke_config, tmp_path):
     torch.save({"dummy": True}, classifier)
     with pytest.raises(ValueError, match="至少包含"):
         save_bundle(tmp_path / "empty_bundle", None, classifier, smoke_config)
+
+
+def test_coreset_matvec_matches_naive_and_keeps_centre_norm():
+    """The fast distance form must select exactly the same points as the naive one."""
+    from anomalyncd.anomaly import _greedy_coreset
+
+    def naive(features, target):
+        centre = features.mean(dim=0)
+        index = int(torch.argmax(((features-centre)**2).sum(dim=1)))
+        chosen = [index]
+        mind = torch.full((features.shape[0],), float("inf"))
+        picked = torch.zeros(features.shape[0], dtype=torch.bool)
+        for _ in range(1, target):
+            mind = torch.minimum(mind, ((features-features[index])**2).sum(dim=1))
+            picked[index] = True
+            mind = mind.masked_fill(picked, -1.0)
+            index = int(torch.argmax(mind))
+            chosen.append(index)
+        return torch.tensor(chosen)
+
+    torch.manual_seed(0)
+    for _ in range(3):
+        features = torch.randn(200, 32)
+        # Unequal norms are what break the version that drops ||c||^2.
+        features[:8] += 6.0
+        assert torch.equal(_greedy_coreset(features, 25), naive(features, 25))
+
+
+def test_bank_build_bounds_memory_and_covers_every_normal_image(weave, ad_config, tmp_path):
+    """Candidate count must be capped before features reach the device."""
+    from anomalyncd.anomaly import anomaly_settings
+
+    cfg = deep_merge(ad_config, {"anomaly": {"max_candidates": 100, "bank_size": 32,
+                                             "coreset": False}})
+    output = tmp_path / "small_bank"
+    metadata = build_bank(weave["root"] / "train", output, cfg, device_name="cpu",
+                          allow_random_init=True, batch_size=4, progress=lambda _: None)
+    settings = anomaly_settings(cfg)
+    # 12 images x 64 patches = 768 total, but only <=100 candidates may be kept.
+    assert metadata["normal_patches"] == 12*8*8
+    assert metadata["bank_size"] <= settings["max_candidates"]
+    assert load_bank(output)["features"].shape[0] <= settings["max_candidates"]
