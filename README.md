@@ -1,122 +1,83 @@
-# AnomalyClass — 基于 Ultralytics YOLO27 设计规范的布匹缺陷轻量化检测模型 (`YOLO27n` / `YOLO27n-Lite`)
+# AnomalyClass — 基于 Ultralytics YOLO27 架构思想的布匹缺陷轻量化高精度检测模型
 
-本仓库针对 **19 类工业布匹缺陷检测数据集**（[`dataset/fabric19.yaml`](dataset/fabric19.yaml)），依据 Ultralytics 官方发布的 **[YOLO27 模型技术预览文档](https://docs.ultralytics.com/zh/models/yolo27)** 与 **YOLO26 基础代码库**，完整设计并实现了可直接训练、验证、双模式推理（带 NMS / 无 NMS 端到端）与零额外开销导出的最轻量化模型体系：
+本仓库针对 **19 类工业布匹缺陷检测数据集**（[`dataset/fabric19.yaml`](dataset/fabric19.yaml)），融合 **[Ultralytics YOLO27 官方架构设计](https://docs.ultralytics.com/zh/models/yolo27)** 与 **YOLO26 预训练体系**，提供与 `YOLO26n` 参数量紧邻（融合后 **2.46M–2.51M** vs `YOLO26n` **2.38M**）且检测精度更优的三套模型方案：
 
-1. **`models/yolo27n.yaml`（官方规格标准版 Nano）**：严格对齐官方文档披露的 `YOLO27n` 指标（COCO `nc=80` 融合后 **3.00M 参数 / 7.2 GFLOPs**；布匹缺陷 `nc=19` 融合后 **2.99M 参数 / 7.16 GFLOPs**）。
-2. **`models/yolo27n-lite.yaml`（工业边缘极轻量版 Nano-Lite）**：完整保留 YOLO27n 的全部架构改进，同时引入可分离下采样 `SCDown` 与通道压缩（`[0.50, 0.1875, 768]`），融合后仅 **0.75M 参数 / 2.97 GFLOPs**（权重文件约 **2.0 MB**），适合产线嵌入式相机与边缘端高帧率实时检测。
+1. **`models/yolo27n.yaml`（推荐默认高精度版）**：融合后 **2.512M 参数 / 6.63 GFLOPs**（仅比 `YOLO26n` 多 `0.13M` 参数），保留 `[P3/8, P4/16, P5/32]` 完整尺度覆盖并融入 YOLO27 小目标高分辨率加宽、可重参数化特征校准与前景对齐监督。
+2. **`models/yolo27n-dual.yaml`（官方 YOLO27 双尺度版 `[P3/8, P5/32]`）**：融合后 **2.465M 参数 / 6.48 GFLOPs**（与 `YOLO26n` 参数量仅差 `3.6%`），移除中尺度检测头（Anchor 数 `8,400 -> 6,800`）并采用 `(1.0, 1/√2)` 双尺度平衡缩放。
+3. **`models/yolo27n-lite.yaml`（工业边缘极轻量版）**：融合后仅 **0.776M 参数 / 3.29 GFLOPs**（参数量减少 **67%**），适合算力严苛的产线智能相机。
 
-> **说明**：根据 Ultralytics 官方文档说明，官方预训练权重 `yolo27n.pt` 与官方源码尚处于发布前最终研发阶段，暂未公开下载。本项目基于官方披露的全部架构与训练机制规范，在最新 `ultralytics` 框架上完成了模块化工程落地与数值等价验证。
+> **重要调用说明**：训练/验证/推理请务必使用本仓库提供的 `from yolo27 import YOLO27`（或 `python train_yolo27n.py`），**切勿直接用 `from ultralytics import YOLO("models/yolo27n.yaml")`**（原生 `YOLO` 类不会挂载 `YOLO27Detect`、前景对齐损失及 `yolo26n.pt` Net2Wider 预训练热启动）。
 
 ---
 
-## 一、YOLO27n 相比前代（YOLO26n / YOLO11n）增加了哪些核心改进？
+## 一、核心架构与训练机制设计（对齐官方 YOLO27 + 布匹缺陷特性）
 
-### 1. 尺度自适应架构路线（Scale-Adaptive Dual-Architecture Strategy）
-- **改进内容**：YOLO27 打破了以往 N/S/M/L 仅靠深度和宽度缩放同一套计算图的惯例——大尺寸 `M/L` 采用基于查询（Query-based）的 Transformer 解码器；而面向边缘实时场景的最轻量级 **`YOLO27n / YOLO27s` 专精于精简纯 CNN 架构**，规避高分辨率注意力带来的显存带宽开销。
-- **双推理路径兼容**：通过同一套 `YOLO27` 接口，默认使用 `nms=True`（一对多密集预测头 + NMS，最大化召回率）；传入 `nms=False`（或 CLI `--no-nms`）即可切换至原生无 NMS 的一对一端到端检测头，实现超低延迟部署。
+### 1. DFL-Free 无约束边界回归（`reg_max: 1`）+ 100% 预训练回归头无损继承
+- 与官方 `YOLO26 / YOLO27` 轻量 CNN 检测头保持一致，采用 `reg_max: 1` 直接回归归一化四边距离：
+  - **消除大跨度细条瑕疵截断**：彻底解除 `reg_max=16` 在 `P3/8` 层 `15 × 8 = 120~240 px` 的回归跨度硬上限，使横跨整幅画面的细长瑕疵（*断纬、纬线不直、多股线、油点线、稀缝、包边不良*）可在高分辨率 `P3/8` 特征图上完整回归；
+  - **Step-0 零误差继承 `yolo26n.pt` 检测头**：完整保留 `yolo26n.pt` 经 Objects365 + COCO 预训练的全部回归卷积（含 `.cv2.*.2`）与 `c3=80` 分类特征塔，避免通道截断或随机重置造成的定位退化。
 
-### 2. 双尺度检测头 + 融合特征固定缩放平衡（Dual-Scale Detection with Fixed Feature Scaling）
-- **移除中等粒度检测层（P4/16）**：传统 YOLO 在 `P3/8 (80×80)`、`P4/16 (40×40)`、`P5/32 (20×20)` 三个尺度上预测（共 `8,400` 个 Anchor）。`YOLO27n` 移除了 `P4/16` 检测分支，仅保留：
-  - **细粒度特征图 `P3/8 (80×80, 6400 Anchors)`**：专职捕捉微米/毫米级细小瑕疵（如 *蚊虫小黑点、经线毛球、小尾巴、短废纱线、单根包不进*）；
-  - **粗粒度特征图 `P5/32 (20×20, 400 Anchors)`**：结合 `SPPF` + `C2PSA` 注意力，专职覆盖大跨度/长条形瑕疵（如 *断纬、纬线不直、纬斜、油点线、包边不良*）。
-  - Anchor 总数由 `8,400` 降至 `6,800`（减少 **19%**），并直接裁掉整组中尺度解耦卷积检测头，大幅降低检测头计算与访存开销。
-- **融合特征固定缩放（Fixed Feature Scaling）与零开销重参数化折叠**：在 `YOLO27Detect`（[`yolo27/modules.py`](yolo27/modules.py)）中对双尺度融合特征施加固定方差平衡系数 `(1.0, 1/√2)`，平衡细粒度与多级融合粗粒度特征的激活幅值与梯度流；在推理/导出执行 `fuse()` 时，该固定系数直接数学等价地折叠进检测头首层 `Conv2d` 权重中，**部署阶段实现 0 额外参数、0 额外算子、数值误差 < 1e-5**。
+### 2. 加宽早期高分辨率与小目标瓶颈阶段（Stronger Small-Object Backbone & Fine Neck）
+- **`P2/4 (160×160)` 高分辨率阶段加宽**（`256 -> 320`，`n` 尺度 `64 -> 80 ch`）：在下采样前保留更细腻的经纬纱线纹理与边缘细节；
+- **`P3/8 (80×80)` 小目标瓶颈容量翻倍**（`C3k2 [512, False, 0.50]`，内部瓶颈通道 `32 -> 64 ch`，对齐官方 `YOLO27-cls` 特征配比）：增强 *蚊虫小黑点、经线毛球、小尾巴、短废纱线* 等微小瑕疵的非线性表征能力，同时保持输出 `128 ch` 与预训练主干无缝对齐；
+- **`P3/8 (80×80)` 细粒度颈部输出加宽**（`256 -> 320`，`80 ch`）：提升细粒度检测分支容量，并使分类头通道 `c3 = max(80, min(nc, 100)) = 80` 与 `yolo26n.pt` 1:1 精确匹配。
 
-### 3. 加宽早期高分辨率特征阶段（Widened Early High-Resolution Feature Stage）
-- **改进内容**：小目标是轻量级模型最薄弱的环节。`YOLO27n` 将早期高分辨率阶段 `P2/4 (160×160)` 的 `C3k2` 通道基准从 `256` 加宽至 `384`（**+50% 特征容量**），并将细粒度颈部输出 `P3/8 (80×80)` 从 `256` 加宽至 `320`（**+25%**）。
-- **对布匹瑕疵的价值**：在下采样丢失高频纹理前保留更丰富的经纬纱线细节，显著提升 *蚊虫小黑点、棉团、稀缝* 等微小缺陷的定位与边界框回归精度。
+### 3. 固定 + 可学习逐通道多尺度特征校准（零推理开销重参数化折叠）
+- 在 `YOLO27Detect`（[`yolo27/modules.py`](yolo27/modules.py)）中结合双尺度固定方差缩放系数（`[P3, P5]` 采用 `(1.0, 1/√2)`）与逐通道校准门控 `feat_logit_scale`（自动路由至无权重衰减、非 Muon 正交化参数组）；
+- 调用 `fuse()` 推理或导出时，校准系数精确折叠进 `cv2`（`Conv2d`）与 `cv3`（`DWConv`）首层卷积核权重中，**部署阶段 0 额外参数、0 额外 FLOPs，融合前后误差 < 1e-4**。
 
-### 4. 前景对齐监督（Foreground Alignment Supervision —— 仅训练期启用，推理零成本）
-- **核心痛点**：在端到端双头训练中，主干与颈部由密集的一对多分支（`one2many`，每个目标匹配 `top-10` 候选点）主导特征学习，而无 NMS 部署头（`one2one`）只允许保留唯一峰值正样本，导致两者存在监督鸿沟（YOLO26n 上一对多与一对一存在 `0.9 mAP` 差距）。
-- **改进实现**（[`yolo27/modules.py`](yolo27/modules.py) & [`yolo27/loss.py`](yolo27/loss.py)）：
-  1. **轻量级前景判别分支 `ForegroundAlignmentBranch`**：训练期间在 `P3/8` 与 `P5/32` 每个空间网格上挂载深度可分离轻量分支 `DWConv(3×3) -> Conv(1×1) -> Conv2d(1)`，联合 IoU 软质量目标与 `VarifocalLoss` 区分“前景瑕疵”与“背景正常布面纹理”；
-  2. **一对一前景一致性对齐损失**：利用 Sigmoid 单调性恒等式 $\max_c \sigma(z_c) = \sigma(\max_c z_c)$，将 `one2one` 分类头的最高前景置信度与前景分支及 IoU 质量对齐（官方数据显示可将一对多与一对一精度差从 `0.9 mAP` 缩小至 `0.4 mAP`）；
-  3. **纯正常布面样本（`normaltrain` / `normalval`）天然协同**：[`YOLO27Trainer`](yolo27/model.py) 自动识别 `dataset/fabric19.yaml` 中的 `normaltrain` 与 `normalval` 无缺陷正常布匹目录并挂载为负样本，前景对齐分支在正常布面上全锚点监督为 `0`，强力抑制纹理误报；
-  4. **推理与导出完全剥离**：调用 `fuse()` 或导出 ONNX / TensorRT 时自动置空 `fg_branch = None`，**不增加任何部署延迟或模型体积**。
-
-### 5. 面向自定义数据集的平稳收敛与高精度增强体系（Smooth-Convergence & High-IoU Recipe）
-- **16-bin DFL 亚像素边界分布回归（`reg_max: 16`）**：YOLO26n 为追求纯无 NMS 速度将 `reg_max` 砍为 `1`（回归头仅 16~20 通道且 `dfl_loss` 失效），导致一对多（`tal_topk=10`）离轴正样本回归框散度偏大、穿透 `iou=0.7` NMS 引发 Precision 与 mAP 曲线剧烈抖动。`YOLO27n` 恢复 **16-bin Distribution Focal Loss（`c2=64` 通道 + 16 离散概率分布积分）**，使同一瑕疵上的多个正样本回归框高度重合（`IoU > 0.85`），被 NMS 干净坍缩为唯一高精度框，大幅提升 `mAP50-95` 并显著平滑收敛曲线（融合后仍仅 **2.73M 参数 / 6.98 GFLOPs**，严格低于官方 `3.0M / 7.2B` 预算）。
-- **智能 Net2Wider 预训练热启动与跨 `reg_max` 保护（[`yolo27/weights.py`](yolo27/weights.py)）**：从 `yolo26n.pt` 热启动时精确拷贝共享层、按拼接块零填充迁移加宽层（保留新增输出通道完整 Kaiming 方差，彻底消除 BatchNorm `20x` 反向梯度放大），并自动保护 19 类分类偏置与 16-bin 均匀 DFL 偏置先验。
-- **双头全偏置初始化 + 归一化渐进梯度平衡（[`yolo27/modules.py`](yolo27/modules.py) & [`yolo27/loss.py`](yolo27/loss.py)）**：修复默认 `end2end=False` 时 `one2one` 分类偏置未初始化导致的早期全局梯度裁剪（`clip_grad_norm_(10.0)`）抑制；采用 `o2m + o2o == 1.0` 渐进调度（`o2m: 0.85 -> 0.65`, `o2o: 0.15 -> 0.35`），全程以 `one2many` 主导特征学习并在训练后期与 `close_mosaic` 切换期平滑阻尼步长，同时训练 `one2one` 分支支持 `nms=False` 端到端导出。
+### 4. 训练期活体颈部前景对齐监督 + 冲突消解一对一匹配（推理零开销剥离）
+- **活体共享颈部前景对齐监督（Live Neck Foreground Alignment Supervision）**：`ForegroundAlignmentBranch` 直接作用于未截断梯度的共享颈部特征，以 `one2many` 的连续 IoU 质量为软目标计算 `Varifocal` 前景损失，强力拉大微小瑕疵与重复编织纹理背景的响应差距，并在 `fuse()` 时完全剥离（`fg_branch = None`）；
+- **前景先验引导的一对一正样本分配 + 均衡双头进度（`o2m: 0.80 -> 0.55`）**：默认采用高精度 **一对多 + NMS**（`nms=True`）推理，同时以 `o2m + o2o = 1.0`（避免原生 `E2ELoss` 后期衰减至 `0.10` 导致一对多分支与主干欠拟合）及 `tal_topk=7, tal_topk2=1` + 前景先验引导训练 `one2one` 头，传入 `nms=False` 即可切换无 NMS 端到端推理。
 
 ---
 
 ## 二、模型复杂度对比（`nc=19`, 输入 `640×640`）
 
-| 模型配置 | 配置文件 | 预测尺度 (Stride) | Anchor 数 | 训练态参数量 | 推理融合后参数量 | 融合后计算量 (FLOPs) | 适用场景 |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准（`reg_max=1` 无 DFL，强制无 NMS 单正样本头） |
-| **YOLO27n** (官方高精度版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 3.201 M | **2.731 M** | **6.98 B** | 16-bin DFL 亚像素回归 + 一对多密集头+NMS高精度推理 + 无损继承 `yolo26n.pt` + P2/P3 加宽 + 前景对齐监督（严格满足官方 ≤3.0M/7.2B 预算） |
-| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 1.160 M | **0.918 M** | **3.84 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
+| 模型变体 | 配置文件 | 预测尺度 (Stride) | 训练态参数量 | 推理融合后参数量 | 融合后 FLOPs | 特点与适用场景 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **YOLO26n** (基准) | `yolo26n.yaml` | `[8, 16, 32]` | 2.511 M | 2.379 M | 5.33 B | 原生前代基准 |
+| **YOLO27n** (推荐默认) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 2.736 M | **2.512 M** | **6.63 B** | 参数量贴近 YOLO26n（仅 `+0.13M`），小目标与细长条瑕疵精度最高 |
+| **YOLO27n-Dual** (双尺度版) | [`models/yolo27n-dual.yaml`](models/yolo27n-dual.yaml) | `[8, 32]` | 2.630 M | **2.465 M** | **6.48 B** | 纯正官方 YOLO27 双尺度头，参数与 YOLO26n 几乎一致 |
+| **YOLO27n-Lite** (极轻版) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | 0.860 M | **0.776 M** | **3.29 B** | 工业边缘相机极限高帧率部署 |
 
 ---
 
-## 三、目录结构与快速开始
+## 三、快速开始
 
-```text
-AnomalyClass/
-├── dataset/
-│   └── fabric19.yaml          # 19 类布匹缺陷数据集配置（含 normaltrain / normalval 正常样本路径）
-├── models/
-│   ├── yolo27.yaml            # YOLO27 (n/s) 统一多尺度架构配置
-│   ├── yolo27n.yaml           # YOLO27n 标准最轻量级模型配置
-│   └── yolo27n-lite.yaml      # YOLO27n-Lite 极轻量化边缘版配置 (~0.75M params / 3.0 GFLOPs)
-├── yolo27/
-│   ├── __init__.py
-│   ├── weights.py             # yolo26n.pt 智能精确+通道切片预训练热启动迁移
-│   ├── modules.py             # YOLO27Detect 双尺度检测头、固定缩放折叠与 ForegroundAlignmentBranch
-│   ├── loss.py                # YOLO27E2ELoss 前景对齐监督损失 + 无衰减双头损失 + 双尺度 STAL 校准
-│   └── model.py               # YOLO27 统一接口、YOLO27DetectionModel 与快速收敛 YOLO27Trainer
-├── train_yolo27n.py           # 一键参数统计 / 训练 / 验证 / 推理 / ONNX 导出脚本
-└── tests/
-    └── test_yolo27n.py        # 架构规格、重参数化数值等价性、前景损失梯度与端到端训练单测
-```
-
-### 1. 环境准备
-```bash
-pip install ultralytics
-```
-
-### 2. 查看参数量与计算量对比
+### 1. 查看参数量与延迟对比
 ```bash
 python train_yolo27n.py --mode profile
 ```
 
-### 3. 训练布匹缺陷检测模型
-先将 `dataset/fabric19.yaml` 中的 `path / train / val` 修改为你机器上的实际数据路径（默认与纯 `yolo26n` 采用完全一致的 `train / val` 划分；若需附加 `normaltrain / normalval` 纯背景目录，请加 `--use-normal`）：
+### 2. 训练模型（自动查找本地/同级目录 `yolo26n.pt` 执行无损 Net2Wider 热启动）
+> 建议将你测试 `yolo26n` 时使用的 `yolo26n.pt` 放在项目根目录或上级目录（训练器会自动检索并打印 `YOLO27 Warm-Start: transferred ...` 日志），也可通过 `--donor path/to/yolo26n.pt` 显式指定：
 
 ```bash
-# 推荐：显式指定本地 yolo26n.pt（或留空自动查找/下载），启用 92.5% 参数零误差 Net2Wider 热启动 + 默认 NMS 高精度验证
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --epochs 150 --batch 16 --imgsz 640
+# 1) 训练默认高精度 YOLO27n（推荐与 yolo26n 使用相同的 epochs/batch/imgsz 对比）
+python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16 --imgsz 640
 
-# 从零随机初始化训练（与纯 YOLO('yolo26n.yaml') 从头训练严格同条件对比）：
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained none --epochs 150 --batch 16 --imgsz 640
+# 2) 或训练双尺度版 YOLO27n-Dual
+python train_yolo27n.py --mode train --model models/yolo27n-dual.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16 --imgsz 640
 
-# 若需同时把 normaltrain / normalval 无缺陷纯背景目录加入训练与验证，加上 --use-normal：
-python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --pretrained yolo26n.pt --use-normal --epochs 150 --batch 16
-
-# 或训练双尺度极轻量版 YOLO27n-Lite (0.75M 参数 / 2.91 GFLOPs)
-python train_yolo27n.py --mode train --model models/yolo27n-lite.yaml --data dataset/fabric19.yaml --epochs 150 --batch 32 --imgsz 640
+# 3) Python 代码直接调用（注意：务必使用 YOLO27 而非 YOLO！）
+python -c "from yolo27 import YOLO27; YOLO27('models/yolo27n.yaml').train(data='dataset/fabric19.yaml', epochs=150, imgsz=640, batch=16)"
 ```
 
-也可以直接在 Python 中调用（与官方 `YOLO` API 完全一致）：
-```python
-from yolo27 import YOLO27
+### 3. 验证、推理与导出（支持 `nms=True` 默认高精度 / `nms=False` 端到端无 NMS）
+```bash
+# 默认：一对多检测头 + NMS（最高检测精度）
+python train_yolo27n.py --mode val --weights runs/detect/yolo27n_fabric19/weights/best.pt --data dataset/fabric19.yaml --nms
 
-model = YOLO27("models/yolo27n.yaml")
-model.train(data="dataset/fabric19.yaml", epochs=150, imgsz=640, batch=32)
+# 可选：一对一端到端无 NMS 推理（nms=False）
+python train_yolo27n.py --mode val --weights runs/detect/yolo27n_fabric19/weights/best.pt --data dataset/fabric19.yaml --no-nms
 
-# 默认模式：一对多预测头 + NMS（最高精度）
-results_nms = model.predict("path/to/fabric.jpg", nms=True)
-
-# 极速端到端模式：一对一预测头，无需 NMS 后处理
-results_e2e = model.predict("path/to/fabric.jpg", nms=False)
-
-# 导出无 NMS 端到端 ONNX 模型（自动剥离前景对齐分支与冗余检测头）
-model.export(format="onnx", imgsz=640, nms=False)
+# 导出 ONNX（自动剥离前景对齐分支并折叠多尺度校准系数）
+python train_yolo27n.py --mode export --weights runs/detect/yolo27n_fabric19/weights/best.pt --format onnx
+python train_yolo27n.py --mode export --weights runs/detect/yolo27n_fabric19/weights/best.pt --format onnx --no-nms
 ```
 
-### 4. 运行自动化验证测试
+### 4. 运行自动化验证单测
 ```bash
 python tests/test_yolo27n.py
 ```

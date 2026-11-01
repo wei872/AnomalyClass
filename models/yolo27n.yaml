@@ -1,17 +1,17 @@
 # =============================================================================
 # YOLO27n — Dedicated Nano Configuration for Fabric19 Defect Detection
-# Reference: https://docs.ultralytics.com/models/yolo27
+# Reference: https://docs.ultralytics.com/zh/models/yolo27
 #
 # Complexity @ 640x640 (Fused, nc=19):
-#   - Parameters: 2.74M (2,735,443)  [Official YOLO27n budget: <= 3.0M]
-#   - FLOPs:      7.00 GFLOPs        [Official YOLO27n budget: <= 7.2B]
+#   - Parameters: ~2.51M (vs YOLO26n 2.38M — close param count, higher capacity!)
+#   - FLOPs:      ~6.63 GFLOPs (Official YOLO27n budget: <= 7.2B)
 #   - Inference:  One-to-many + NMS default (pass nms=False for E2E one-to-one)
 # =============================================================================
 
 nc: 19
 scale: n
 end2end: True
-reg_max: 16
+reg_max: 1
 scales:
   n: [0.50, 0.25, 1024]
 
@@ -21,7 +21,7 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   (160x160)
   - [-1, 2, C3k2, [320, False, 0.25]]  # 2-P2/4   widened high-res stage (80 ch vs YOLO26n's 64 ch)
   - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   (80x80)
-  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   small-object feature stage (128 ch)
+  - [-1, 2, C3k2, [512, False, 0.50]]  # 4-P3/8   small-object stage with 2x inner bottleneck (64 ch vs 32 ch)
   - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  (40x40)
   - [-1, 2, C3k2, [512, True]]         # 6-P4/16  1:1 aligned with yolo26n.pt (128 ch)
   - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  (20x20)
@@ -36,9 +36,9 @@ head:
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, C3k2, [288, True]]                 # 16: P3/8-fine prediction map (72 ch vs 64 ch)
+  - [-1, 2, C3k2, [320, True]]                 # 16: P3/8-fine prediction map (80 ch -> c3=80 1:1 with yolo26n.pt)
 
-  - [-1, 1, Conv, [288, 3, 2]]
+  - [-1, 1, Conv, [320, 3, 2]]
   - [[-1, 13], 1, Concat, [1]]
   - [-1, 2, C3k2, [512, True]]                 # 19: P4/16-medium prediction map (128 ch)
 

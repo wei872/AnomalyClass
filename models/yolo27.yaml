@@ -1,31 +1,32 @@
 # =============================================================================
 # Ultralytics YOLO27 Fabric-Enhanced Architecture (N / S scales)
-# Reference: https://docs.ultralytics.com/models/yolo27
+# Reference: https://docs.ultralytics.com/zh/models/yolo27
 # Dataset default: dataset/fabric19.yaml (19 fabric defect classes)
 #
-# Key Architectural Enhancements over Pure YOLO26n for Fabric Defect Detection:
-#   1. 16-Bin Distribution Focal Loss (reg_max: 16) + Dual-Mode Detection Head:
-#      Restores 16-bin sub-pixel boundary probability regression (c2=64 box head
-#      + DFL loss) alongside YOLO27's one-to-many + NMS default inference and
-#      parallel one-to-one (nms=False) export capability (~2.74M fused params /
-#      ~7.00 GFLOPs @ nc=19, well inside official YOLO27n 3.0M / 7.2B specs).
-#   2. Widened Early High-Resolution Stages:
-#      P2/4 C3k2 widened (256 -> 320, +25%) + P3/8 fine neck widened (256 -> 288, +12.5%)
-#      with function-preserving Net2Wider warm-start from yolo26n.pt (<1e-6 step-0 error)
-#      to capture tiny defects (蚊虫小黑点 / 经线毛球 / 小尾巴).
-#   3. Full Multi-Scale Feature Preservation:
-#      Retains P3/8 + P4/16 + P5/32 so tiny point defects, medium stains, and
-#      full-width warp/weft defects (纬斜 / 稀缝 / 断纬) are localized smoothly.
+# Core Design Aligned with Official Ultralytics YOLO27 + Fabric19 Characteristics:
+#   1. DFL-Free Unconstrained Regression (reg_max: 1):
+#      Matches official YOLO26/YOLO27 CNN box head — preserves 100% of yolo26n.pt's
+#      pretrained box regression head at step 0 (0.0 localization drift) AND removes
+#      DFL-16's 240px P3 coordinate cap so thin full-width fabric strip defects
+#      (断纬 / 纬线不直 / 多股线 / 油点线 / 稀缝 / 包边不良) regress across 640px cleanly.
+#   2. Stronger Small-Object High-Resolution Stages (Official YOLO27 Backbone/Neck):
+#      - P2/4 C3k2 widened (256 -> 320, +25% edge/yarn texture channels)
+#      - P3/8 Backbone C3k2 bottleneck doubled (e: 0.25 -> 0.50, 2x nonlinear capacity)
+#      - P3/8 Fine Neck C3k2 widened (256 -> 320, +25%, aligning cls c3=80 1:1 with yolo26n.pt)
+#   3. Folded Multi-Scale Feature Calibration + Multi-Scale Preservation:
+#      Calibrates per-channel & cross-scale neck features during training and folds
+#      100% into first-layer conv weights on fuse() at zero deployment cost (~2.51M
+#      fused params @ nc=19, right alongside YOLO26n's 2.38M).
 #   4. Foreground Alignment Supervision (Training-Only Auxiliary Branch):
-#      Bridges dense one-to-many supervision and NMS-free one-to-one inference;
-#      stripped completely during fuse()/export at zero deployment overhead.
+#      Sharpens shared-neck defect-vs-weave-background separation and guides one-to-one
+#      anchor assignment during training; stripped completely on fuse()/export.
 # =============================================================================
 
 nc: 19
 end2end: True
-reg_max: 16
+reg_max: 1
 scales:
-  n: [0.50, 0.25, 1024] # ~2.74M fused params, ~7.00 GFLOPs (@ nc=19)
+  n: [0.50, 0.25, 1024] # ~2.51M fused params, ~6.63 GFLOPs (@ nc=19)
   s: [0.50, 0.50, 1024]
 
 backbone:
@@ -34,7 +35,7 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   (160x160)
   - [-1, 2, C3k2, [320, False, 0.25]]  # 2-P2/4   widened early high-res stage (256 -> 320, 80 ch on n)
   - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   (80x80)
-  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   small-object feature stage
+  - [-1, 2, C3k2, [512, False, 0.50]]  # 4-P3/8   widened small-object bottleneck (e: 0.25 -> 0.50, 2x capacity)
   - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  (40x40)
   - [-1, 2, C3k2, [512, True]]         # 6-P4/16  1:1 aligned with yolo26n.pt
   - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  (20x20)
@@ -49,9 +50,9 @@ head:
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]                  # 15: cat backbone P3/8
-  - [-1, 2, C3k2, [288, True]]                 # 16: P3/8-fine output (widened: 256 -> 288, 72 ch on n)
+  - [-1, 2, C3k2, [320, True]]                 # 16: P3/8-fine output (widened: 256 -> 320, 80 ch / c3=80 on n)
 
-  - [-1, 1, Conv, [288, 3, 2]]
+  - [-1, 1, Conv, [320, 3, 2]]
   - [[-1, 13], 1, Concat, [1]]                 # 18: cat neck P4/16
   - [-1, 2, C3k2, [512, True]]                 # 19: P4/16-medium output (1:1 aligned with yolo26n.pt)
 
@@ -59,4 +60,4 @@ head:
   - [[-1, 10], 1, Concat, [1]]                 # 21: cat backbone C2PSA P5/32
   - [-1, 1, C3k2, [1024, True, 0.5, True]]     # 22: P5/32-coarse output (1:1 aligned with yolo26n.pt)
 
-  - [[16, 19, 22], 1, Detect, [nc]]            # 23: Upgraded to YOLO27Detect (+ FG Alignment)
+  - [[16, 19, 22], 1, Detect, [nc]]            # 23: Upgraded to YOLO27Detect (+ Folded Scale + FG Alignment)

@@ -1,35 +1,74 @@
-"""YOLO27 unified model, detection model, and calibrated fabric-defect trainer."""
+"""YOLO27 high-level model, trainer, and validator interfaces.
+
+Integrates ``YOLO27DetectionModel`` seamlessly into Ultralytics' training, validation,
+prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4.197``:
+    - Upgraded ``YOLO27Detect`` head (``reg_max=1`` DFL-free regression + folded
+      per-channel/cross-scale calibration + training-only ``ForegroundAlignmentBranch``).
+    - Zero-shock Net2Wider warm-start from ``yolo26n.pt`` / ``yolo26s.pt`` with
+      automatic local, sibling, dataset-root, cache, and asset-download resolution
+      (protecting against Ultralytics ``Model.load(True)`` scratch hijack!).
+    - Official YOLO27 inference convention: defaults to ``one2many + NMS`` for maximum
+      mAP, with ``nms=False`` switching cleanly to end-to-end ``one2one`` inference.
+    - Built-in support for ``normaltrain`` / ``normalval`` defect-free fabric samples in
+      ``dataset/fabric19.yaml`` via ``use_normal=True``.
+"""
 
 from __future__ import annotations
 
-from copy import copy
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
-
-import numpy as np
 import torch
+import torch.nn as nn
 
-from ultralytics.models import yolo
-from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
+from ultralytics.cfg import DEFAULT_CFG_DICT
+from ultralytics.models.yolo.detect import DetectionPredictor, DetectionTrainer, DetectionValidator
 from ultralytics.models.yolo.model import YOLO
-from ultralytics.nn.modules.head import Detect
-from ultralytics.nn.tasks import DetectionModel, torch_safe_load
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
-from ultralytics.utils.torch_utils import initialize_weights, unwrap_model
+from ultralytics.nn.modules import Detect
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.utils import LOGGER, RANK
 
 from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
 
-if hasattr(torch.serialization, "add_safe_globals"):
-    torch.serialization.add_safe_globals([
-        YOLO27Detect,
-        ForegroundAlignmentBranch,
-    ])
+
+def _merge_split_paths(primary: Any, extra: Any) -> list[str]:
+    """Combine primary defect split path(s) with defect-free ``normal*`` split path(s)."""
+    out: list[str] = []
+    for item in (primary, extra):
+        if not item:
+            continue
+        if isinstance(item, (list, tuple)):
+            out.extend(str(x) for x in item if x)
+        else:
+            out.append(str(item))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
+def _upgrade_detect_head(model: DetectionModel, reg_max_override: int | None = None) -> None:
+    """Replace terminal ``Detect`` head with ``YOLO27Detect`` while preserving graph metadata."""
+    head = model.model[-1]
+    if isinstance(head, Detect) and not isinstance(head, YOLO27Detect):
+        ch = tuple(int(m[0].conv.in_channels) for m in head.cv2)
+        end2end = hasattr(head, "one2one_cv2") and head.one2one_cv2 is not None
+        reg_max = int(reg_max_override if reg_max_override is not None else getattr(head, "reg_max", 1))
+        new_head = YOLO27Detect(nc=head.nc, end2end=end2end, reg_max=reg_max, ch=ch)
+        new_head.i = head.i
+        new_head.f = head.f
+        new_head.type = f"{YOLO27Detect.__module__}.{YOLO27Detect.__qualname__}"
+        new_head.np = sum(x.numel() for x in new_head.parameters())
+        model.model[-1] = new_head
 
 
 class YOLO27DetectionModel(DetectionModel):
-    """YOLO27 CNN detection model upgrading ``Detect`` to ``YOLO27Detect`` and ``YOLO27E2ELoss``."""
+    """Ultralytics ``DetectionModel`` subclass powered by ``YOLO27Detect`` and ``YOLO27E2ELoss``."""
 
     def __init__(
         self,
@@ -38,305 +77,253 @@ class YOLO27DetectionModel(DetectionModel):
         nc: int | None = None,
         verbose: bool = True,
     ) -> None:
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=False)
+        if isinstance(cfg, (str, Path)):
+            from ultralytics.nn.tasks import yaml_model_load
+
+            cfg_dict = yaml_model_load(str(cfg))
+        else:
+            cfg_dict = deepcopy(cfg)
+
+        yaml_reg_max = int(cfg_dict.get("reg_max", 1))
+
+        super().__init__(cfg=cfg_dict, ch=ch, nc=nc, verbose=False)
+        _upgrade_detect_head(self, reg_max_override=yaml_reg_max)
 
         m = self.model[-1]
-        if isinstance(m, Detect) and not isinstance(m, YOLO27Detect):
-            new_head = YOLO27Detect.from_detect(m)
-            new_head.stride = m.stride.clone()
-            self.model[-1] = new_head
-            self.stride = new_head.stride
-            initialize_weights(new_head)
-            new_head.bias_init()
-        self.nc = self.model[-1].nc
+        if isinstance(m, Detect):
+            s = 256
+            m.inplace = self.inplace
+            self.model.eval()
+            m.training = True
+            preds = self.forward(torch.zeros(1, ch, s, s))
+            feats = preds["one2many"]["feats"] if isinstance(preds, dict) else preds["feats"]
+            m.stride = torch.tensor([s / x.shape[-2] for x in feats])
+            self.stride = m.stride
+            self.model.train()
+            m.bias_init()
+
+        from ultralytics.utils.torch_utils import initialize_weights
+
+        initialize_weights(self)
+        if isinstance(m, YOLO27Detect):
+            m.bias_init()
 
         if verbose:
             self.info()
             LOGGER.info("")
 
-    def load(self, weights: dict | torch.nn.Module, verbose: bool = True):
-        """Override ``BaseModel.load`` to always use function-preserving Net2Wider weight transfer."""
-        donor = (weights.get("ema") or weights.get("model")) if isinstance(weights, dict) else weights
-        if donor is not None:
-            transfer_pretrained_weights(donor, self)
-        return self
-
     def init_criterion(self):
-        """Initialize YOLO27E2ELoss (full dual-head + Foreground Alignment Supervision)."""
-        head = self.model[-1]
-        if getattr(head, "one2one_cv2", None) is not None:
-            return YOLO27E2ELoss(self)
-        return YOLO27DetectionLoss(self)
-
-    def fuse(self, verbose: bool = True, *args: Any, **kwargs: Any):
-        """Ensure ``YOLO27Detect.fuse()`` runs before printing fused summary across all ``end2end`` modes."""
-        already_fused = self.is_fused()
-        super().fuse(verbose=False, *args, **kwargs)
-        head = self.model[-1]
-        if isinstance(head, YOLO27Detect) and not head._scale_folded:
-            head.fuse()
-        if verbose and not already_fused:
-            self.info(verbose=True)
-        return self
-
-
-if hasattr(torch.serialization, "add_safe_globals"):
-    torch.serialization.add_safe_globals([YOLO27DetectionModel])
-
-
-def _compute_inverse_freq_class_weights(labels: list[dict[str, Any]], nc: int, power: float = 0.0) -> torch.Tensor:
-    """Compute optional dampened inverse-frequency class weights normalized to mean 1.0."""
-    if power <= 0.0 or not labels:
-        return torch.ones(nc, dtype=torch.float32)
-    cls_list = [lb["cls"].reshape(-1) for lb in labels if "cls" in lb and len(lb["cls"]) > 0]
-    if not cls_list:
-        return torch.ones(nc, dtype=torch.float32)
-    all_cls = np.concatenate(cls_list, axis=0).astype(np.int64)
-    counts = np.bincount(all_cls[all_cls < nc], minlength=nc).astype(np.float64)
-    present = counts > 0
-    if not np.any(present):
-        return torch.ones(nc, dtype=torch.float32)
-    weights = np.ones(nc, dtype=np.float64)
-    raw = (1.0 / np.where(present, counts, 1.0)) ** power
-    mean_present = float(raw[present].mean())
-    weights[present] = raw[present]
-    weights[~present] = mean_present
-    weights /= float(weights.mean())
-    return torch.tensor(weights, dtype=torch.float32)
-
-
-class YOLO27Trainer(DetectionTrainer):
-    """YOLO27 trainer calibrated to strictly outperform pure ``yolo26n`` on custom fabric datasets.
-
-    Core guarantees:
-      1. Intercepts explicit ``pretrained='path/to/yolo26n.pt'`` AND ``pretrained=True`` cleanly via
-         function-preserving Net2Wider transfer (never hijacked by ``BaseModel.load`` ``intersect_dicts``).
-      2. Validates and saves ``best.pt`` using YOLO27's default high-accuracy ``one2many + NMS`` head
-         while simultaneously training the ``one2one`` head for optional ``nms=False`` export.
-      3. Matches ``YOLO('yolo26n.yaml')``'s exact optimizer & linear LR schedule (``optimizer='auto'``,
-         ``cos_lr=False``, ``close_mosaic=10``) so late-epoch localization retains full step size.
-    """
-
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
-        overrides = dict(overrides or {})
-        self._cls_pw = float(overrides.pop("cls_pw", 0.0))
-        self._use_normal = bool(overrides.pop("use_normal", False))
-        self._donor_weights_path: str | None = overrides.pop("_donor_weights_path", None)
-
-        opt_choice = str(overrides.get("optimizer", "auto"))
-        overrides.setdefault("optimizer", opt_choice)
-        if opt_choice.lower() == "adamw":
-            overrides.setdefault("lr0", 0.0005)
-            overrides.setdefault("momentum", 0.9)
-            overrides.setdefault("lrf", 0.01)
-            overrides.setdefault("warmup_bias_lr", 0.0)
-        elif opt_choice.lower() == "musgd":
-            overrides.setdefault("lr0", 0.004)
-            overrides.setdefault("lrf", 0.05)
-            overrides.setdefault("warmup_bias_lr", 0.0)
-
-        # Match Ultralytics default linear LR & 10-epoch close_mosaic so late-epoch box refinement is never starved
-        overrides.setdefault("cos_lr", False)
-        overrides.setdefault("warmup_epochs", 3.0)
-        overrides.setdefault("close_mosaic", 10)
-
-        overrides.setdefault("box", 7.5)
-        overrides.setdefault("cls", 0.5)
-        overrides.setdefault("dfl", 1.5)
-
-        overrides.setdefault("degrees", 0.0)
-        overrides.setdefault("shear", 0.0)
-        overrides.setdefault("flipud", 0.0)
-        overrides.setdefault("fliplr", 0.5)
-        overrides.setdefault("scale", 0.5)
-        overrides.setdefault("mosaic", 1.0)
-        overrides.setdefault("copy_paste", 0.0)
-        if hasattr(DEFAULT_CFG, "cls_pw"):
-            overrides["cls_pw"] = self._cls_pw
-
-        super().__init__(cfg, overrides, _callbacks)
-
-    @staticmethod
-    def _resolve_optional_dir(data: dict[str, Any], key: str) -> str | None:
-        """Resolve optional ``normaltrain`` / ``normalval`` directory from dataset YAML if it exists on disk."""
-        raw = data.get(key)
-        if not raw:
-            return None
-        cand = Path(str(raw))
-        if not cand.is_absolute() and data.get("path"):
-            cand = Path(str(data["path"])) / cand
-        if cand.is_dir() and any(cand.rglob("*.*")):
-            return str(cand)
-        return None
-
-    def get_dataset(self) -> dict[str, Any]:
-        """Load dataset config; append ``normaltrain`` / ``normalval`` only when ``use_normal=True``."""
-        data = super().get_dataset()
-        if not self._use_normal:
-            return data
-        for split_key, normal_key in (("train", "normaltrain"), ("val", "normalval")):
-            normal_dir = self._resolve_optional_dir(data, normal_key)
-            if normal_dir is None:
-                continue
-            cur = data.get(split_key)
-            cur_list = list(cur) if isinstance(cur, (list, tuple)) else [cur]
-            if normal_dir not in cur_list:
-                data[split_key] = [*cur_list, normal_dir]
-                LOGGER.info(f"YOLO27Trainer: attached defect-free background directory '{normal_key}' -> {normal_dir}")
-        return data
-
-    def set_model_names_for_load(self, model: YOLO27DetectionModel) -> YOLO27DetectionModel:
-        """Align model class names with dataset names before optional weight loading."""
-        names = self.data.get("names")
-        if names is not None and hasattr(model, "names"):
-            try:
-                model.names = names
-            except Exception as e:  # pragma: no cover - defensive
-                LOGGER.warning(f"YOLO27Trainer: failed to set model names before load: {e}")
-        return model
-
-    def get_validator(self):
-        """Build validator, preserve 4-column ``fg_loss`` header, and apply optional ``class_weights``."""
-        m_unwrapped = unwrap_model(self.model)
-        if getattr(m_unwrapped, "class_weights", None) is None and self._cls_pw > 0.0:
-            ds = getattr(getattr(self, "train_loader", None), "dataset", None)
-            label_list = getattr(ds, "labels", None)
-            if label_list:
-                cw = _compute_inverse_freq_class_weights(label_list, self.data["nc"], power=self._cls_pw)
-                m_unwrapped.class_weights = cw
-                LOGGER.info(
-                    f"YOLO27Trainer: applied inverse-frequency class_weights (power={self._cls_pw}): "
-                    f"{cw.numpy().round(3)}"
-                )
-
-        super().get_validator()
-        if getattr(self, "loss_names", None) and len(self.loss_names) == 3:
-            self.loss_names = (*self.loss_names, "fg_loss")
-
-        val_cls = YOLO27Validator if self._use_normal else DetectionValidator
-        return val_cls(
-            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
-        )
-
-    def set_model_attributes(self) -> None:
-        """Attach dataset metadata and ``fg_loss`` column name."""
-        super().set_model_attributes()
-        if getattr(self, "loss_names", None) and len(self.loss_names) == 3:
-            self.loss_names = (*self.loss_names, "fg_loss")
-
-    def get_model(
-        self,
-        cfg: str | dict | None = None,
-        weights: torch.nn.Module | None = None,
-        verbose: bool = True,
-    ) -> YOLO27DetectionModel:
-        """Build ``YOLO27DetectionModel`` and apply function-preserving Net2Wider warm-start."""
-        model = self.set_model_names_for_load(
-            YOLO27DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
-        )
-        extra_dirs = [self.data.get("path", ""), str(self.data.get("train", ""))]
-
-        if self._donor_weights_path is not None and not self.resume:
-            donor_path = resolve_donor_checkpoint(self._donor_weights_path, allow_download=True, extra_dirs=extra_dirs)
-            if donor_path is not None:
-                ckpt, _ = torch_safe_load(str(donor_path))
-                donor_model = ckpt.get("ema") or ckpt.get("model")
-                if donor_model is not None:
-                    transfer_pretrained_weights(donor_model, model)
-        elif weights is not None:
-            transfer_pretrained_weights(weights, model)
-        elif self.args.pretrained and not self.resume:
-            scale = model.yaml.get("scale", "n") if isinstance(getattr(model, "yaml", None), dict) else "n"
-            donor_name = "yolo26s.pt" if scale == "s" else "yolo26n.pt"
-            donor_path = resolve_donor_checkpoint(donor_name, allow_download=True, extra_dirs=extra_dirs)
-            if donor_path is not None:
-                ckpt, _ = torch_safe_load(str(donor_path))
-                donor_model = ckpt.get("ema") or ckpt.get("model")
-                if donor_model is not None:
-                    transfer_pretrained_weights(donor_model, model)
-        return model
+        """Initialize balanced ``YOLO27E2ELoss`` (with live FG alignment) or ``YOLO27DetectionLoss``."""
+        class_weights = getattr(self, "_class_weights", None)
+        if getattr(self, "end2end", False) or hasattr(self.model[-1], "one2one_cv2"):
+            return YOLO27E2ELoss(self, class_weights=class_weights)
+        return YOLO27DetectionLoss(self, class_weights=class_weights)
 
 
 class YOLO27Validator(DetectionValidator):
-    """DetectionValidator that attaches ``normalval`` / ``normaltrain`` when requested."""
+    """Validator supporting both ``nms=True`` (one2many+NMS) and ``nms=False`` (one2one E2E)."""
 
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks: dict | None = None, use_normal: bool = False):
-        self._use_normal = use_normal
-        super().__init__(dataloader, save_dir, args, _callbacks)
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
+        self._use_normal: bool = False
+        if isinstance(args, dict) and "use_normal" in args:
+            args = dict(args)
+            self._use_normal = bool(args.pop("use_normal"))
+        super().__init__(dataloader=dataloader, save_dir=save_dir, args=args, _callbacks=_callbacks)
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
 
-    def get_dataloader(self, dataset_path: Any, batch_size: int):
-        if self._use_normal and isinstance(self.data, dict):
-            normal_key = "normalval" if getattr(self.args, "split", "val") == "val" else "normaltrain"
-            normal_dir = YOLO27Trainer._resolve_optional_dir(self.data, normal_key)
-            if normal_dir is not None:
-                cur_list = list(dataset_path) if isinstance(dataset_path, (list, tuple)) else [dataset_path]
-                if normal_dir not in cur_list:
-                    dataset_path = [*cur_list, normal_dir]
-                    LOGGER.info(
-                        f"YOLO27Validator: attached defect-free background directory '{normal_key}' -> {normal_dir}"
-                    )
-        return super().get_dataloader(dataset_path, batch_size)
+    def check_det_dataset(self, dataset: str) -> dict[str, Any]:
+        data = super().check_det_dataset(dataset)
+        if self._use_normal:
+            if data.get("normaltrain"):
+                data["train"] = _merge_split_paths(data.get("train"), data.get("normaltrain"))
+            if data.get("normalval"):
+                data["val"] = _merge_split_paths(data.get("val"), data.get("normalval"))
+        return data
 
 
-def _translate_nms_kwarg(kwargs: dict[str, Any], for_export: bool = False) -> dict[str, Any]:
-    """Bridge ``nms=True/False`` and ``end2end=False/True`` across Ultralytics 8.4.33 and 8.4.194+."""
+class YOLO27Trainer(DetectionTrainer):
+    """Trainer building ``YOLO27DetectionModel`` with automatic Net2Wider warm-start from ``yolo26*.pt``."""
+
+    _preset_use_normal: bool = False
+    _preset_donor_weights: str | None = None
+    _preset_allow_warmstart: bool | None = None
+
+    def __init__(self, cfg=DEFAULT_CFG_DICT, overrides: dict[str, Any] | None = None, _callbacks=None) -> None:
+        overrides = dict(overrides or {})
+        self._use_normal: bool = bool(overrides.pop("use_normal", self._preset_use_normal))
+        self._donor_weights: str | None = overrides.pop("donor_weights", self._preset_donor_weights)
+
+        raw_pretrained = overrides.get("pretrained", True)
+        if isinstance(raw_pretrained, (str, Path)) and self._donor_weights is None:
+            self._donor_weights = str(raw_pretrained)
+            overrides["pretrained"] = False
+
+        if self._preset_allow_warmstart is not None:
+            self._allow_warmstart: bool = bool(self._preset_allow_warmstart)
+        else:
+            self._allow_warmstart = raw_pretrained is not False
+
+        super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
+
+    def get_dataset(self) -> dict[str, Any]:
+        """Load dataset dict and optionally merge ``normaltrain`` / ``normalval`` splits."""
+        data = super().get_dataset()
+        if self._use_normal:
+            if data.get("normaltrain"):
+                data["train"] = _merge_split_paths(data.get("train"), data.get("normaltrain"))
+                LOGGER.info(f"YOLO27Trainer: merged normaltrain -> {data['train']}")
+            if data.get("normalval"):
+                data["val"] = _merge_split_paths(data.get("val"), data.get("normalval"))
+                LOGGER.info(f"YOLO27Trainer: merged normalval -> {data['val']}")
+        return data
+
+    def _collect_dataset_search_dirs(self) -> list[str]:
+        """Gather dataset directories so ``yolo26n.pt`` stored beside datasets is found automatically."""
+        dirs: list[str] = []
+        data = getattr(self, "data", None)
+        if isinstance(data, dict):
+            for k in ("path", "train", "val"):
+                v = data.get(k)
+                if isinstance(v, (str, Path)):
+                    dirs.append(str(v))
+                elif isinstance(v, (list, tuple)):
+                    dirs.extend(str(item) for item in v if isinstance(item, (str, Path)))
+        return dirs
+
+    def get_model(
+        self,
+        cfg: str | Path | dict[str, Any] | None = None,
+        weights: Any = None,
+        verbose: bool = True,
+    ) -> YOLO27DetectionModel:
+        """Instantiate ``YOLO27DetectionModel`` and apply Net2Wider warm-start when starting from YAML."""
+        model = YOLO27DetectionModel(
+            cfg or "models/yolo27n.yaml",
+            nc=self.data["nc"],
+            ch=self.data.get("channels", 3),
+            verbose=verbose and RANK == -1,
+        )
+        if weights is not None:
+            if isinstance(weights, nn.Module) and isinstance(getattr(weights, "model", [None])[-1], YOLO27Detect):
+                model.load(weights)
+            else:
+                transfer_pretrained_weights(weights, model, verbose=verbose and RANK in {-1, 0})
+        elif self._allow_warmstart and not getattr(self.args, "resume", False):
+            scale = str(model.yaml.get("scale", "n") or "n")
+            donor = resolve_donor_checkpoint(
+                scale=scale,
+                explicit_donor=self._donor_weights,
+                allow_download=True,
+                extra_dirs=self._collect_dataset_search_dirs(),
+            )
+            if donor is not None:
+                transfer_pretrained_weights(donor, model, verbose=verbose and RANK in {-1, 0})
+            elif RANK in {-1, 0}:
+                LOGGER.warning(
+                    f"WARNING: Could not find or download yolo26{scale}.pt for Net2Wider warm-start! "
+                    f"Training from scratch will converge slower and lower mAP than YOLO26n. "
+                    f"Place yolo26{scale}.pt in the project root or pass --donor path/to/yolo26{scale}.pt."
+                )
+        return model
+
+    def get_validator(self) -> YOLO27Validator:
+        """Return ``YOLO27Validator`` matching the 4-component loss layout."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
+        return YOLO27Validator(
+            self.test_loader, save_dir=self.save_dir, args=deepcopy(self.args), _callbacks=self.callbacks
+        )
+
+
+def _translate_nms_kwarg(
+    kwargs: dict[str, Any],
+    model: nn.Module | None,
+    default_nms: bool | None = True,
+) -> dict[str, Any]:
+    """Translate ``nms=True/False/None`` cleanly across Ultralytics 8.4.33 and >=8.4.197."""
     out = dict(kwargs)
-    if "nms" in out and hasattr(DEFAULT_CFG, "end2end"):
-        use_nms = bool(out.pop("nms"))
-        out.setdefault("end2end", not use_nms)
-        if for_export:
-            out.setdefault("nms", False)
+    nms_flag = out.pop("nms", default_nms)
+    use_end2end = nms_flag is False
+
+    if model is not None:
+        head = model.model[-1] if hasattr(model, "model") else None
+        if isinstance(head, YOLO27Detect):
+            head.end2end = use_end2end
+
+    if "end2end" in DEFAULT_CFG_DICT:
+        out["end2end"] = use_end2end
+    elif "nms" in DEFAULT_CFG_DICT:
+        if nms_flag is not None:
+            out["nms"] = bool(nms_flag)
     return out
 
 
 class YOLO27(YOLO):
-    """Unified Ultralytics-compatible interface for YOLO27n / YOLO27n-Lite / YOLO27s models."""
+    """Drop-in ``YOLO`` user interface for ``YOLO27n`` / ``YOLO27n-Dual`` / ``YOLO27n-Lite``."""
 
-    def __init__(self, model: str | Path = "models/yolo27n.yaml", task: str | None = "detect", verbose: bool = False):
-        super().__init__(model=model, task=task, verbose=verbose)
+    def __init__(self, model: str | Path = "models/yolo27n.yaml", task: str | None = None, verbose: bool = False):
+        super().__init__(model=str(model), task=task or "detect", verbose=verbose)
 
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:
+        """Map detect task to ``YOLO27DetectionModel``, ``YOLO27Trainer``, and ``YOLO27Validator``."""
         base_map = dict(super().task_map)
         base_map["detect"] = {
             "model": YOLO27DetectionModel,
             "trainer": YOLO27Trainer,
             "validator": YOLO27Validator,
-            "predictor": yolo.detect.DetectionPredictor,
+            "predictor": DetectionPredictor,
         }
         return base_map
 
     def train(self, trainer=None, **kwargs: Any):
-        """Train model, intercepting ``pretrained='path.pt'`` so Net2Wider runs cleanly without Model.load hijack."""
+        """Train model while preventing ``Model.load(True)`` from hijacking Net2Wider warm-start on YAML configs."""
         train_kwargs = dict(kwargs)
-        pt_arg = train_kwargs.get("pretrained", None)
-        if isinstance(pt_arg, (str, Path)) and str(self.overrides.get("model", "")).endswith((".yaml", ".yml")):
-            train_kwargs["_donor_weights_path"] = str(pt_arg)
+        use_normal = bool(train_kwargs.pop("use_normal", False))
+        donor_weights = train_kwargs.pop("donor_weights", None)
+
+        is_yaml_start = str(self.overrides.get("model", "")).lower().endswith((".yaml", ".yml")) and not self.ckpt
+        raw_pretrained = train_kwargs.get("pretrained", True)
+        if is_yaml_start:
+            if isinstance(raw_pretrained, (str, Path)) and donor_weights is None:
+                donor_weights = str(raw_pretrained)
+            allow_warmstart = raw_pretrained is not False
+            # Critical: pass pretrained=False into Model.train() so Model.load(True) does NOT
+            # overwrite self.ckpt with random scratch self.model and bypass YOLO27Trainer.get_model()!
             train_kwargs["pretrained"] = False
-        return super().train(trainer=trainer, **train_kwargs)
+        else:
+            allow_warmstart = None
+
+        base_trainer_cls = trainer or YOLO27Trainer
+
+        class _BoundYOLO27Trainer(base_trainer_cls):
+            _preset_use_normal = use_normal
+            _preset_donor_weights = str(donor_weights) if donor_weights is not None else None
+            _preset_allow_warmstart = allow_warmstart
+
+        return super().train(trainer=_BoundYOLO27Trainer, **train_kwargs)
 
     def val(self, validator=None, **kwargs: Any):
-        """Validate model, supporting ``nms=True/False`` and optional ``use_normal=True``."""
+        """Validate model; defaults to ``nms=True`` (one-to-many + NMS) per YOLO27 spec."""
         use_normal = bool(kwargs.pop("use_normal", False))
-        norm_kwargs = _translate_nms_kwarg(kwargs, for_export=False)
-        if use_normal and validator is None:
-            custom = {"rect": True}
-            args = {**self.overrides, **custom, **norm_kwargs, "mode": "val"}
-            val_inst = YOLO27Validator(args=args, _callbacks=self.callbacks, use_normal=True)
-            val_inst(model=self.model)
-            self.metrics = val_inst.metrics
-            return val_inst.metrics
-        return super().val(validator=validator, **norm_kwargs)
+        kwargs = _translate_nms_kwarg(kwargs, self.model, default_nms=True)
+        if use_normal:
+            custom_val = validator or YOLO27Validator
+
+            class _NormalEnabledValidator(custom_val):
+                def __init__(self, *a, **kw):
+                    super().__init__(*a, **kw)
+                    self._use_normal = True
+
+            return super().val(validator=_NormalEnabledValidator, **kwargs)
+        return super().val(validator=validator, **kwargs)
 
     def predict(self, source=None, stream: bool = False, predictor=None, **kwargs: Any):
-        """Run inference, supporting ``nms=True`` (default one2many+NMS) and ``nms=False`` (one2one)."""
-        return super().predict(
-            source=source,
-            stream=stream,
-            predictor=predictor,
-            **_translate_nms_kwarg(kwargs, for_export=False),
-        )
+        """Run inference; defaults to ``nms=True`` (pass ``nms=False`` for E2E one-to-one)."""
+        kwargs = _translate_nms_kwarg(kwargs, self.model, default_nms=True)
+        return super().predict(source=source, stream=stream, predictor=predictor, **kwargs)
 
-    def export(self, **kwargs: Any) -> str:
-        """Export model, supporting ``nms=True`` (one2many) and ``nms=False`` (end-to-end one2one)."""
-        return super().export(**_translate_nms_kwarg(kwargs, for_export=True))
+    def export(self, **kwargs: Any):
+        """Export model; defaults to raw one-to-many head (pass ``nms=False`` for E2E one-to-one)."""
+        kwargs = _translate_nms_kwarg(kwargs, self.model, default_nms=None)
+        return super().export(**kwargs)

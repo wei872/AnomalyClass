@@ -1,26 +1,24 @@
-"""Function-preserving Net2Wider pretrained warm-start for YOLO27n / YOLO27n-Lite.
+"""Function-preserving Net2Wider pretrained warm-start for YOLO27n / YOLO27n-Dual / YOLO27n-Lite.
 
 Transfers pretrained weights from ``yolo26n.pt`` (or ``yolo26s.pt`` / ``yolo11n.pt``) into
-``YOLO27DetectionModel`` cleanly:
-  1. Exact-shape layers (stem Conv, P3/P4/P5 C3k2, SPPF, C2PSA, etc.) copy 1:1.
-  2. Widened ``C3k2`` stages align both ``cv1`` (2-chunk split) and ``cv2`` (``(2+n)``-chunk concat).
+``YOLO27DetectionModel`` with **exact step-0 functional equivalence** (``max_diff < 1e-5``):
+  1. Exact-shape layers (stem Conv, P4/P5 C3k2, SPPF, C2PSA, ``reg_max=1`` box head,
+     and ``c3=80`` classification conv towers) copy 1:1 with zero truncation.
+  2. Widened ``C3k2`` stages (``P2/4`` width, ``P3/8`` 2x inner bottleneck, ``P3/8`` fine neck)
+     align ``cv1`` (2-chunk split on both ``conv.weight`` and ``bn.*``), inner ``C3k.cv3``
+     (2-chunk concat), and ``cv2`` (``(2+n)``-chunk concat).
   3. ``Concat`` consumers align input channel offsets per concatenated branch.
   4. Newly widened input-channel columns on consumer convolutions are zero-initialized (Net2Wider),
-     while newly widened output-channel filters retain their full Kaiming initialization (preventing
-     ``BatchNorm`` running-variance shrinkage and ``20x`` backward Jacobian spikes) so step-0 outputs
-     on shared architectures match to ``< 1e-6`` while step-1 gradients cleanly unlock new channels.
-  5. Incompatible final head projection convs — ``.cv3.<scale>.2.`` when ``nc`` differs and
-     ``.cv2.<scale>.2.`` when ``reg_max`` differs (e.g., ``yolo26n.pt`` ``reg_max=1`` 4-ch scalar
-     head -> ``YOLO27n`` ``reg_max=16`` 64-ch DFL head) — are skipped so ``bias_init()`` priors stay
-     intact while all shared ``3x3`` head feature convs (``.0`` and ``.1``) transfer cleanly.
-  6. ``YOLO27Detect`` fixed ``scale_factors`` are pre-compensated (``1 / s_i``) on first-layer convs
-     when loading from an unscaled donor so pretrained BatchNorm statistics remain calibrated.
+     while newly widened output-channel filters retain their full Kaiming initialization so step-0
+     outputs match the donor to ``< 1e-5`` while step-1 gradients cleanly unlock all new capacity.
+  5. ``YOLO27Detect`` fixed ``scale_factors`` are pre-compensated (``1 / s_i``) on first-layer convs
+     and ``feat_logit_scale`` is initialized to ``1.0`` when loading from an unscaled donor.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-import urllib.request
 from typing import Any
 
 import torch
@@ -28,6 +26,26 @@ from torch import nn
 
 from ultralytics.nn.modules.conv import Concat
 from ultralytics.utils import LOGGER, SETTINGS
+
+
+def _extract_donor_object(donor: str | Path | dict[str, Any] | nn.Module) -> nn.Module | dict[str, torch.Tensor]:
+    """Load or unwrap an ``nn.Module`` (preferring EMA weights) or state_dict from path/dict/model."""
+    if isinstance(donor, (str, Path)):
+        from ultralytics.nn.tasks import load_checkpoint
+
+        weights, ckpt = load_checkpoint(str(donor))
+        if isinstance(ckpt, dict):
+            ema_or_model = ckpt.get("ema") or ckpt.get("model")
+            if isinstance(ema_or_model, nn.Module):
+                return ema_or_model
+        if isinstance(weights, nn.Module):
+            return weights
+        donor = ckpt
+    if isinstance(donor, dict) and (isinstance(donor.get("ema"), nn.Module) or isinstance(donor.get("model"), nn.Module)):
+        return donor.get("ema") or donor.get("model")
+    if isinstance(donor, nn.Module) and hasattr(donor, "ckpt") and hasattr(donor, "model"):
+        return donor.model
+    return donor
 
 
 def _infer_layer_out_ch(sd: dict[str, torch.Tensor], seq_mods: Any, idx: int) -> int | None:
@@ -96,11 +114,6 @@ def _copy_out_rows_with_chunked_in(
     in_pairs: list[tuple[int, int, int]],
 ) -> int:
     """Copy ``(out_src, out_dst, out_len) x (in_src, in_dst, in_len)`` blocks; zero extra cols cleanly."""
-    # Keep full Kaiming initialization on newly widened output rows (no 0.05x BN variance shrinkage!),
-    # while zeroing newly widened input columns across ALL rows so step-0 shared outputs are exact.
-    for _, id_i, ilen in in_pairs:
-        pass
-    # Zero any input columns not covered by donor's shared input chunks
     covered_in = torch.zeros(dst.shape[1], dtype=torch.bool, device=dst.device)
     for _, id_i, ilen in in_pairs:
         covered_in[id_i : id_i + ilen] = True
@@ -169,7 +182,7 @@ def _copy_sliced_tensor(
         dst[:c_out].copy_(src_cast[:c_out])
         return c_out * dst.shape[2] * dst.shape[3]
 
-    # Determine output-channel block alignment (only top-level C2f/C3k2 cv1 splits via chunk(2))
+    # Determine output-channel block alignment (top-level C2f/C3k2 cv1 splits via chunk(2, 1))
     if (
         is_top_c2f
         and key == f"model.{layer_idx}.cv1.conv.weight"
@@ -184,7 +197,6 @@ def _copy_sliced_tensor(
         c_out = min(src.shape[0], dst.shape[0])
         out_pairs = [(0, 0, c_out)]
 
-    # Determine input-channel block alignment
     in_pairs: list[tuple[int, int, int]] | None = None
 
     # Case A1: Top-level C2f / C3k2 cv2.conv.weight concatenating (2 + len(m)) chunks of hidden width c_
@@ -224,7 +236,6 @@ def _copy_sliced_tensor(
                     so += sc
                     do += dc
 
-    # Default contiguous input channels
     if in_pairs is None:
         in_pairs = [(0, 0, min(src.shape[1], dst.shape[1]))]
 
@@ -232,11 +243,15 @@ def _copy_sliced_tensor(
 
 
 def _compensate_head_scale_factors(donor_obj: Any, target: nn.Module) -> None:
-    """Divide first-conv weights on ``YOLO27Detect`` by ``scale_factors[i]`` when donor head was unscaled."""
+    """Reset ``feat_logit_scale`` to ``1.0`` and pre-divide first head convs by ``scale_factors[i]``."""
     target_mods = getattr(target, "model", None)
     if target_mods is None or len(target_mods) == 0:
         return
     head = target_mods[-1]
+    if getattr(head, "feat_logit_scale", None) is not None:
+        for p in head.feat_logit_scale:
+            p.data.fill_(1.0)
+
     scale_factors = getattr(head, "scale_factors", None)
     if not scale_factors or getattr(head, "_scale_folded", False):
         return
@@ -258,12 +273,13 @@ def _compensate_head_scale_factors(donor_obj: Any, target: nn.Module) -> None:
 
 
 @torch.no_grad()
-def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], target: nn.Module) -> dict[str, float]:
+def transfer_pretrained_weights(
+    donor: str | Path | nn.Module | dict[str, Any],
+    target: nn.Module,
+    verbose: bool = True,
+) -> dict[str, float]:
     """Transfer exact and function-preserving Net2Wider pretrained weights from ``donor`` into ``target``."""
-    if isinstance(donor, dict) and (isinstance(donor.get("ema"), nn.Module) or isinstance(donor.get("model"), nn.Module)):
-        donor_obj: Any = donor.get("ema") or donor.get("model")
-    else:
-        donor_obj = donor
+    donor_obj = _extract_donor_object(donor)
     donor_sd = donor_obj if isinstance(donor_obj, dict) else donor_obj.float().state_dict()
     target_sd = target.state_dict()
     target_mods = getattr(target, "model", None)
@@ -284,7 +300,6 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
         and donor_sd[donor_box_key].shape == target_sd[target_box_key].shape
     )
 
-    # Support both 3-scale->3-scale (YOLO27n) and 3-scale->2-scale (YOLO27n-Lite) warm-start
     donor_has_3_scales = f"model.{head_idx}.cv2.2.0.conv.weight" in donor_sd
     target_has_2_scales = (
         f"model.{head_idx}.cv2.1.0.conv.weight" in target_sd
@@ -293,19 +308,19 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
 
     exact_tensors, sliced_tensors = 0, 0
     copied_numel = 0
-    total_numel = sum(v.numel() for v in target_sd.values() if v.ndim >= 1)
+    total_numel = sum(v.numel() for v in target_sd.values() if v.is_floating_point() and v.ndim >= 1)
 
     for key, dst in target_sd.items():
-        if dst.ndim == 0:
+        if not dst.is_floating_point() or dst.ndim == 0:
             continue
 
         # Keep target dataset 19-class focal bias prior on final 1x1 projection when nc differs
         if not same_nc and any(tag in key for tag in (".cv3.", ".one2one_cv3.")) and ".2." in key:
             continue
-        # Keep uniform 16-bin DFL bias prior on final 1x1 box projection when reg_max differs (e.g. yolo26n reg_max=1 -> yolo27n reg_max=16)
+        # Guard final 1x1 box projection only when reg_max differs
         if not same_reg_max and any(tag in key for tag in (".cv2.", ".one2one_cv2.")) and ".2." in key:
             continue
-        if any(tag in key for tag in (".fg_branch.", ".strip_adapters.")) and key not in donor_sd:
+        if any(tag in key for tag in (".fg_branch.", ".feat_logit_scale.")) and key not in donor_sd:
             continue
 
         src_key = key
@@ -344,14 +359,14 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
                 head.one2one_cv2[s].load_state_dict(head.cv2[s].state_dict())
                 head.one2one_cv3[s].load_state_dict(head.cv3[s].state_dict())
 
-    # Pre-compensate fixed feature scale factors so step-0 outputs match unscaled donor 100% exactly
     _compensate_head_scale_factors(donor_obj, target)
 
     ratio = copied_numel / max(total_numel, 1)
-    LOGGER.info(
-        f"YOLO27 Warm-Start: transferred {exact_tensors} exact + {sliced_tensors} Net2Wider-sliced tensors "
-        f"({copied_numel / 1e6:.2f}M / {total_numel / 1e6:.2f}M elements, {ratio * 100:.1f}%)"
-    )
+    if verbose:
+        LOGGER.info(
+            f"YOLO27 Warm-Start: transferred {exact_tensors} exact + {sliced_tensors} Net2Wider-sliced tensors "
+            f"({copied_numel / 1e6:.2f}M / {total_numel / 1e6:.2f}M elements, {ratio * 100:.1f}%)"
+        )
     return {
         "exact_tensors": exact_tensors,
         "sliced_tensors": sliced_tensors,
@@ -362,64 +377,92 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
 
 
 def resolve_donor_checkpoint(
-    donor_name: str = "yolo26n.pt",
+    scale: str = "n",
+    explicit_donor: str | Path | None = None,
     allow_download: bool = True,
-    extra_dirs: list[str | Path] | None = None,
+    extra_dirs: Sequence[str | Path] | None = None,
 ) -> Path | None:
-    """Locate ``donor_name`` across local/parent/sibling folders or download cleanly via Range-GET."""
-    name = Path(donor_name).name
+    """Locate ``yolo26{scale}.pt`` across local/parent/sibling/dataset folders or download via Ultralytics."""
+    if explicit_donor is not None:
+        p = Path(explicit_donor)
+        if p.is_file() and p.stat().st_size > 100_000:
+            LOGGER.info(f"YOLO27 Warm-Start: using explicit pretrained donor -> {p}")
+            return p
+
+    scale_key = (scale or "n").lower()
+    if scale_key.endswith(".pt"):
+        donor_name = Path(scale_key).name
+    else:
+        if scale_key not in {"n", "s", "m", "l", "x"}:
+            scale_key = "n"
+        donor_name = f"yolo26{scale_key}.pt"
+
     cwd = Path.cwd().resolve()
-    cand_paths: list[Path] = [
-        Path(donor_name),
-        cwd / name,
-        cwd.parent / name,
-        cwd.parent.parent / name,
-        Path(SETTINGS.get("weights_dir", "")) / name,
-        Path.home() / name,
+    repo_root = Path(__file__).resolve().parents[1]
+    base_roots: list[Path] = [
+        cwd,
+        cwd.parent,
+        cwd.parent.parent,
+        repo_root,
+        repo_root.parent,
     ]
     if extra_dirs:
         for d in extra_dirs:
             if d:
                 dp = Path(str(d))
-                cand_paths.extend([dp / name, dp.parent / name, dp.parent.parent / name])
+                base_roots.extend([dp, dp.parent, dp.parent.parent])
 
-    if cwd.parent.is_dir():
+    cand_paths: list[Path] = []
+    seen: set[Path] = set()
+    for base in base_roots:
+        for sub in (base / donor_name, base / "weights" / donor_name):
+            try:
+                resolved = sub.resolve()
+            except OSError:
+                resolved = sub
+            if resolved not in seen:
+                seen.add(resolved)
+                cand_paths.append(sub)
         try:
-            for sub in cwd.parent.iterdir():
-                if sub.is_dir() and sub != cwd:
-                    cand_paths.append(sub / name)
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir() and not child.name.startswith("."):
+                        sib = child / donor_name
+                        if sib.is_file() and sib.stat().st_size > 100_000:
+                            LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor -> {sib}")
+                            return sib
         except OSError:
             pass
 
-    for p in cand_paths:
+    weights_dir = SETTINGS.get("weights_dir")
+    if weights_dir:
+        cand_paths.append(Path(weights_dir) / donor_name)
+    cand_paths.extend(
+        [
+            Path.home() / donor_name,
+            Path.home() / "Downloads" / donor_name,
+            Path.home() / ".cache" / "ultralytics" / donor_name,
+        ]
+    )
+
+    for cand in cand_paths:
         try:
-            if p.is_file() and p.stat().st_size > 100_000:
-                LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor checkpoint -> {p}")
-                return p
+            if cand.is_file() and cand.stat().st_size > 100_000:
+                LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor -> {cand}")
+                return cand
         except OSError:
             continue
 
-    if not allow_download:
-        return None
+    if allow_download:
+        try:
+            from ultralytics.utils.downloads import attempt_download_asset
 
-    url = f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}"
-    try:
-        req = urllib.request.Request(url, method="GET", headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            resp.read(1)
-    except Exception:
-        LOGGER.warning(
-            f"YOLO27 Warm-Start: 未在本地目录找到 '{name}' 且当前网络无法直连 GitHub 下载！"
-            f" 请将你测过 yolo26n 的 '{name}' 复制到项目根目录（或通过 --pretrained 指定路径），否则将退回随机初始化！"
-        )
-        return None
-
-    try:
-        from ultralytics.utils.downloads import attempt_download_asset
-
-        downloaded = Path(attempt_download_asset(donor_name))
-        if downloaded.is_file() and downloaded.stat().st_size > 100_000:
-            return downloaded
-    except Exception as exc:
-        LOGGER.warning(f"YOLO27 Warm-Start: 自动下载 {donor_name} 失败 ({exc})。")
+            downloaded = Path(attempt_download_asset(donor_name))
+            if downloaded.is_file() and downloaded.stat().st_size > 100_000:
+                return downloaded
+        except Exception as exc:
+            LOGGER.warning(
+                f"YOLO27 Warm-Start: 未在本地找到 '{donor_name}' 且自动下载失败 ({exc})。"
+                f" 请将你跑过 yolo26n 的 '{donor_name}' 放入项目根目录（或通过 --donor 指定路径），避免退回从零随机训练！"
+            )
     return None

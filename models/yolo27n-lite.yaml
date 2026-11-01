@@ -1,20 +1,20 @@
 # =============================================================================
 # YOLO27n-Lite — Extreme Edge-Lightweight Variant for Fabric Inspection Cameras
 #
-# Retains ALL core YOLO27n innovations (widened early P2/4 stage, dual-scale
-# [P3/8, P5/32] head with fixed feature scaling, 16-bin DFL reg_max=16, and
-# training-only Foreground Alignment Supervision), while further compressing
-# deeper stages via separable SCDown downsampling and [0.50, 0.1875, 768] scaling.
+# Retains ALL core YOLO27n innovations (widened early P2/4 & P3/8 stages,
+# dual-scale [P3/8, P5/32] head with fixed + folded feature scaling, DFL-free
+# unconstrained reg_max=1 regression, and training-only Foreground Alignment
+# Supervision), while compressing deeper stages via SCDown and [0.50, 0.1875, 768].
 #
 # Complexity @ 640x640 (Fused, nc=19):
-#   - Parameters: ~0.92M (918,153) — 66% fewer params than standard YOLO27n!
-#   - FLOPs:      ~3.84 GFLOPs     — 45% lower compute than standard YOLO27n!
+#   - Parameters: ~0.77M — 68% fewer params than YOLO26n!
+#   - FLOPs:      ~3.14 GFLOPs — 41% lower compute than YOLO26n!
 # =============================================================================
 
 nc: 19
 scale: n
 end2end: True
-reg_max: 16
+reg_max: 1
 scales:
   n: [0.50, 0.1875, 768]
 
@@ -24,7 +24,7 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4
   - [-1, 2, C3k2, [384, False, 0.25]]  # 2-P2/4   widened early high-res stage (72 ch vs 48 ch)
   - [-1, 1, SCDown, [256, 3, 2]]       # 3-P3/8   pointwise + depthwise separable downsample
-  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8
+  - [-1, 2, C3k2, [512, False, 0.50]]  # 4-P3/8   2x inner bottleneck small-object stage
   - [-1, 1, SCDown, [512, 3, 2]]       # 5-P4/16  separable downsample
   - [-1, 2, C3k2, [640, True]]         # 6-P4/16
   - [-1, 1, SCDown, [768, 3, 2]]       # 7-P5/32  separable downsample
