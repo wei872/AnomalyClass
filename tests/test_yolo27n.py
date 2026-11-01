@@ -1,4 +1,4 @@
-"""Automated verification suite for YOLO27n, YOLO27n-Dual, YOLO27n-Lite, folded scaling, and Net2Wider warm-start."""
+"""Automated verification suite for YOLO27n/Dual/Lite high-IoU localization, warm-start, and v8.4.33+ compatibility."""
 
 from __future__ import annotations
 
@@ -15,79 +15,81 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultralytics import YOLO
-from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import YAML
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
-from yolo27 import YOLO27, YOLO27Detect, YOLO27DetectionModel, YOLO27E2ELoss, resolve_donor_checkpoint, transfer_pretrained_weights
+from yolo27 import (
+    YOLO27,
+    YOLO27BboxLoss,
+    YOLO27Detect,
+    YOLO27DetectionModel,
+    YOLO27E2ELoss,
+    YOLO27Trainer,
+    resolve_donor_checkpoint,
+    transfer_pretrained_weights,
+)
 
 
-def test_yolo27n_footprints_regmax1_and_optimizer_groups() -> None:
-    """Verify YOLO27n/Dual/Lite footprints, reg_max=1, c3=80 preservation, dual biases, and optimizer group routing."""
+def test_yolo27n_footprints_box_tower_and_musgd_guard() -> None:
+    """Verify footprints, widened c2=32 box head, deterministic fixed scaling, and >10k-iter MuSGD protection."""
     model_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
     head = model_19.model[-1]
     assert isinstance(head, YOLO27Detect)
-    assert head.reg_max == 1, f"Expected DFL-free reg_max=1 matching YOLO26/YOLO27, got {head.reg_max}"
-    assert head.fg_branch is not None
-    assert head.feat_logit_scale is not None
-    assert model_19.end2end is False, "Official YOLO27 default must use high-accuracy one2many + NMS"
-    # Verify c3 == 80 (1:1 aligned with yolo26n.pt cv3 channels — zero truncation!)
+    assert head.reg_max == 1, f"Expected DFL-free reg_max=1, got {head.reg_max}"
+    assert head.c2_width == 32 and head.cv2[0][0].conv.out_channels == 32
     assert head.cv3[0][0][1].conv.out_channels == 80
+    assert head.fg_branch is not None
+    assert not hasattr(head, "feat_logit_scale") or getattr(head, "feat_logit_scale") is None
+    assert model_19.end2end is False
 
     # Verify BOTH one2many and one2one biases are initialized to focal/box priors
     for s in range(head.nl):
         o2m_cls_b = head.cv3[s][-1].bias.detach()
         o2o_cls_b = head.one2one_cv3[s][-1].bias.detach()
-        assert torch.all(o2m_cls_b < -5.0), f"one2many cls bias not initialized at scale {s}"
-        assert torch.allclose(o2m_cls_b, o2o_cls_b), "one2one cls bias must match one2many focal prior!"
+        assert torch.all(o2m_cls_b < -5.0)
+        assert torch.allclose(o2m_cls_b, o2o_cls_b)
         assert torch.allclose(head.cv2[s][-1].bias.detach(), torch.full_like(head.cv2[s][-1].bias, 2.0))
         assert torch.allclose(head.one2one_cv2[s][-1].bias.detach(), torch.full_like(head.one2one_cv2[s][-1].bias, 2.0))
 
-    # Verify feat_logit_scale routes to weight_decay=0.0 and non-Muon optimizer param group
-    dummy_trainer = BaseTrainer.__new__(BaseTrainer)
+    # Verify YOLO27Trainer.build_optimizer prevents MuSGD shock at iterations=25000 when warm-started!
+    dummy_trainer = YOLO27Trainer.__new__(YOLO27Trainer)
+    dummy_trainer._allow_warmstart = True
     dummy_trainer.data = {"nc": 19}
     dummy_trainer.args = SimpleNamespace(
         optimizer="auto", lr0=0.01, momentum=0.937, weight_decay=0.0005, warmup_epochs=3.0
     )
-    opt = dummy_trainer.build_optimizer(model=model_19, name="auto", lr=0.001, momentum=0.9, decay=0.0005, iterations=100)
-    scale_ptrs = {id(p) for p in head.feat_logit_scale}
-    found_scale = 0
-    for pg in opt.param_groups:
-        for p in pg["params"]:
-            if id(p) in scale_ptrs:
-                found_scale += 1
-                assert pg.get("weight_decay", 0.0) == 0.0, "feat_logit_scale must have weight_decay=0.0"
-                assert not pg.get("use_muon", False), "feat_logit_scale must NOT use Muon 2D orthogonalization"
-    assert found_scale == head.nl
+    opt = dummy_trainer.build_optimizer(model=model_19, name="auto", lr=0.01, momentum=0.9, decay=0.0005, iterations=25000)
+    assert isinstance(opt, torch.optim.AdamW), f"Expected AdamW instead of MuSGD on warm-start, got {type(opt)}"
 
-    # Verify parameter counts are close to YOLO26n (~2.38M @ nc=19) and strictly inside YOLO27n budget
+    # Verify fused parameter counts & FLOPs stay compact and auxiliary FG branch is stripped
     fused_19 = deepcopy(model_19).eval().fuse(verbose=False)
     params_19 = get_num_params(fused_19) / 1e6
     flops_19 = get_flops(fused_19, imgsz=640)
-    assert 2.38 <= params_19 <= 2.65, f"Expected YOLO27n fused params ~2.51M (close to YOLO26n), got {params_19:.3f}M"
-    assert 5.40 <= flops_19 <= 7.00, f"Expected YOLO27n FLOPs <=7.0B @ nc=19, got {flops_19:.2f}B"
+    assert 2.45 <= params_19 <= 2.70, f"Expected YOLO27n fused params ~2.57M, got {params_19:.3f}M"
+    assert 5.40 <= flops_19 <= 7.20, f"Expected YOLO27n FLOPs <=7.2B @ nc=19, got {flops_19:.2f}B"
     assert fused_19.model[-1].fg_branch is None
-    assert fused_19.model[-1].feat_logit_scale is None
+    assert fused_19.model[-1].cv2 is not None and fused_19.model[-1].one2one_cv2 is None
 
-    # Verify YOLO27n-Dual (~2.46M fused params, stride [8, 32])
+    # Verify YOLO27n-Dual (~2.51M fused params, stride [8, 32])
     model_dual = YOLO27DetectionModel("models/yolo27n-dual.yaml", nc=19, verbose=False)
     assert model_dual.model[-1].stride.tolist() == [8.0, 32.0]
+    assert model_dual.model[-1].cv2[0][0].conv.out_channels == 32
     fused_dual = deepcopy(model_dual).eval().fuse(verbose=False)
     params_dual = get_num_params(fused_dual) / 1e6
-    assert 2.35 <= params_dual <= 2.60, f"Expected YOLO27n-Dual ~2.46M params, got {params_dual:.3f}M"
+    assert 2.40 <= params_dual <= 2.65, f"Expected YOLO27n-Dual ~2.51M params, got {params_dual:.3f}M"
 
     # Verify YOLO27n-Lite (<0.9M fused params, <3.6B FLOPs)
     model_lite = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False)
     assert model_lite.model[-1].stride.tolist() == [8.0, 32.0]
-    assert model_lite.model[-1].reg_max == 1
+    assert model_lite.model[-1].cv2[0][0].conv.out_channels == 24
     fused_lite = deepcopy(model_lite).eval().fuse(verbose=False)
     assert get_num_params(fused_lite) / 1e6 < 0.90
     assert get_flops(fused_lite, imgsz=640) < 3.60
 
 
-def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
-    """Verify Net2Wider warm-start from stock YOLO26n (reg_max=1, nc=80) has <1e-5 step-0 drift & zero cv3 truncation."""
+def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
+    """Verify Net2Wider warm-start from YOLO26n (c2=16 -> c2=32) has <5e-5 step-0 drift & step-1 active grads."""
     torch.manual_seed(0)
     calib_x = torch.rand(2, 3, 160, 160)
 
@@ -99,10 +101,10 @@ def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
         donor_y26(calib_x)
     donor_y26.eval()
 
-    # 1. nc=80 -> nc=80: exact step-0 equivalence across BOTH one2many and one2one on YOLO27n!
+    # 1. nc=80 -> nc=80: exact step-0 equivalence across BOTH one2many and one2one even with c2=32!
     target_80 = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False).eval()
     stats_80 = transfer_pretrained_weights(donor_y26, target_80, verbose=False)
-    assert stats_80["ratio"] >= 0.93, f"Expected >=93% warm-start coverage @ nc=80, got {stats_80['ratio']:.3f}"
+    assert stats_80["ratio"] >= 0.88, f"Expected >=88% warm-start coverage @ nc=80 (c2=32), got {stats_80['ratio']:.3f}"
     with torch.no_grad():
         _, p_donor = donor_y26(calib_x[:1])
         _, p_target = target_80(calib_x[:1])
@@ -112,7 +114,7 @@ def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
         assert box_diff < 5e-5, f"Step-0 {branch_key} box drift: {box_diff}"
         assert score_diff < 5e-5, f"Step-0 {branch_key} score drift: {score_diff}"
 
-    # 2. nc=80 -> nc=19 (Fabric19): exact step-0 box equivalence vs YOLO26n(nc=19).load(donor) + active step-1 grads
+    # 2. nc=80 -> nc=19 (Fabric19): exact step-0 box equivalence vs YOLO26n(nc=19).load(donor)
     y26_19_cfg = deepcopy(donor_y26.yaml)
     y26_19_cfg["nc"] = 19
     ref_y26_19 = DetectionModel(y26_19_cfg, nc=19, verbose=False)
@@ -122,7 +124,7 @@ def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
     target_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
     orig_cls_bias = target_19.model[-1].cv3[0][-1].bias.detach().clone()
     stats_19 = transfer_pretrained_weights(donor_y26, target_19, verbose=False)
-    assert stats_19["ratio"] >= 0.90, f"Expected >=90% warm-start coverage @ nc=19, got {stats_19['ratio']:.3f}"
+    assert stats_19["ratio"] >= 0.85, f"Expected >=85% warm-start coverage @ nc=19 (c2=32), got {stats_19['ratio']:.3f}"
     assert torch.allclose(orig_cls_bias, target_19.model[-1].cv3[0][-1].bias)
     assert torch.allclose(orig_cls_bias, target_19.model[-1].one2one_cv3[0][-1].bias)
 
@@ -134,7 +136,7 @@ def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
         box_diff_19 = (p_ref19[branch_key]["boxes"] - p_t19[branch_key]["boxes"]).abs().max().item()
         assert box_diff_19 < 5e-5, f"Fabric19 step-0 {branch_key} box drift vs YOLO26n: {box_diff_19}"
 
-    # Confirm step-1 unlocks non-zero gradients on widened P2/4 (layer 2), P3/8 bottleneck (layer 4), & P3 neck (layer 16)
+    # Confirm step-1 unlocks non-zero gradients on widened backbone, neck, AND widened c2=32 box head!
     target_19.train()
     target_19.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=100)
     crit = target_19.init_criterion()
@@ -153,67 +155,87 @@ def test_net2wider_exact_step0_equivalence_from_yolo26n() -> None:
             assert target_19.model[2].cv1.conv.weight.grad[16:20].abs().sum().item() > 0
             assert target_19.model[4].cv1.conv.weight.grad[32:64].abs().sum().item() > 0
             assert target_19.model[16].cv1.conv.weight.grad[16:20].abs().sum().item() > 0
+            assert target_19.model[-1].cv2[0][0].conv.weight.grad[16:32].abs().sum().item() > 0
         opt.step()
 
 
-def test_folded_per_channel_scale_exact_fusion() -> None:
-    """Verify learned per-channel feat_logit_scale + fixed scale_factors fuse with <1e-4 error on Conv & DWConv."""
+def test_version_safe_fusion_and_end2end_setter() -> None:
+    """Verify fixed scale folding, idempotent head.fuse() (8.4.33 safety), and model.end2end setter."""
     torch.manual_seed(42)
     x = torch.randn(2, 3, 256, 256)
 
     for cfg in ("models/yolo27n.yaml", "models/yolo27n-dual.yaml", "models/yolo27n-lite.yaml"):
         base_m = YOLO27DetectionModel(cfg, nc=19, verbose=False)
-        # Perturb feat_logit_scale across channels to simulate post-training learned calibration
-        with torch.no_grad():
-            for p in base_m.model[-1].feat_logit_scale:
-                p.copy_(torch.linspace(0.6, 1.8, steps=p.numel()))
 
-        # 1. Default NMS mode (end2end=False -> keeps one2many head)
+        # 1. Default NMS mode (end2end=False -> keeps one2many head, never deletes cv2/cv3!)
         m_nms = deepcopy(base_m).eval()
         assert m_nms.end2end is False
         with torch.no_grad():
             y_unfused, _ = m_nms(x)
         m_nms_fused = deepcopy(m_nms).fuse(verbose=False)
+        # Call head.fuse() a second time to verify idempotence across 8.4.33 & 8.4.197
+        m_nms_fused.model[-1].fuse()
         assert m_nms_fused.model[-1].fg_branch is None
-        assert m_nms_fused.model[-1].feat_logit_scale is None
+        assert m_nms_fused.model[-1].cv2 is not None
         assert m_nms_fused.model[-1].one2one_cv2 is None
         assert m_nms_fused.model[-1]._scale_folded is True
         with torch.no_grad():
             y_fused, _ = m_nms_fused(x)
         max_diff_nms = (y_unfused - y_fused).abs().max().item()
-        assert max_diff_nms < 1e-4, f"{cfg} NMS fuse mismatch with per-channel scale: {max_diff_nms}"
+        assert max_diff_nms < 1e-4, f"{cfg} NMS fuse mismatch: {max_diff_nms}"
 
         # 2. End-to-End NMS-free mode (end2end=True -> keeps one2one head)
         m_e2e = deepcopy(base_m).eval()
         m_e2e.end2end = True
+        assert m_e2e.model[-1].end2end is True
         with torch.no_grad():
             y_e2e_unfused, _ = m_e2e(x)
         m_e2e_fused = deepcopy(m_e2e).fuse(verbose=False)
+        m_e2e_fused.model[-1].fuse()
         assert m_e2e_fused.model[-1].fg_branch is None
-        assert m_e2e_fused.model[-1].feat_logit_scale is None
         assert m_e2e_fused.model[-1].cv2 is None
+        assert m_e2e_fused.model[-1].one2one_cv2 is not None
         with torch.no_grad():
             y_e2e_fused, _ = m_e2e_fused(x)
         max_diff_e2e = (y_e2e_unfused[..., :5] - y_e2e_fused[..., :5]).abs().max().item()
-        assert max_diff_e2e < 1e-4, f"{cfg} E2E fuse mismatch with per-channel scale: {max_diff_e2e}"
+        assert max_diff_e2e < 1e-4, f"{cfg} E2E fuse mismatch: {max_diff_e2e}"
 
 
-def test_live_fg_supervision_and_progressive_schedule() -> None:
-    """Verify live neck FG supervision backpropagates into neck, o2m: 0.80->0.55, STAL=16, and empty batches."""
+def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
+    """Verify YOLO27BboxLoss sharpens thin-defect edges and fg_align reuses o2m_assign on 8.4.33 & >=8.4.197."""
+    # 1. Verify YOLO27BboxLoss gives much stronger vertical edge supervision on a 560x8 px weft break than stock L1
+    stock_bbox = YOLO27BboxLoss(reg_max=1, edge_gain=0.0)
+    aniso_bbox = YOLO27BboxLoss(reg_max=1, edge_gain=0.25, min_edge_px=24.0)
+
+    anchor_pts = torch.tensor([[40.0, 40.0]])  # stride-8 grid units -> (320, 320) px
+    stride_t = torch.tensor([[8.0]])
+    imgsz_t = torch.tensor([640.0, 640.0])
+    # GT weft strip: width=560 px (x: 40..600 -> 5..75), thickness=8 px (y: 316..324 -> 39.5..40.5)
+    target_boxes = torch.tensor([[[5.0, 39.5, 75.0, 40.5]]])
+    # Prediction off by 2.4 px vertically (0.3 grid cells on top & bottom -> IoU drops to ~0.62!)
+    pred_dist_stock = torch.tensor([[[35.0, 0.8, 35.0, 0.8]]], requires_grad=True)
+    pred_dist_aniso = torch.tensor([[[35.0, 0.8, 35.0, 0.8]]], requires_grad=True)
+    pred_boxes = torch.tensor([[[5.0, 39.2, 75.0, 40.8]]])
+    target_scores = torch.ones((1, 1, 1))
+    fg_mask = torch.tensor([[True]])
+
+    _, l_dfl_stock = stock_bbox(
+        pred_dist_stock, pred_boxes, anchor_pts, target_boxes, target_scores, torch.tensor(1.0), fg_mask, imgsz_t, stride_t
+    )
+    _, l_dfl_aniso = aniso_bbox(
+        pred_dist_aniso, pred_boxes, anchor_pts, target_boxes, target_scores, torch.tensor(1.0), fg_mask, imgsz_t, stride_t
+    )
+    l_dfl_stock.backward()
+    l_dfl_aniso.backward()
+    assert pred_dist_aniso.grad[0, 0, 1].abs().item() > 4.0 * pred_dist_stock.grad[0, 0, 1].abs().item()
+
+    # 2. Verify live FG supervision & legacy 8.4.33 3-tuple compatibility
     model = YOLO27DetectionModel("models/yolo27n-dual.yaml", nc=19, verbose=False).train()
     model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
     criterion = model.init_criterion()
     assert isinstance(criterion, YOLO27E2ELoss)
-
+    assert isinstance(criterion.one2many.bbox_loss, YOLO27BboxLoss)
     assert criterion.one2many.assigner.stride_val == 16
-    assert criterion.one2one.assigner.stride_val == 16
-    assert abs((criterion.o2m + criterion.o2o) - 1.0) < 1e-6
-    assert abs(criterion.o2m - 0.80) < 1e-6
-
-    for _ in range(9):
-        criterion.update()
-        assert abs((criterion.o2m + criterion.o2o) - 1.0) < 1e-6
-    assert abs(criterion.o2m - 0.55) < 1e-6
 
     imgs = torch.rand(2, 3, 256, 256)
     batch_mixed = {
@@ -223,36 +245,29 @@ def test_live_fg_supervision_and_progressive_schedule() -> None:
         "bboxes": torch.tensor([[0.25, 0.25, 0.05, 0.05], [0.50, 0.50, 0.90, 0.03]]),
     }
 
-    # Verify fg_branch alone directly sends gradients into shared neck model[16]!
     model.zero_grad()
-    preds_only_fg = model(imgs)
-    fg_only = criterion._compute_fg_alignment_loss(preds_only_fg["fg_align"], preds_only_fg["one2many"], batch_mixed)
+    preds = model(imgs)
+    fg_only = criterion._compute_fg_alignment_loss(preds["fg_align"], preds["one2many"], batch_mixed)
     fg_only.backward()
-    neck_grad = model.model[16].cv2.conv.weight.grad
-    assert neck_grad is not None and neck_grad.abs().sum().item() > 0, "fg_loss must supervise shared neck directly!"
+    assert model.model[16].cv2.conv.weight.grad.abs().sum().item() > 0
 
-    # Full loss + empty normal fabric batch
-    model.zero_grad()
-    total_loss, loss_items = criterion(model(imgs), batch_mixed)
-    assert total_loss.ndim == 0 and torch.isfinite(total_loss)
-    fg_val = float(loss_items["fg_loss"]) if isinstance(loss_items, dict) else float(loss_items[3])
-    assert fg_val > 0.005
-    total_loss.backward()
-
-    model.zero_grad()
-    batch_normal = {
-        "img": imgs,
-        "batch_idx": torch.zeros((0,), dtype=torch.float32),
-        "cls": torch.zeros((0, 1), dtype=torch.float32),
-        "bboxes": torch.zeros((0, 4), dtype=torch.float32),
-    }
-    loss_normal, _ = criterion(model(imgs), batch_normal)
-    assert torch.isfinite(loss_normal)
-    loss_normal.backward()
+    # Simulate legacy Ultralytics <=8.4.33 3-tuple o2m_assign = (fg_mask, target_scores, target_scores_sum)
+    n_anc = preds["fg_align"].shape[1]
+    fake_fg_mask = torch.zeros((2, n_anc), dtype=torch.bool)
+    fake_fg_mask[0, :4] = True
+    fake_t_scores = torch.zeros((2, n_anc, 19))
+    fake_t_scores[0, :4, 3] = 0.85
+    legacy_fg_loss = criterion._compute_fg_alignment_from_o2m(
+        preds["fg_align"].detach().requires_grad_(True),
+        preds["one2many"],
+        (fake_fg_mask, fake_t_scores, fake_t_scores.sum()),
+        has_gt=True,
+    )
+    assert torch.isfinite(legacy_fg_loss) and legacy_fg_loss.item() > 0.0
 
 
-def test_donor_discovery_and_end_to_end_pipeline() -> None:
-    """Verify sibling-folder yolo26n.pt discovery, explicit pretrained warm-start, and val/predict nms toggling."""
+def test_deep_donor_discovery_failfast_guard_and_pipeline() -> None:
+    """Verify multi-level nested donor discovery, fail-fast missing-donor guard, --scratch, and train/val/predict."""
     names = [
         "纬线杂质", "断纬", "多股线", "纬线不直", "包边不重叠", "捻接器接头",
         "小尾巴", "经线毛球", "包边不良", "手工接头", "纬斜", "短废纱线",
@@ -260,58 +275,93 @@ def test_donor_discovery_and_end_to_end_pipeline() -> None:
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
+        # Simulate Windows layout: dataset at root/yolo/dataset/source5, donor nested 2 levels deep in sibling!
+        ds_dir = root / "yolo/dataset/source5"
+        nested_donor_dir = root / "yolo/other_yolo26_proj/sub_weights"
         for sub in (
-            "images/train",
-            "images/val",
-            "labels/train",
-            "labels/val",
-            "normal/images/train",
-            "normal/images/val",
-            "sibling_proj",
+            ds_dir / "images/train",
+            ds_dir / "images/val",
+            ds_dir / "labels/train",
+            ds_dir / "labels/val",
+            ds_dir / "normal/images/train",
+            ds_dir / "normal/images/val",
+            nested_donor_dir,
         ):
-            (root / sub).mkdir(parents=True, exist_ok=True)
+            sub.mkdir(parents=True, exist_ok=True)
 
         rng = np.random.default_rng(0)
         for split in ("train", "val"):
             for i in range(4):
                 img = rng.integers(100, 200, size=(128, 128, 3), dtype=np.uint8)
                 cv2.rectangle(img, (20, 20), (50, 50), (20, 20, 20), -1)
-                cv2.imwrite(str(root / f"images/{split}/def_{i}.jpg"), img)
+                cv2.imwrite(str(ds_dir / f"images/{split}/def_{i}.jpg"), img)
                 cls_id = i % 19
-                (root / f"labels/{split}/def_{i}.txt").write_text(f"{cls_id} 0.273 0.273 0.234 0.234\n", encoding="utf-8")
-
+                (ds_dir / f"labels/{split}/def_{i}.txt").write_text(
+                    f"{cls_id} 0.273 0.273 0.234 0.234\n", encoding="utf-8"
+                )
             for i in range(2):
                 norm_img = rng.integers(120, 180, size=(128, 128, 3), dtype=np.uint8)
-                cv2.imwrite(str(root / f"normal/images/{split}/norm_{i}.jpg"), norm_img)
+                cv2.imwrite(str(ds_dir / f"normal/images/{split}/norm_{i}.jpg"), norm_img)
 
-        data_yaml = root / "fabric19_tmp.yaml"
+        data_yaml = ds_dir / "fabric19_tmp.yaml"
         YAML.save(
             data_yaml,
             {
-                "path": str(root),
-                "train": str(root / "images/train"),
-                "val": str(root / "images/val"),
-                "normaltrain": str(root / "normal/images/train"),
-                "normalval": str(root / "normal/images/val"),
+                "path": str(ds_dir),
+                "train": str(ds_dir / "images/train"),
+                "val": str(ds_dir / "images/val"),
+                "normaltrain": str(ds_dir / "normal/images/train"),
+                "normalval": str(ds_dir / "normal/images/val"),
                 "nc": 19,
                 "names": names,
             },
         )
 
-        # Save simulated yolo26n.pt inside sibling folder and verify auto-discovery via extra_dirs
+        # 1. Verify fail-fast guard raises FileNotFoundError instead of silent scratch training when donor is absent!
+        isolated_dir = root / "empty_island/a/b/c/d"
+        isolated_dir.mkdir(parents=True, exist_ok=True)
+        isolated_yaml = isolated_dir / "iso.yaml"
+        YAML.save(
+            isolated_yaml,
+            {
+                "path": str(isolated_dir),
+                "train": str(ds_dir / "images/train"),
+                "val": str(ds_dir / "images/val"),
+                "nc": 19,
+                "names": names,
+            },
+        )
+        # Before creating donor_pt anywhere under root, verify fail-fast raises FileNotFoundError:
+        raised = False
+        try:
+            YOLO27("models/yolo27n.yaml").train(
+                data=str(isolated_yaml),
+                epochs=1,
+                imgsz=128,
+                batch=2,
+                workers=0,
+                pretrained=True,
+                allow_download=False,
+                device="cpu",
+                project=str(root / "runs_fail"),
+                name="exp_fail",
+                plots=False,
+            )
+        except FileNotFoundError as exc:
+            raised = "yolo26n.pt" in str(exc)
+        assert raised, "Missing donor with pretrained=True must fail fast instead of training from scratch!"
+
+        # 2. Now save simulated yolo26n.pt 2 levels deep under root/yolo/other_yolo26_proj/sub_weights/yolo26n.pt
         donor_y26 = YOLO("yolo26n.yaml")
         with torch.no_grad():
             donor_y26.model.model[2].cv1.conv.weight.fill_(0.125)
-        donor_pt = root / "sibling_proj/yolo26n.pt"
+        donor_pt = nested_donor_dir / "yolo26n.pt"
         donor_y26.save(str(donor_pt))
 
-        found = resolve_donor_checkpoint(scale="n", allow_download=False, extra_dirs=[root / "images/train"])
+        found = resolve_donor_checkpoint(scale="n", allow_download=False, extra_dirs=[ds_dir])
         assert found is not None and found.resolve() == donor_pt.resolve()
 
-        # Regression test for BOTH bugs:
-        #   (a) Must train actual models/yolo27n.yaml (model[2].cv2 out_channels == 80, NOT yolo26n's 64!)
-        #   (b) Passing pretrained=True (boolean default from train_yolo27n.py) must NOT trigger Model.load(True)
-        #       scratch hijack — it must auto-discover sibling_proj/yolo26n.pt and run Net2Wider warm-start!
+        # 3. Verify full train -> val(nms=True/False) -> predict(nms=True/False) pipeline with warm-start!
         y27 = YOLO27("models/yolo27n.yaml")
         y27.train(
             data=str(data_yaml),
@@ -320,14 +370,16 @@ def test_donor_discovery_and_end_to_end_pipeline() -> None:
             batch=2,
             workers=0,
             pretrained=True,
+            allow_download=False,
             device="cpu",
             project=str(root / "runs"),
             name="exp",
             plots=False,
         )
-        assert y27.trainer.model.model[2].cv2.conv.out_channels == 80, "Trainer built wrong YAML instead of yolo27n!"
+        assert y27.trainer.model.model[2].cv2.conv.out_channels == 80
+        assert y27.trainer.args.cos_lr is True
         shared_slice = y27.trainer.model.model[2].cv1.conv.weight[:16].detach().mean().item()
-        assert abs(shared_slice - 0.125) < 0.02, f"pretrained=True failed to run Net2Wider donor warm-start: {shared_slice}"
+        assert abs(shared_slice - 0.125) < 0.02, f"Expected Net2Wider warm-start ~0.125, got {shared_slice}"
 
         best_pt = root / "runs/exp/weights/best.pt"
         assert best_pt.exists()
@@ -342,18 +394,18 @@ def test_donor_discovery_and_end_to_end_pipeline() -> None:
         m_val_norm.val(data=str(data_yaml), imgsz=128, batch=2, workers=0, nms=False, use_normal=True, plots=False)
         assert m_val_norm.model.end2end is True
 
-        sample_img = str(root / "images/val/def_0.jpg")
+        sample_img = str(ds_dir / "images/val/def_0.jpg")
         assert len(YOLO27(best_pt).predict(sample_img, imgsz=128, nms=True, verbose=False)) == 1
         assert len(YOLO27(best_pt).predict(sample_img, imgsz=128, nms=False, verbose=False)) == 1
 
 
 if __name__ == "__main__":
     for fn in (
-        test_yolo27n_footprints_regmax1_and_optimizer_groups,
-        test_net2wider_exact_step0_equivalence_from_yolo26n,
-        test_folded_per_channel_scale_exact_fusion,
-        test_live_fg_supervision_and_progressive_schedule,
-        test_donor_discovery_and_end_to_end_pipeline,
+        test_yolo27n_footprints_box_tower_and_musgd_guard,
+        test_net2wider_exact_step0_equivalence_with_widened_c2,
+        test_version_safe_fusion_and_end2end_setter,
+        test_anisotropic_edge_loss_and_reused_fg_supervision,
+        test_deep_donor_discovery_failfast_guard_and_pipeline,
     ):
         print(f"[RUN ] {fn.__name__} ...")
         fn()

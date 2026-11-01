@@ -2,15 +2,17 @@
 
 Integrates ``YOLO27DetectionModel`` seamlessly into Ultralytics' training, validation,
 prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4.197``:
-    - Upgraded ``YOLO27Detect`` head (``reg_max=1`` DFL-free regression + folded
-      per-channel/cross-scale calibration + training-only ``ForegroundAlignmentBranch``).
-    - Zero-shock Net2Wider warm-start from ``yolo26n.pt`` / ``yolo26s.pt`` with
-      automatic local, sibling, dataset-root, cache, and asset-download resolution
-      (protecting against Ultralytics ``Model.load(True)`` scratch hijack!).
-    - Official YOLO27 inference convention: defaults to ``one2many + NMS`` for maximum
-      mAP, with ``nms=False`` switching cleanly to end-to-end ``one2one`` inference.
-    - Built-in support for ``normaltrain`` / ``normalval`` defect-free fabric samples in
-      ``dataset/fabric19.yaml`` via ``use_normal=True``.
+    - Upgraded ``YOLO27Detect`` head (``reg_max=1`` unconstrained regression, widened
+      ``c2=32`` box regression tower, deterministic folded scale factors, and training-only
+      ``ForegroundAlignmentBranch``).
+    - Zero-shock Net2Wider warm-start from ``yolo26n.pt`` / ``yolo26s.pt`` with multi-level
+      Windows/Linux directory & ``SETTINGS`` discovery plus fail-fast guard so training
+      never silently falls back to scratch (``mAP50-95 < 0.60``).
+    - Anti-oscillation fine-tuning defaults: ``cos_lr=True``, ``close_mosaic=15``, and
+      protection against ``optimizer='auto'`` flipping to ``MuSGD(muon=0.2, lr=0.01)`` on
+      offline-augmented datasets with ``>10,000`` iterations.
+    - Full ``ultralytics 8.4.33`` .. ``>=8.4.197`` compatibility for ``model.end2end``
+      setter, ``YOLO27DetectionModel.fuse()``, and ``nms=True/False`` head selection.
 """
 
 from __future__ import annotations
@@ -112,6 +114,25 @@ class YOLO27DetectionModel(DetectionModel):
             self.info()
             LOGGER.info("")
 
+    @property
+    def end2end(self) -> bool:
+        """Return whether end-to-end NMS-free inference mode is currently active."""
+        return getattr(self.model[-1], "end2end", False)
+
+    @end2end.setter
+    def end2end(self, value: bool) -> None:
+        """Toggle active inference head across both Ultralytics 8.4.33 (no base setter) and >=8.4.197."""
+        if isinstance(self.model[-1], Detect):
+            self.model[-1].end2end = bool(value)
+
+    def fuse(self, verbose: bool = True):
+        """Fold fixed scales & strip auxiliary branches BEFORE Conv+BN fusion (fixes 8.4.33 BaseModel.fuse)."""
+        if not self.is_fused():
+            head = self.model[-1]
+            if isinstance(head, YOLO27Detect):
+                head.fuse()
+        return super().fuse(verbose=verbose)
+
     def init_criterion(self):
         """Initialize balanced ``YOLO27E2ELoss`` (with live FG alignment) or ``YOLO27DetectionLoss``."""
         class_weights = getattr(self, "_class_weights", None)
@@ -142,16 +163,18 @@ class YOLO27Validator(DetectionValidator):
 
 
 class YOLO27Trainer(DetectionTrainer):
-    """Trainer building ``YOLO27DetectionModel`` with automatic Net2Wider warm-start from ``yolo26*.pt``."""
+    """Trainer building ``YOLO27DetectionModel`` with guaranteed Net2Wider warm-start and smooth cosine convergence."""
 
     _preset_use_normal: bool = False
     _preset_donor_weights: str | None = None
     _preset_allow_warmstart: bool | None = None
+    _preset_allow_download: bool = True
 
     def __init__(self, cfg=DEFAULT_CFG_DICT, overrides: dict[str, Any] | None = None, _callbacks=None) -> None:
         overrides = dict(overrides or {})
         self._use_normal: bool = bool(overrides.pop("use_normal", self._preset_use_normal))
         self._donor_weights: str | None = overrides.pop("donor_weights", self._preset_donor_weights)
+        self._allow_download: bool = bool(overrides.pop("allow_download", self._preset_allow_download))
 
         raw_pretrained = overrides.get("pretrained", True)
         if isinstance(raw_pretrained, (str, Path)) and self._donor_weights is None:
@@ -163,8 +186,47 @@ class YOLO27Trainer(DetectionTrainer):
         else:
             self._allow_warmstart = raw_pretrained is not False
 
+        # Smooth late-epoch convergence defaults (cosine LR + 15 clean un-mosaicked epochs)
+        overrides.setdefault("cos_lr", True)
+        overrides.setdefault("close_mosaic", 15)
+
+        # Protect training validation from evaluating weaker one2one head across 8.4.33..8.4.197:
+        # In 8.4.33, default.yaml has nms=False (export flag) and end2end=None; in >=8.4.194, nms=None.
+        if "end2end" in DEFAULT_CFG_DICT:
+            overrides.setdefault("end2end", False)
+        elif "nms" in DEFAULT_CFG_DICT:
+            overrides.setdefault("nms", True)
+
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
+
+    def build_optimizer(
+        self,
+        model: nn.Module,
+        name: str = "auto",
+        lr: float = 0.001,
+        momentum: float = 0.9,
+        decay: float = 1e-5,
+        iterations: float = 1e5,
+    ):
+        """Prevent ``optimizer='auto'`` from switching to ``MuSGD(muon=0.2, lr=0.01)`` on Net2Wider warm-start.
+
+        When ``iterations > 10,000`` (common on 5x offline-augmented fabric datasets at 150 epochs),
+        Ultralytics' ``auto`` mode switches from ``AdamW`` to ``MuSGD(lr=0.01, lr_cv3=0.03)``, whose
+        Newton-Schulz orthogonalization amplifies tiny gradients on Net2Wider zero-padded blocks to unit
+        singular values and causes late-epoch curve oscillation. Clamping ``auto`` iteration heuristic
+        selects Ultralytics' calibrated ``AdamW(lr = 0.002 * 5 / (4 + nc))`` cleanly while respecting any
+        explicit ``optimizer`` choice (``SGD``, ``MuSGD``, ``AdamW``, etc.).
+        """
+        eff_iterations = min(iterations, 9000) if (name == "auto" and self._allow_warmstart) else iterations
+        return super().build_optimizer(
+            model=model,
+            name=name,
+            lr=lr,
+            momentum=momentum,
+            decay=decay,
+            iterations=eff_iterations,
+        )
 
     def get_dataset(self) -> dict[str, Any]:
         """Load dataset dict and optionally merge ``normaltrain`` / ``normalval`` splits."""
@@ -197,7 +259,7 @@ class YOLO27Trainer(DetectionTrainer):
         weights: Any = None,
         verbose: bool = True,
     ) -> YOLO27DetectionModel:
-        """Instantiate ``YOLO27DetectionModel`` and apply Net2Wider warm-start when starting from YAML."""
+        """Instantiate ``YOLO27DetectionModel`` and apply mandatory Net2Wider warm-start unless ``--scratch``."""
         model = YOLO27DetectionModel(
             cfg or "models/yolo27n.yaml",
             nc=self.data["nc"],
@@ -211,19 +273,23 @@ class YOLO27Trainer(DetectionTrainer):
                 transfer_pretrained_weights(weights, model, verbose=verbose and RANK in {-1, 0})
         elif self._allow_warmstart and not getattr(self.args, "resume", False):
             scale = str(model.yaml.get("scale", "n") or "n")
+            donor_name = f"yolo26{scale}.pt"
             donor = resolve_donor_checkpoint(
                 scale=scale,
                 explicit_donor=self._donor_weights,
-                allow_download=True,
+                allow_download=self._allow_download,
                 extra_dirs=self._collect_dataset_search_dirs(),
             )
             if donor is not None:
                 transfer_pretrained_weights(donor, model, verbose=verbose and RANK in {-1, 0})
-            elif RANK in {-1, 0}:
-                LOGGER.warning(
-                    f"WARNING: Could not find or download yolo26{scale}.pt for Net2Wider warm-start! "
-                    f"Training from scratch will converge slower and lower mAP than YOLO26n. "
-                    f"Place yolo26{scale}.pt in the project root or pass --donor path/to/yolo26{scale}.pt."
+            else:
+                raise FileNotFoundError(
+                    f"\n[YOLO27 Warm-Start Error] 未找到预训练权重 '{donor_name}'，已阻止退回从零随机训练 "
+                    f"(从零训练会导致 mAP50-95 卡在 <0.60 且后期震荡)！\n"
+                    f"请任选以下一种方式解决：\n"
+                    f"  1) 将你本地跑过 yolo26 基准的 '{donor_name}' 复制到项目根目录或 weights/ 目录；\n"
+                    f"  2) 启动命令添加参数: --donor D:/你的路径/{donor_name}；\n"
+                    f"  3) 若确实需要无预训练从零训练，请显式添加 --scratch (或 pretrained=False)。"
                 )
         return model
 
@@ -281,6 +347,7 @@ class YOLO27(YOLO):
         train_kwargs = dict(kwargs)
         use_normal = bool(train_kwargs.pop("use_normal", False))
         donor_weights = train_kwargs.pop("donor_weights", None)
+        allow_download = bool(train_kwargs.pop("allow_download", True))
 
         is_yaml_start = str(self.overrides.get("model", "")).lower().endswith((".yaml", ".yml")) and not self.ckpt
         raw_pretrained = train_kwargs.get("pretrained", True)
@@ -300,6 +367,7 @@ class YOLO27(YOLO):
             _preset_use_normal = use_normal
             _preset_donor_weights = str(donor_weights) if donor_weights is not None else None
             _preset_allow_warmstart = allow_warmstart
+            _preset_allow_download = allow_download
 
         return super().train(trainer=_BoundYOLO27Trainer, **train_kwargs)
 

@@ -7,7 +7,7 @@ Reference:
 import ultralytics.nn.modules as _ult_modules
 import ultralytics.nn.tasks as _ult_tasks
 
-from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
+from .loss import YOLO27BboxLoss, YOLO27DetectionLoss, YOLO27E2ELoss
 from .model import YOLO27, YOLO27DetectionModel, YOLO27Trainer, YOLO27Validator
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
@@ -20,6 +20,7 @@ setattr(_ult_tasks, "ForegroundAlignmentBranch", ForegroundAlignmentBranch)
 
 __all__ = (
     "YOLO27",
+    "YOLO27BboxLoss",
     "YOLO27Detect",
     "YOLO27DetectionLoss",
     "YOLO27DetectionModel",

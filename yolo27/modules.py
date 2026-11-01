@@ -3,30 +3,32 @@
 Reference: https://docs.ultralytics.com/zh/models/yolo27
 
 Key architectural elements implemented here:
-    1. DFL-Free Unconstrained Regression Head (``reg_max=1`` default):
-       Preserves 100% of ``yolo26n.pt``'s pretrained box regression head at step 0
-       and removes DFL-16's ``15 * stride = 240 px`` coordinate ceiling on ``P3/8``,
-       enabling full-width thin fabric strip defects to be regressed cleanly.
-    2. Folded Multi-Scale & Per-Channel Feature Calibration:
-       Combines fixed balanced cross-scale factors (``(1.0, 1/sqrt(2))`` for dual-scale
-       ``[P3, P5]``, ``(1.0, 1.0, 1.0)`` for 3-scale ``[P3, P4, P5]``) with learnable
-       per-channel calibration gates (``feat_logit_scale``, placed in the no-decay
-       non-Muon optimizer group). On ``fuse()``, the effective per-channel scale is
-       folded algebraically into the first ``Conv`` / ``DWConv`` of ``cv2`` and ``cv3``
-       with zero extra inference parameters or FLOPs.
+    1. DFL-Free High-Precision Regression Head (``reg_max=1``, widened ``c2=32``):
+       Stock ``YOLO26n`` (``reg_max=1``) collapses box head width ``c2`` down to ``16``
+       channels across all scales (``256 -> 16`` at P5), bottlenecking high-IoU edge
+       localization (``AP75..AP95`` / ``mAP50-95``). ``YOLO27Detect`` widens ``c2`` to
+       ``32`` channels (``24`` on ``yolo27n-lite``) while keeping ``reg_max=1`` and
+       ``c3=80``, preserving **exact step-0 Net2Wider equivalence** from ``yolo26n.pt``
+       and unconstrained coordinate span on full-width thin fabric strip defects.
+    2. Deterministic Folded Fixed Feature Scaling (Zero EMA/BN Drift):
+       Uses purely deterministic fixed cross-scale factors (``(1.0, 1/sqrt(2))`` for
+       dual-scale ``[P3, P5]``, ``(1.0, 1.0, 1.0)`` for 3-scale ``[P3, P4, P5]``) with no
+       pre-BatchNorm learnable scalar parameters, guaranteeing 100% synchronization
+       between ``ModelEMA`` weights and ``BatchNorm2d.running_var`` during validation.
+       Folded algebraically into the first head ``Conv`` / ``DWConv`` on ``fuse()``.
     3. Training-Only Foreground Alignment Branch (``ForegroundAlignmentBranch``):
-       Supervises shared neck features directly with IoU-aware Varifocal foreground
-       quality targets to separate subtle fabric anomalies from repetitive weave
-       textures and guide one-to-one positive anchor assignment during training.
-       Stripped completely on ``fuse()`` / deployment.
-    4. Dual-Mode Inference (One-to-Many + NMS Default, Optional End-to-End ``nms=False``):
-       Follows official YOLO27 semantics: defaults to the high-recall ``one2many`` head
-       with NMS, while initializing and training both branches cleanly so ``nms=False``
-       switches to end-to-end ``one2one`` inference seamlessly.
+       Supervises live shared neck features with continuous IoU-quality Varifocal targets
+       to separate subtle fabric anomalies from repetitive weave textures; stripped on
+       ``fuse()`` for zero deployment overhead.
+    4. Version-Safe Dual-Mode Fusion & Inference (``ultralytics 8.4.33`` .. ``>=8.4.197``):
+       Defaults to ``one2many + NMS`` for maximum ``mAP50-95`` while retaining ``one2one``
+       for optional ``nms=False`` end-to-end deployment, avoiding ``v8.4.33`` ``Detect.fuse()``
+       pitfalls that unconditionally delete ``cv2``/``cv3``.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 import torch
 import torch.nn as nn
@@ -39,8 +41,7 @@ class ForegroundAlignmentBranch(nn.Module):
 
     Evaluates directly on live balanced neck features during training so its
     IoU-quality Varifocal supervision sharpens defect-vs-weave separation in the
-    shared neck AND provides a clean foreground prior for one-to-one anchor
-    assignment. Stripped on ``fuse()`` so deployment incurs zero overhead.
+    shared neck. Stripped completely on ``fuse()`` so deployment incurs zero overhead.
     """
 
     def __init__(self, ch: tuple[int, ...] | list[int]) -> None:
@@ -69,22 +70,34 @@ class ForegroundAlignmentBranch(nn.Module):
 
 
 class YOLO27Detect(Detect):
-    """Official-style YOLO27 detection head with folded feature calibration and FG alignment.
+    """Official-style YOLO27 detection head with widened box tower, fixed scaling, and FG alignment.
 
     Attributes:
-        scale_factors (tuple[float, ...]): Fixed cross-scale feature factors
+        c2_width (int): Box regression head channel width (``32`` on standard nano, ``24`` on lite).
+        scale_factors (tuple[float, ...]): Deterministic cross-scale feature factors
             (``(1.0, 1/sqrt(2))`` for dual-scale ``[P3, P5]``, ``1.0`` per level for 3-scale).
-        feat_logit_scale (nn.ParameterList | None): Learnable per-channel feature
-            calibration gates (named ``*logit_scale*`` and 1D so Ultralytics' optimizer
-            builder disables weight decay and Muon orthogonalization). Folded into first
-            head convolutions and removed on ``fuse()``.
         fg_branch (ForegroundAlignmentBranch | None): Training-only auxiliary branch
             stripped upon ``fuse()``.
     """
 
     def __init__(self, nc: int = 80, end2end: bool = True, reg_max: int = 1, ch: tuple = ()) -> None:
         super().__init__(nc=nc, end2end=end2end, reg_max=reg_max, ch=ch)
-        # Official YOLO27 inference default: one-to-many + NMS (highest mAP),
+
+        # Upgrade cramped 16-ch reg_max=1 box tower to 32-ch (24-ch on lite) for high-IoU mAP50-95;
+        # Net2Wider copies all 16 pretrained yolo26n.pt box channels with exact step-0 equivalence.
+        if len(ch) > 0:
+            base_c2 = 32 if ch[0] > 64 else 24
+            c2 = max(base_c2, ch[0] // 4, self.reg_max * 4)
+            self.c2_width = c2
+            self.cv2 = nn.ModuleList(
+                nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            )
+            if end2end:
+                self.one2one_cv2 = deepcopy(self.cv2)
+        else:
+            self.c2_width = 32
+
+        # Official YOLO27 inference default: one-to-many + NMS (highest mAP50-95),
         # while keeping dual-head architecture ready for nms=False switching.
         if end2end:
             self._end2end = False
@@ -94,9 +107,6 @@ class YOLO27Detect(Detect):
         else:
             self.scale_factors = tuple(1.0 for _ in range(self.nl))
 
-        self.feat_logit_scale: nn.ParameterList | None = nn.ParameterList(
-            nn.Parameter(torch.ones(c, dtype=torch.float32)) for c in ch
-        )
         self._scale_folded: bool = False
         self.fg_branch: ForegroundAlignmentBranch | None = ForegroundAlignmentBranch(ch) if end2end else None
 
@@ -114,25 +124,11 @@ class YOLO27Detect(Detect):
             raise ValueError("Cannot enable end2end=False (nms=True) after one2many head was stripped by fuse().")
         self._end2end = bool(value)
 
-    def _effective_channel_scale(self, idx: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Compute clamped per-channel scale ``(C,)`` for level ``idx``."""
-        base = float(self.scale_factors[idx])
-        if self.feat_logit_scale is None:
-            return torch.tensor(base, dtype=dtype, device=device)
-        return (self.feat_logit_scale[idx].clamp(0.25, 4.0) * base).to(dtype=dtype, device=device)
-
     def _apply_feature_scale(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Apply fixed + learnable per-channel calibration when not yet folded into head convs."""
+        """Apply deterministic fixed cross-scale factors when not yet folded into head convs."""
         if self._scale_folded:
             return x
-        out: list[torch.Tensor] = []
-        for i, xi in enumerate(x):
-            scale_vec = self._effective_channel_scale(i, dtype=xi.dtype, device=xi.device)
-            if scale_vec.ndim == 0:
-                out.append(xi if scale_vec.item() == 1.0 else xi * scale_vec)
-            else:
-                out.append(xi * scale_vec.view(1, -1, 1, 1))
-        return out
+        return [xi if s == 1.0 else xi * s for xi, s in zip(x, self.scale_factors)]
 
     def forward(self, x: list[torch.Tensor]):
         """Forward pass supporting dual-branch + live FG alignment training and zero-overhead inference."""
@@ -171,30 +167,22 @@ class YOLO27Detect(Detect):
     def _fold_scale_into_branch(
         box_convs: nn.ModuleList | None,
         cls_convs: nn.ModuleList | None,
-        scale_vecs: list[torch.Tensor],
+        scale_factors: tuple[float, ...],
     ) -> None:
-        """Fold per-channel ``scale_vecs[i]`` into the first Conv/DWConv weights of level ``i``."""
+        """Fold scalar ``scale_factors[i]`` into the first Conv/DWConv weights of level ``i``."""
         if box_convs is None or cls_convs is None:
             return
         with torch.no_grad():
-            for i, s_vec in enumerate(scale_vecs):
+            for i, s in enumerate(scale_factors):
+                if s == 1.0:
+                    continue
                 for seq in (box_convs[i], cls_convs[i]):
                     first_block = seq[0]
-                    # In Detect.cv3, seq[0] is Sequential(DWConv, Conv); unwrap to the first Conv/DWConv block
                     if isinstance(first_block, nn.Sequential):
                         first_block = first_block[0]
                     first_conv = getattr(first_block, "conv", first_block)
                     if isinstance(first_conv, nn.Conv2d):
-                        s = s_vec.to(dtype=first_conv.weight.dtype, device=first_conv.weight.device)
-                        if s.ndim == 0:
-                            if s.item() != 1.0:
-                                first_conv.weight.mul_(s)
-                        elif first_conv.groups == first_conv.in_channels:
-                            # Depthwise conv: weight shape is (C_in, 1, kH, kW)
-                            first_conv.weight.mul_(s.view(-1, 1, 1, 1))
-                        else:
-                            # Standard conv: weight shape is (C_out, C_in, kH, kW)
-                            first_conv.weight.mul_(s.view(1, -1, 1, 1))
+                        first_conv.weight.mul_(float(s))
 
     def bias_init(self) -> None:
         """Initialize BOTH one2many and one2one box/cls biases + fg_branch focal prior."""
@@ -220,21 +208,22 @@ class YOLO27Detect(Detect):
             self.fg_branch.bias_init(prior_prob=0.01)
 
     def fuse(self) -> None:
-        """Fold per-channel feature calibration into head convs and strip auxiliary branches."""
+        """Idempotently fold fixed scales and strip ONLY inactive branches (safe on 8.4.33 & >=8.4.197)."""
         if not self._scale_folded:
-            ref_param = next(self.parameters())
-            scale_vecs = [
-                self._effective_channel_scale(i, dtype=ref_param.dtype, device=ref_param.device).detach()
-                for i in range(self.nl)
-            ]
-            self._fold_scale_into_branch(self.cv2, self.cv3, scale_vecs)
+            self._fold_scale_into_branch(self.cv2, self.cv3, self.scale_factors)
             self._fold_scale_into_branch(
                 getattr(self, "one2one_cv2", None),
                 getattr(self, "one2one_cv3", None),
-                scale_vecs,
+                self.scale_factors,
             )
-            self.feat_logit_scale = None
             self._scale_folded = True
 
         self.fg_branch = None
-        super().fuse()
+        # Do NOT call super().fuse(): ultralytics==8.4.33 Detect.fuse() unconditionally sets
+        # self.cv2 = self.cv3 = None even when self.end2end is False!
+        if self.end2end:
+            self.cv2 = None
+            self.cv3 = None
+        else:
+            self.one2one_cv2 = None
+            self.one2one_cv3 = None

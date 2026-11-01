@@ -2,30 +2,60 @@
 
 Transfers pretrained weights from ``yolo26n.pt`` (or ``yolo26s.pt`` / ``yolo11n.pt``) into
 ``YOLO27DetectionModel`` with **exact step-0 functional equivalence** (``max_diff < 1e-5``):
-  1. Exact-shape layers (stem Conv, P4/P5 C3k2, SPPF, C2PSA, ``reg_max=1`` box head,
-     and ``c3=80`` classification conv towers) copy 1:1 with zero truncation.
+  1. Exact-shape layers (stem Conv, P4/P5 C3k2, SPPF, C2PSA, and ``c3=80`` classification
+     conv towers) copy 1:1 with zero truncation.
   2. Widened ``C3k2`` stages (``P2/4`` width, ``P3/8`` 2x inner bottleneck, ``P3/8`` fine neck)
-     align ``cv1`` (2-chunk split on both ``conv.weight`` and ``bn.*``), inner ``C3k.cv3``
-     (2-chunk concat), and ``cv2`` (``(2+n)``-chunk concat).
+     and widened ``c2=32`` box regression towers align ``cv1`` (2-chunk split on both
+     ``conv.weight`` and ``bn.*``), inner ``C3k.cv3`` (2-chunk concat), ``cv2``
+     (``(2+n)``-chunk concat), and ``reg_max=1`` final ``1x1`` box projections.
   3. ``Concat`` consumers align input channel offsets per concatenated branch.
-  4. Newly widened input-channel columns on consumer convolutions are zero-initialized (Net2Wider),
-     while newly widened output-channel filters retain their full Kaiming initialization so step-0
-     outputs match the donor to ``< 1e-5`` while step-1 gradients cleanly unlock all new capacity.
-  5. ``YOLO27Detect`` fixed ``scale_factors`` are pre-compensated (``1 / s_i``) on first-layer convs
-     and ``feat_logit_scale`` is initialized to ``1.0`` when loading from an unscaled donor.
+  4. Newly widened input-channel columns are zeroed ONLY on copied donor output rows,
+     preserving Kaiming initialization across ``[new_out_rows, all_in_cols]`` so step-0
+     outputs match the donor to ``< 1e-5`` while step-1 gradients immediately unlock all
+     widened filters.
+  5. ``YOLO27Detect`` deterministic ``scale_factors`` are pre-compensated (``1 / s_i``) on
+     first-layer head convs when loading from an unscaled donor.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
+import urllib.request
 
 import torch
 from torch import nn
 
 from ultralytics.nn.modules.conv import Concat
-from ultralytics.utils import LOGGER, SETTINGS
+from ultralytics.utils import LOGGER, SETTINGS, YAML
+
+_SKIP_SCAN_DIRS = frozenset(
+    {
+        "images",
+        "labels",
+        "normal",
+        "normaltrain",
+        "normalval",
+        "runs",
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "conda",
+        ".idea",
+        ".vscode",
+        ".pytest_cache",
+        "Unselected files",
+    }
+)
 
 
 def _extract_donor_object(donor: str | Path | dict[str, Any] | nn.Module) -> nn.Module | dict[str, torch.Tensor]:
@@ -113,13 +143,12 @@ def _copy_out_rows_with_chunked_in(
     out_pairs: list[tuple[int, int, int]],
     in_pairs: list[tuple[int, int, int]],
 ) -> int:
-    """Copy ``(out_src, out_dst, out_len) x (in_src, in_dst, in_len)`` blocks; zero extra cols cleanly."""
-    covered_in = torch.zeros(dst.shape[1], dtype=torch.bool, device=dst.device)
-    for _, id_i, ilen in in_pairs:
-        covered_in[id_i : id_i + ilen] = True
-    if not bool(covered_in.all()):
-        dst[:, ~covered_in] = 0.0
+    """Copy ``(out_src, out_dst, out_len) x (in_src, in_dst, in_len)`` blocks cleanly.
 
+    Zeros uncovered input columns ONLY on copied donor output rows, leaving newly widened
+    output rows ``[new_out, :]`` with their full Kaiming initialization so step-0 outputs
+    remain 100% identical to the donor while step-1 gradients unlock all widened channels.
+    """
     copied = 0
     for os_i, od_i, olen in out_pairs:
         dst[od_i : od_i + olen].zero_()
@@ -243,15 +272,11 @@ def _copy_sliced_tensor(
 
 
 def _compensate_head_scale_factors(donor_obj: Any, target: nn.Module) -> None:
-    """Reset ``feat_logit_scale`` to ``1.0`` and pre-divide first head convs by ``scale_factors[i]``."""
+    """Pre-divide first head conv weights by deterministic ``scale_factors[i]`` when donor is unscaled."""
     target_mods = getattr(target, "model", None)
     if target_mods is None or len(target_mods) == 0:
         return
     head = target_mods[-1]
-    if getattr(head, "feat_logit_scale", None) is not None:
-        for p in head.feat_logit_scale:
-            p.data.fill_(1.0)
-
     scale_factors = getattr(head, "scale_factors", None)
     if not scale_factors or getattr(head, "_scale_folded", False):
         return
@@ -320,7 +345,7 @@ def transfer_pretrained_weights(
         # Guard final 1x1 box projection only when reg_max differs
         if not same_reg_max and any(tag in key for tag in (".cv2.", ".one2one_cv2.")) and ".2." in key:
             continue
-        if any(tag in key for tag in (".fg_branch.", ".feat_logit_scale.")) and key not in donor_sd:
+        if ".fg_branch." in key and key not in donor_sd:
             continue
 
         src_key = key
@@ -376,18 +401,171 @@ def transfer_pretrained_weights(
     }
 
 
+def _is_valid_ckpt(path: Path) -> bool:
+    """Return True if ``path`` exists as a regular file > 100 KB."""
+    try:
+        return path.is_file() and path.stat().st_size > 100_000
+    except OSError:
+        return False
+
+
+def _is_filesystem_root(path: Path) -> bool:
+    """Return True if ``path`` is a bare filesystem or Windows drive root (e.g. ``/`` or ``D:\\``)."""
+    try:
+        return path.parent == path
+    except OSError:
+        return True
+
+
+def _add_ancestors(seed: Path, out: list[Path], max_up: int = 3) -> None:
+    """Append ``seed`` and up to ``max_up`` non-root parent directories."""
+    cur = seed
+    for _ in range(max_up + 1):
+        if _is_filesystem_root(cur):
+            break
+        out.append(cur)
+        cur = cur.parent
+
+
+def _scan_runs_args_for_donor(runs_roots: Sequence[Path], donor_name: str) -> Path | None:
+    """Check recent Ultralytics ``runs/**/args.yaml`` files for an existing path to ``donor_name``."""
+    checked = 0
+    for rdir in runs_roots:
+        try:
+            if not rdir.is_dir():
+                continue
+            for args_yaml in rdir.rglob("args.yaml"):
+                checked += 1
+                if checked > 40:
+                    return None
+                cfg = YAML.load(args_yaml)
+                if not isinstance(cfg, dict):
+                    continue
+                for key in ("model", "pretrained"):
+                    val = cfg.get(key)
+                    if isinstance(val, str) and Path(val).name.lower() == donor_name.lower():
+                        cand = Path(val)
+                        if not cand.is_absolute():
+                            cand = (args_yaml.parent.parent.parent / cand).resolve()
+                        if _is_valid_ckpt(cand):
+                            return cand
+        except Exception:
+            continue
+    return None
+
+
+def _bfs_find_donor(roots: Sequence[Path], donor_name: str, max_depth: int = 3, max_dirs: int = 400) -> Path | None:
+    """Fast breadth-first directory search skipping dataset/image/venv folders."""
+    visited: set[str] = set()
+    queue: deque[tuple[Path, int]] = deque()
+
+    for r in roots:
+        if _is_filesystem_root(r):
+            continue
+        key = os.path.normcase(str(r))
+        if key not in visited:
+            visited.add(key)
+            queue.append((r, 0))
+
+    dirs_scanned = 0
+    while queue and dirs_scanned < max_dirs:
+        cur_dir, depth = queue.popleft()
+        dirs_scanned += 1
+
+        for direct in (cur_dir / donor_name, cur_dir / "weights" / donor_name):
+            if _is_valid_ckpt(direct):
+                return direct
+
+        if depth >= max_depth:
+            continue
+
+        try:
+            with os.scandir(cur_dir) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    if name.startswith(".") or name in _SKIP_SCAN_DIRS:
+                        continue
+                    sub_path = Path(entry.path)
+                    sub_key = os.path.normcase(str(sub_path))
+                    if sub_key not in visited:
+                        visited.add(sub_key)
+                        queue.append((sub_path, depth + 1))
+        except OSError:
+            continue
+    return None
+
+
+def _cache_donor_locally(found: Path, repo_root: Path, donor_name: str) -> None:
+    """Cache discovered donor into gitignored ``repo_root/weights/`` so future runs & AMP checks are instant."""
+    try:
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        resolved_found = found.resolve()
+        if str(resolved_found).startswith(str(tmp_root)):
+            return  # Do not cache ephemeral unit-test checkpoints into the repository
+        cache_dst = repo_root / "weights" / donor_name
+        if resolved_found != cache_dst.resolve() and not _is_valid_ckpt(cache_dst):
+            cache_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved_found, cache_dst)
+            LOGGER.info(f"YOLO27 Warm-Start: cached '{donor_name}' -> {cache_dst}")
+    except Exception:
+        pass
+
+
+def _download_with_mirrors(donor_name: str, dst_path: Path) -> Path | None:
+    """Attempt download via domestic GitHub release mirrors first, then official Ultralytics downloader."""
+    base_gh = f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{donor_name}"
+    mirror_urls = (
+        f"https://gh-proxy.com/{base_gh}",
+        f"https://ghfast.top/{base_gh}",
+    )
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_part = dst_path.with_suffix(".pt.part")
+
+    for url in mirror_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp, open(tmp_part, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            if _is_valid_ckpt(tmp_part):
+                tmp_part.replace(dst_path)
+                LOGGER.info(f"YOLO27 Warm-Start: downloaded '{donor_name}' via mirror -> {dst_path}")
+                return dst_path
+        except Exception:
+            try:
+                tmp_part.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset
+
+        downloaded = Path(attempt_download_asset(dst_path))
+        if _is_valid_ckpt(downloaded):
+            return downloaded
+    except Exception as exc:
+        LOGGER.warning(f"YOLO27 Warm-Start: automatic download of '{donor_name}' failed ({exc}).")
+    return None
+
+
 def resolve_donor_checkpoint(
     scale: str = "n",
     explicit_donor: str | Path | None = None,
     allow_download: bool = True,
     extra_dirs: Sequence[str | Path] | None = None,
 ) -> Path | None:
-    """Locate ``yolo26{scale}.pt`` across local/parent/sibling/dataset folders or download via Ultralytics."""
-    if explicit_donor is not None:
-        p = Path(explicit_donor)
-        if p.is_file() and p.stat().st_size > 100_000:
-            LOGGER.info(f"YOLO27 Warm-Start: using explicit pretrained donor -> {p}")
-            return p
+    """Locate ``yolo26{scale}.pt`` across repo, Ultralytics SETTINGS, sibling/dataset roots, or download."""
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # 1. Explicit CLI path (--donor) or YOLO27_DONOR environment variable
+    for raw_exp in (explicit_donor, os.environ.get("YOLO27_DONOR")):
+        if raw_exp:
+            p = Path(str(raw_exp)).expanduser()
+            if _is_valid_ckpt(p):
+                LOGGER.info(f"YOLO27 Warm-Start: using explicit pretrained donor -> {p}")
+                _cache_donor_locally(p, repo_root, p.name)
+                return p
 
     scale_key = (scale or "n").lower()
     if scale_key.endswith(".pt"):
@@ -398,71 +576,74 @@ def resolve_donor_checkpoint(
         donor_name = f"yolo26{scale_key}.pt"
 
     cwd = Path.cwd().resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-    base_roots: list[Path] = [
-        cwd,
-        cwd.parent,
-        cwd.parent.parent,
-        repo_root,
-        repo_root.parent,
+
+    # 2. Fast direct checks in repo/cwd/SETTINGS/user home/Windows AppData
+    direct_candidates: list[Path] = [
+        repo_root / "weights" / donor_name,
+        repo_root / donor_name,
+        cwd / donor_name,
+        cwd / "weights" / donor_name,
     ]
+    for s_key in ("weights_dir", "runs_dir", "datasets_dir"):
+        s_val = SETTINGS.get(s_key)
+        if s_val:
+            sp = Path(str(s_val))
+            direct_candidates.extend([sp / donor_name, sp.parent / donor_name, sp.parent / "weights" / donor_name])
+
+    home = Path.home()
+    direct_candidates.extend(
+        [
+            home / donor_name,
+            home / "Downloads" / donor_name,
+            home / "Desktop" / donor_name,
+            home / ".cache" / "ultralytics" / donor_name,
+        ]
+    )
+    for env_key in ("APPDATA", "LOCALAPPDATA"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            ap = Path(env_val) / "Ultralytics"
+            direct_candidates.extend([ap / donor_name, ap / "weights" / donor_name])
+
+    for cand in direct_candidates:
+        if _is_valid_ckpt(cand):
+            LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor -> {cand}")
+            _cache_donor_locally(cand, repo_root, donor_name)
+            return cand
+
+    # 3. Inspect recent Ultralytics runs/**/args.yaml (finds exact path used in user's yolo26 baseline!)
+    runs_roots: list[Path] = [cwd / "runs", repo_root / "runs"]
+    if SETTINGS.get("runs_dir"):
+        runs_roots.append(Path(str(SETTINGS["runs_dir"])))
+    from_runs = _scan_runs_args_for_donor(runs_roots, donor_name)
+    if from_runs is not None:
+        LOGGER.info(f"YOLO27 Warm-Start: found donor referenced in Ultralytics runs -> {from_runs}")
+        _cache_donor_locally(from_runs, repo_root, donor_name)
+        return from_runs
+
+    # 4. Bounded multi-level search across project & dataset ancestors (e.g. D:/tyhn/yolo/**)
+    bfs_roots: list[Path] = []
+    _add_ancestors(cwd, bfs_roots, max_up=3)
+    _add_ancestors(repo_root, bfs_roots, max_up=3)
+    if SETTINGS.get("runs_dir"):
+        _add_ancestors(Path(str(SETTINGS["runs_dir"])).parent, bfs_roots, max_up=2)
+    if SETTINGS.get("datasets_dir"):
+        _add_ancestors(Path(str(SETTINGS["datasets_dir"])), bfs_roots, max_up=2)
     if extra_dirs:
         for d in extra_dirs:
             if d:
-                dp = Path(str(d))
-                base_roots.extend([dp, dp.parent, dp.parent.parent])
+                _add_ancestors(Path(str(d)), bfs_roots, max_up=3)
 
-    cand_paths: list[Path] = []
-    seen: set[Path] = set()
-    for base in base_roots:
-        for sub in (base / donor_name, base / "weights" / donor_name):
-            try:
-                resolved = sub.resolve()
-            except OSError:
-                resolved = sub
-            if resolved not in seen:
-                seen.add(resolved)
-                cand_paths.append(sub)
-        try:
-            if base.is_dir():
-                for child in base.iterdir():
-                    if child.is_dir() and not child.name.startswith("."):
-                        sib = child / donor_name
-                        if sib.is_file() and sib.stat().st_size > 100_000:
-                            LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor -> {sib}")
-                            return sib
-        except OSError:
-            pass
+    bfs_found = _bfs_find_donor(bfs_roots, donor_name, max_depth=3, max_dirs=400)
+    if bfs_found is not None:
+        LOGGER.info(f"YOLO27 Warm-Start: auto-discovered local pretrained donor -> {bfs_found}")
+        _cache_donor_locally(bfs_found, repo_root, donor_name)
+        return bfs_found
 
-    weights_dir = SETTINGS.get("weights_dir")
-    if weights_dir:
-        cand_paths.append(Path(weights_dir) / donor_name)
-    cand_paths.extend(
-        [
-            Path.home() / donor_name,
-            Path.home() / "Downloads" / donor_name,
-            Path.home() / ".cache" / "ultralytics" / donor_name,
-        ]
-    )
-
-    for cand in cand_paths:
-        try:
-            if cand.is_file() and cand.stat().st_size > 100_000:
-                LOGGER.info(f"YOLO27 Warm-Start: found local pretrained donor -> {cand}")
-                return cand
-        except OSError:
-            continue
-
+    # 5. Multi-mirror + official asset download fallback
     if allow_download:
-        try:
-            from ultralytics.utils.downloads import attempt_download_asset
+        downloaded = _download_with_mirrors(donor_name, repo_root / "weights" / donor_name)
+        if downloaded is not None:
+            return downloaded
 
-            downloaded = Path(attempt_download_asset(donor_name))
-            if downloaded.is_file() and downloaded.stat().st_size > 100_000:
-                return downloaded
-        except Exception as exc:
-            LOGGER.warning(
-                f"YOLO27 Warm-Start: 未在本地找到 '{donor_name}' 且自动下载失败 ({exc})。"
-                f" 请将你跑过 yolo26n 的 '{donor_name}' 放入项目根目录（或通过 --donor 指定路径），避免退回从零随机训练！"
-            )
     return None
