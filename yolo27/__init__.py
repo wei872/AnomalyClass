@@ -7,6 +7,7 @@ Reference:
 import ultralytics.nn.modules as _ult_modules
 import ultralytics.nn.tasks as _ult_tasks
 
+from .augment import apply_defect_invariant_bg_augment
 from .loss import YOLO27BboxLoss, YOLO27DetectionLoss, YOLO27E2ELoss
 from .model import YOLO27, YOLO27DetectionModel, YOLO27Trainer, YOLO27Validator
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
@@ -28,6 +29,7 @@ __all__ = (
     "YOLO27Trainer",
     "YOLO27Validator",
     "ForegroundAlignmentBranch",
+    "apply_defect_invariant_bg_augment",
     "transfer_pretrained_weights",
     "resolve_donor_checkpoint",
 )

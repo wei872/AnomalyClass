@@ -33,6 +33,7 @@ from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
 
+from .augment import apply_defect_invariant_bg_augment
 from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
@@ -172,12 +173,14 @@ class YOLO27Trainer(DetectionTrainer):
     _preset_donor_weights: str | None = None
     _preset_allow_warmstart: bool | None = None
     _preset_allow_download: bool = True
+    _preset_bg_augment_prob: float = 0.50
 
     def __init__(self, cfg=DEFAULT_CFG_DICT, overrides: dict[str, Any] | None = None, _callbacks=None) -> None:
         overrides = dict(overrides or {})
         self._use_normal: bool = bool(overrides.pop("use_normal", self._preset_use_normal))
         self._donor_weights: str | None = overrides.pop("donor_weights", self._preset_donor_weights)
         self._allow_download: bool = bool(overrides.pop("allow_download", self._preset_allow_download))
+        self._bg_augment_prob: float = float(overrides.pop("bg_augment_prob", self._preset_bg_augment_prob))
 
         raw_pretrained = overrides.get("pretrained", True)
         if isinstance(raw_pretrained, (str, Path)) and self._donor_weights is None:
@@ -203,6 +206,38 @@ class YOLO27Trainer(DetectionTrainer):
 
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
+
+    def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Preprocess batch and apply defect-invariant cloth background perturbation in training.
+
+        Alters background weave texture, cross-sample cloth grain, and local illumination while
+        preserving every pixel inside ground-truth defect bounding boxes bit-for-bit
+        (``背景发生改变，疵点不变，泛化能力增强``). Automatically turns off during the final
+        ``close_mosaic`` calibration epochs and never runs in validation or inference.
+        """
+        batch = super().preprocess_batch(batch)
+        if self._bg_augment_prob <= 0.0:
+            return batch
+        if getattr(self, "model", None) is not None and not getattr(self.model, "training", True):
+            return batch
+
+        epoch = int(getattr(self, "epoch", 0) or 0)
+        epochs = int(getattr(self, "epochs", 150) or 150)
+        close_mosaic = int(getattr(self.args, "close_mosaic", 0) or 0)
+        if close_mosaic > 0 and epochs > close_mosaic and epoch >= epochs - close_mosaic:
+            return batch
+
+        imgs = batch.get("img")
+        bboxes = batch.get("bboxes")
+        batch_idx = batch.get("batch_idx")
+        if isinstance(imgs, torch.Tensor) and isinstance(bboxes, torch.Tensor) and isinstance(batch_idx, torch.Tensor):
+            batch["img"] = apply_defect_invariant_bg_augment(
+                imgs,
+                batch_idx=batch_idx,
+                bboxes=bboxes,
+                prob=self._bg_augment_prob,
+            )
+        return batch
 
     def _setup_train(self, *args: Any, **kwargs: Any) -> None:
         """Calibrate ``ModelEMA`` decay/tau and rare-class foreground recall weights for industrial datasets."""
@@ -398,6 +433,7 @@ class YOLO27(YOLO):
         use_normal = bool(train_kwargs.pop("use_normal", False))
         donor_weights = train_kwargs.pop("donor_weights", None)
         allow_download = bool(train_kwargs.pop("allow_download", True))
+        bg_augment_prob = float(train_kwargs.pop("bg_augment_prob", 0.50))
 
         is_yaml_start = str(self.overrides.get("model", "")).lower().endswith((".yaml", ".yml")) and not self.ckpt
         raw_pretrained = train_kwargs.get("pretrained", True)
@@ -418,6 +454,7 @@ class YOLO27(YOLO):
             _preset_donor_weights = str(donor_weights) if donor_weights is not None else None
             _preset_allow_warmstart = allow_warmstart
             _preset_allow_download = allow_download
+            _preset_bg_augment_prob = bg_augment_prob
 
         return super().train(trainer=_BoundYOLO27Trainer, **train_kwargs)
 

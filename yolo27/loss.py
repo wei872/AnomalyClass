@@ -301,23 +301,39 @@ class YOLO27E2ELoss:
 
     def _compute_fg_alignment_from_o2m(
         self,
-        fg_logits: torch.Tensor,
+        fg_out: torch.Tensor | dict[str, torch.Tensor],
         o2m_preds: dict[str, torch.Tensor],
         o2m_assign: tuple[Any, ...],
         has_gt: bool,
     ) -> torch.Tensor:
-        """Supervise live neck foreground logits by reusing one2many's TAL assignment (zero extra TAL pass)."""
+        """Supervise background-invariant foreground saliency & defect embedding alignment on live neck features."""
+        if isinstance(fg_out, dict):
+            fg_logits = fg_out["logits"]
+            pert_logits: torch.Tensor | None = fg_out.get("pert_logits")
+            embed: torch.Tensor | None = fg_out.get("embed")
+            pert_embed: torch.Tensor | None = fg_out.get("pert_embed")
+        else:
+            fg_logits = fg_out
+            pert_logits = None
+            embed = None
+            pert_embed = None
+
         dtype = fg_logits.dtype
         batch_size = fg_logits.shape[0]
 
         if not has_gt:
             fg_zero = torch.zeros_like(fg_logits)
-            return (_varifocal_sum(fg_logits, fg_zero, fg_zero) / max(batch_size, 1)) * self.fg_gain
+            vfl_clean = _varifocal_sum(fg_logits, fg_zero, fg_zero) / max(batch_size, 1)
+            if pert_logits is not None:
+                vfl_pert = _varifocal_sum(pert_logits, fg_zero, fg_zero) / max(batch_size, 1)
+                return (0.5 * vfl_clean + 0.5 * vfl_pert) * self.fg_gain
+            return vfl_clean * self.fg_gain
 
         with torch.no_grad():
             if len(o2m_assign) == 3:
                 # Ultralytics <=8.4.33 returns (fg_mask, target_scores, target_scores_sum)
                 fg_mask, target_scores, _ = o2m_assign
+                fg_idx = fg_mask.nonzero(as_tuple=True)
                 fg_quality = target_scores.amax(dim=-1, keepdim=True).clamp(0.0, 1.0).to(dtype)
                 fg_label = fg_mask.unsqueeze(-1).to(dtype)
             else:
@@ -337,18 +353,32 @@ class YOLO27E2ELoss:
 
             norm = fg_quality.sum().clamp(min=1.0)
 
-        return (_varifocal_sum(fg_logits, fg_quality, fg_label) / norm) * self.fg_gain
+        vfl_clean = _varifocal_sum(fg_logits, fg_quality, fg_label) / norm
+        if pert_logits is None:
+            return vfl_clean * self.fg_gain
+
+        vfl_pert = _varifocal_sum(pert_logits, fg_quality, fg_label) / norm
+        loss_fg = 0.5 * vfl_clean + 0.5 * vfl_pert
+
+        # Foreground defect feature cosine alignment: background changes, defect representation stays invariant!
+        if embed is not None and pert_embed is not None and fg_idx[0].numel() > 0:
+            cos_sim = (embed[fg_idx].float() * pert_embed[fg_idx].float()).sum(dim=-1, keepdim=True)
+            q_fg = fg_quality[fg_idx].float()
+            loss_invariance = ((1.0 - cos_sim).clamp(min=0.0) * q_fg).sum() / norm.float()
+            loss_fg = loss_fg + 0.5 * loss_invariance.to(dtype=loss_fg.dtype)
+
+        return loss_fg * self.fg_gain
 
     def _compute_fg_alignment_loss(
         self,
-        fg_logits: torch.Tensor,
+        fg_out: torch.Tensor | dict[str, torch.Tensor],
         o2m_preds: dict[str, torch.Tensor],
         batch: dict[str, Any],
     ) -> torch.Tensor:
         """Standalone helper for computing foreground alignment loss from raw ``o2m_preds`` and ``batch``."""
         o2m_res = self.one2many.get_assigned_targets_and_loss(o2m_preds, batch)
         return self._compute_fg_alignment_from_o2m(
-            fg_logits,
+            fg_out,
             o2m_preds,
             o2m_res[0],
             has_gt=batch["bboxes"].numel() > 0,
@@ -357,7 +387,7 @@ class YOLO27E2ELoss:
     def __call__(
         self, preds: Any, batch: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
-        """Evaluate weighted ``one2many`` + conflict-free ``one2one`` + live neck FG alignment loss."""
+        """Evaluate weighted ``one2many`` + conflict-free ``one2one`` + background-invariant FG alignment loss."""
         preds = preds[1] if isinstance(preds, tuple) else preds
 
         if not isinstance(preds, dict) or "one2many" not in preds:
@@ -368,8 +398,8 @@ class YOLO27E2ELoss:
             return total_single.sum(), (dict(zip(self.loss_names, vec4)) if self._returns_dict else vec4)
 
         one2many = preds["one2many"]
-        one2one = preds["one2one"]
-        fg_logits: torch.Tensor | None = preds.get("fg_align")
+        one2one = preds.get("one2one")
+        fg_out = preds.get("fg_align")
         batch_size = one2many["boxes"].shape[0]
 
         o2m_res = self.one2many.get_assigned_targets_and_loss(one2many, batch)
@@ -377,15 +407,18 @@ class YOLO27E2ELoss:
         loss_o2m = o2m_loss_vec.sum() * batch_size
         vec_o2m = o2m_loss_vec.detach()
 
-        loss_o2o, items_o2o = self.one2one(one2one, batch)
-        vec_o2o = self._loss_dict_or_tensor_to_vec(items_o2o)
+        if one2one is not None:
+            loss_o2o, items_o2o = self.one2one(one2one, batch)
+            vec_o2o = self._loss_dict_or_tensor_to_vec(items_o2o)
+            det_items = vec_o2m * self.o2m + vec_o2o * self.o2o
+            total_loss = loss_o2m.sum() * self.o2m + loss_o2o.sum() * self.o2o
+        else:
+            det_items = vec_o2m
+            total_loss = loss_o2m.sum()
 
-        det_items = vec_o2m * self.o2m + vec_o2o * self.o2o
-        total_loss = loss_o2m.sum() * self.o2m + loss_o2o.sum() * self.o2o
-
-        if fg_logits is not None:
+        if fg_out is not None:
             fg_loss_unscaled = self._compute_fg_alignment_from_o2m(
-                fg_logits,
+                fg_out,
                 one2many,
                 o2m_assign,
                 has_gt=batch["bboxes"].numel() > 0,

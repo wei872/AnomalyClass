@@ -26,6 +26,7 @@ from yolo27 import (
     YOLO27DetectionModel,
     YOLO27E2ELoss,
     YOLO27Trainer,
+    apply_defect_invariant_bg_augment,
     resolve_donor_checkpoint,
     transfer_pretrained_weights,
 )
@@ -254,23 +255,116 @@ def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
 
     model.zero_grad()
     preds = model(imgs)
+    assert isinstance(preds["fg_align"], dict)
+    assert set(preds["fg_align"].keys()) == {"logits", "pert_logits", "embed", "pert_embed"}
     fg_only = criterion._compute_fg_alignment_loss(preds["fg_align"], preds["one2many"], batch_mixed)
     fg_only.backward()
     assert model.model[16].cv2.conv.weight.grad.abs().sum().item() > 0
 
     # Simulate legacy Ultralytics <=8.4.33 3-tuple o2m_assign = (fg_mask, target_scores, target_scores_sum)
-    n_anc = preds["fg_align"].shape[1]
+    n_anc = preds["fg_align"]["logits"].shape[1]
     fake_fg_mask = torch.zeros((2, n_anc), dtype=torch.bool)
     fake_fg_mask[0, :4] = True
     fake_t_scores = torch.zeros((2, n_anc, 19))
     fake_t_scores[0, :4, 3] = 0.85
+    legacy_fg_dict = {k: v.detach().requires_grad_(True) for k, v in preds["fg_align"].items()}
     legacy_fg_loss = criterion._compute_fg_alignment_from_o2m(
-        preds["fg_align"].detach().requires_grad_(True),
+        legacy_fg_dict,
         preds["one2many"],
         (fake_fg_mask, fake_t_scores, fake_t_scores.sum()),
         has_gt=True,
     )
+    legacy_fg_loss.backward()
     assert torch.isfinite(legacy_fg_loss) and legacy_fg_loss.item() > 0.0
+    assert legacy_fg_dict["pert_logits"].grad.abs().sum().item() > 0.0
+    assert legacy_fg_dict["pert_embed"].grad.abs().sum().item() > 0.0
+
+
+def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
+    """Verify FG alignment spec (YOLO26n=None; YOLO27n/Dual/Lite=Train-Only, Stripped on Fuse) & BG-only augment."""
+    torch.manual_seed(7)
+
+    # 1. YOLO26n has NO fg_branch; YOLO27n / YOLO27n-Dual / YOLO27n-Lite ALL enable fg_branch in training & strip on fuse
+    m_y26 = YOLO("yolo26n.yaml").model
+    assert getattr(m_y26.model[-1], "fg_branch", None) is None
+
+    for cfg in ("models/yolo27n.yaml", "models/yolo27n-dual.yaml", "models/yolo27n-lite.yaml"):
+        m_train = YOLO27DetectionModel(cfg, nc=19, verbose=False).train()
+        head = m_train.model[-1]
+        assert head.fg_branch is not None, f"{cfg} must enable ForegroundAlignmentBranch during training"
+        m_train.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
+        crit = m_train.init_criterion()
+
+        x = torch.rand(2, 3, 192, 192)
+        out = m_train(x)
+        assert isinstance(out["fg_align"], dict)
+        assert out["fg_align"]["embed"].shape[-1] == 16
+        # Verify counterfactual background perturbation changes features while anchoring fg_prob=1 centers
+        f0 = torch.randn(2, 16, 12, 12)
+        fg_ones = torch.ones(2, 1, 12, 12)
+        fg_zeros = torch.zeros(2, 1, 12, 12)
+        assert (head.fg_branch._perturb_background_features(f0, fg_ones) - f0).abs().max().item() == 0.0
+        assert (head.fg_branch._perturb_background_features(f0, fg_zeros) - f0).abs().mean().item() > 0.05
+
+        batch = {
+            "img": x,
+            "batch_idx": torch.tensor([0.0, 1.0]),
+            "cls": torch.tensor([[14.0], [1.0]]),
+            "bboxes": torch.tensor([[0.30, 0.30, 0.08, 0.08], [0.50, 0.60, 0.80, 0.05]]),
+        }
+        loss, items = crit(out, batch)
+        loss.backward()
+        assert torch.isfinite(loss)
+        fg_val = items["fg_loss"].item() if isinstance(items, dict) else items[3].item()
+        assert fg_val > 0.0
+
+        m_fused = deepcopy(m_train).eval().fuse(verbose=False)
+        assert m_fused.model[-1].fg_branch is None, f"{cfg} must strip ForegroundAlignmentBranch on fuse()"
+
+    # 2. Defect-invariant cloth background perturbation: background changes, GT defect pixels stay 100% bit-exact!
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, 128), torch.linspace(0, 1, 128), indexing="ij")
+    weave_a = (0.5 + 0.16 * torch.sin(xx * 90.0) + 0.12 * torch.cos(yy * 70.0)).clamp(0.0, 1.0)
+    weave_b = (0.5 + 0.18 * torch.sin((xx + yy) * 55.0) + 0.10 * torch.cos(xx * 130.0)).clamp(0.0, 1.0)
+    weave_skew = (0.5 + 0.15 * torch.sin((xx + 0.2 * yy) * 80.0)).clamp(0.0, 1.0)
+    imgs = torch.stack([weave_a.expand(3, -1, -1), weave_b.expand(3, -1, -1), weave_skew.expand(3, -1, -1)], dim=0)
+    # Stamp synthetic dark defect spots into sample 0 (32..56, 40..64) and thin strip into sample 1 (60..68, 16..112)
+    imgs[0, :, 32:56, 40:64] = 0.08
+    imgs[1, :, 60:68, 16:112] = 0.92
+
+    bboxes = torch.tensor(
+        [
+            [52.0 / 128.0, 44.0 / 128.0, 24.0 / 128.0, 24.0 / 128.0],  # sample 0 localized defect
+            [64.0 / 128.0, 64.0 / 128.0, 96.0 / 128.0, 8.0 / 128.0],   # sample 1 thin weft defect
+            [0.50, 0.50, 0.96, 0.96],                                  # sample 2 full-frame weft skew (纬斜)
+        ]
+    )
+    batch_idx = torch.tensor([0.0, 1.0, 2.0])
+    aug = apply_defect_invariant_bg_augment(imgs, bboxes=bboxes, batch_idx=batch_idx, p=1.0)
+
+    # GT defect interiors in samples 0 & 1 are bit-for-bit untouched (疵点不变)
+    assert (aug[0, :, 32:56, 40:64] - imgs[0, :, 32:56, 40:64]).abs().max().item() == 0.0
+    assert (aug[1, :, 60:68, 16:112] - imgs[1, :, 60:68, 16:112]).abs().max().item() == 0.0
+    # Background cloth weave outside defects genuinely changes (背景发生改变)
+    assert (aug[0, :, :20, :28] - imgs[0, :, :20, :28]).abs().mean().item() > 0.01
+    assert (aug[1, :, :44, :] - imgs[1, :, :44, :]).abs().mean().item() > 0.01
+    # Full-frame global defect (sample 2, 纬斜 w*h >= 0.55) is automatically skipped without distorting cloth skew
+    assert (aug[2] - imgs[2]).abs().max().item() == 0.0
+
+    # Verify YOLO27Trainer.preprocess_batch gates BG augmentation off cleanly during final close_mosaic epochs
+    dummy_t = YOLO27Trainer.__new__(YOLO27Trainer)
+    dummy_t.device = torch.device("cpu")
+    dummy_t._bg_augment_prob = 1.0
+    dummy_t.model = SimpleNamespace(training=True)
+    dummy_t.epochs = 150
+    dummy_t.args = SimpleNamespace(multi_scale=0.0, close_mosaic=5)
+
+    raw_uint8 = (imgs[:2] * 255.0).round().to(torch.uint8)
+    dummy_t.epoch = 10
+    b_active = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
+    dummy_t.epoch = 147  # inside final close_mosaic=5 window
+    b_tail = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
+    assert (b_active["img"][0, :, 32:56, 40:64] - b_tail["img"][0, :, 32:56, 40:64]).abs().max().item() == 0.0
+    assert (b_active["img"][0, :, :20, :28] - b_tail["img"][0, :, :20, :28]).abs().mean().item() > 0.01
 
 
 def test_deep_donor_discovery_failfast_guard_and_pipeline() -> None:
@@ -415,6 +509,7 @@ if __name__ == "__main__":
         test_net2wider_exact_step0_equivalence_with_widened_c2,
         test_version_safe_fusion_and_end2end_setter,
         test_anisotropic_edge_loss_and_reused_fg_supervision,
+        test_foreground_alignment_and_defect_invariant_bg_augment,
         test_deep_donor_discovery_failfast_guard_and_pipeline,
     ):
         print(f"[RUN ] {fn.__name__} ...")

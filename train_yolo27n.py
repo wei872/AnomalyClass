@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Final un-mosaicked epochs (5 prevents small-dataset overfitting spike while refining full-frame boxes)",
     )
+    parser.add_argument(
+        "--bg-augment-prob",
+        type=float,
+        default=0.50,
+        help="Per-sample probability of defect-invariant cloth background perturbation in training (0.0 disables)",
+    )
     parser.add_argument("--project", type=str, default="runs/detect", help="Output root directory")
     parser.add_argument("--name", type=str, default="yolo27n_fabric19", help="Experiment run name")
     parser.add_argument("--source", type=str, default="", help="Image/directory source for predict mode")
@@ -147,7 +153,7 @@ def run_profile(imgsz: int = 640, nc: int = 19) -> None:
 
     header = (
         f"{'Model Variant':<24} | {'Train Params':>12} | {'Fused Params':>12} | "
-        f"{'FLOPs @' + str(imgsz):>11} | {'Scales':<13} | {'Latency (ms)':>12}"
+        f"{'FLOPs @' + str(imgsz):>11} | {'Scales':<10} | {'FG Align':<15} | {'Latency (ms)':>12}"
     )
     print("\n" + "=" * len(header))
     print(f"Fabric19 (nc={nc}) Architecture Complexity & Inference Comparison")
@@ -157,9 +163,12 @@ def run_profile(imgsz: int = 640, nc: int = 19) -> None:
 
     for label, builder in candidates:
         m_train = builder()
+        has_fg_train = getattr(m_train.model[-1], "fg_branch", None) is not None
         train_params = get_num_params(m_train)
         m_infer = deepcopy(m_train).eval()
         m_infer.fuse(verbose=False)
+        has_fg_infer = getattr(m_infer.model[-1], "fg_branch", None) is not None
+        fg_status = "训练启用/推理剥离" if (has_fg_train and not has_fg_infer) else ("有" if has_fg_infer else "无")
         fused_params = get_num_params(m_infer)
         flops = get_flops(m_infer, imgsz=imgsz)
         strides = [int(s) for s in m_train.stride.tolist()]
@@ -167,7 +176,7 @@ def run_profile(imgsz: int = 640, nc: int = 19) -> None:
         lat_ms = _measure_latency_ms(m_infer, imgsz=imgsz)
         print(
             f"{label:<24} | {train_params / 1e6:>10.3f} M | {fused_params / 1e6:>10.3f} M | "
-            f"{flops:>9.2f} B | {scale_str:<13} | {lat_ms:>9.2f} ms"
+            f"{flops:>9.2f} B | {scale_str:<10} | {fg_status:<11} | {lat_ms:>9.2f} ms"
         )
     print("=" * len(header) + "\n")
 
@@ -192,6 +201,7 @@ def main() -> None:
             "optimizer": args.optimizer,
             "cos_lr": True,
             "close_mosaic": args.close_mosaic,
+            "bg_augment_prob": args.bg_augment_prob,
             "project": args.project,
             "name": args.name,
             "use_normal": args.use_normal,
