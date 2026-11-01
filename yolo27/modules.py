@@ -44,34 +44,35 @@ class ForegroundAlignmentBranch(nn.Module):
 
 
 class YOLO27Detect(Detect):
-    """Official YOLO27 dual-pathway detection head.
+    """Official YOLO27 dual-pathway detection head with 16-bin DFL sub-pixel regression.
 
     Key properties aligned with Ultralytics YOLO27 specification:
-      1. Defaults to high-accuracy ``one2many + NMS`` inference/validation (``end2end = False``),
-         eliminating single-anchor recall loss and adjacent duplicate false positives on small or
-         elongated fabric defects, while retaining full ``one2one`` weights for optional ``nms=False``
-         end-to-end deployment.
-      2. Fixed multi-scale feature balancing ``scale_factors`` folded into first conv weights on ``fuse()``
-         for zero runtime overhead.
+      1. Defaults to high-accuracy ``one2many + NMS`` inference/validation (``end2end = False``)
+         backed by 16-bin Distribution Focal Loss (``reg_max = 16``), eliminating off-center
+         localization jitter and duplicate false positives while retaining full ``one2one``
+         weights for optional ``nms=False`` end-to-end deployment.
+      2. Fixed multi-scale feature balancing ``scale_factors`` (``(1.0, 1/sqrt(2))`` on dual-scale
+         ``[P3, P5]``, ``(1.0, 1.0, 1.0)`` on balanced 3-scale ``[P3, P4, P5]``) folded into first
+         conv weights on ``fuse()`` for zero runtime overhead.
       3. Training-only ``ForegroundAlignmentBranch`` stripped completely on ``fuse()``.
     """
 
     def __init__(
         self,
         nc: int = 19,
-        reg_max: int = 1,
+        reg_max: int = 16,
         end2end: bool = True,
         ch: list[int] | tuple[int, ...] = (),
         scale_factors: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
-        # Official YOLO27 default: train dual heads (one2many + one2one), default eval/infer to one2many + NMS
+        # Official YOLO27 N/S default: train dual heads (one2many + one2one), default eval/infer to one2many + NMS
         self._end2end = False
         if scale_factors is None:
             if self.nl == 2:
                 scale_factors = (1.0, 1.0 / math.sqrt(2.0))
             else:
-                scale_factors = tuple(1.0 / math.sqrt(1.0 + 0.5 * i) for i in range(self.nl))
+                scale_factors = tuple(1.0 for _ in range(self.nl))
         if len(scale_factors) != self.nl:
             raise ValueError(f"Expected {self.nl} scale_factors for {self.nl} detection scales, got {scale_factors}")
         self.scale_factors: tuple[float, ...] = tuple(float(s) for s in scale_factors)
@@ -84,10 +85,11 @@ class YOLO27Detect(Detect):
         det: Detect,
         scale_factors: tuple[float, ...] | None = None,
     ) -> YOLO27Detect:
-        """Upgrade a parsed Ultralytics ``Detect`` head into ``YOLO27Detect`` while preserving metadata."""
+        """Upgrade a parsed Ultralytics ``Detect`` head into ``YOLO27Detect`` without losing initialized weights."""
         ch = tuple(branch[0].conv.in_channels for branch in det.cv2)
         has_dual_heads = getattr(det, "one2one_cv2", None) is not None
         cls.legacy = det.legacy
+        rng_state = torch.get_rng_state()
         new_head = cls(
             nc=det.nc,
             reg_max=det.reg_max,
@@ -95,6 +97,8 @@ class YOLO27Detect(Detect):
             ch=ch,
             scale_factors=scale_factors,
         )
+        new_head.load_state_dict(det.state_dict(), strict=False)
+        torch.set_rng_state(rng_state)
         for attr in ("i", "f", "type", "inplace"):
             if hasattr(det, attr):
                 setattr(new_head, attr, getattr(det, attr))
@@ -102,8 +106,18 @@ class YOLO27Detect(Detect):
         return new_head
 
     def bias_init(self) -> None:
-        """Initialize box, class, and foreground alignment biases."""
-        super().bias_init()
+        """Initialize box, class, and foreground alignment biases across BOTH one2many and one2one heads.
+
+        Note: stock ``Detect.bias_init()`` skips ``self.one2one`` when ``self.end2end`` is ``False``,
+        which would leave ``one2one_cv3`` biases at ``0.0`` (``p = 0.5`` across all anchors) and trigger
+        massive early gradient clipping. Here both branches are always initialized identically.
+        """
+        for branch in (self.one2many, getattr(self, "one2one", None)):
+            if not branch or branch.get("box_head") is None or branch.get("cls_head") is None:
+                continue
+            for i, (a, b) in enumerate(zip(branch["box_head"], branch["cls_head"])):
+                a[-1].bias.data[:] = 2.0  # box / uniform DFL bias
+                b[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
         if getattr(self, "fg_branch", None) is not None:
             self.fg_branch.bias_init(prior_prob=0.01)
 

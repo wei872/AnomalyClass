@@ -1,4 +1,4 @@
-"""YOLO27n dual-head training criterion with non-interfering Foreground Alignment Supervision."""
+"""YOLO27n dual-head training criterion with smooth progressive balancing and Foreground Alignment."""
 
 from __future__ import annotations
 
@@ -102,19 +102,18 @@ class YOLO27DetectionLoss(v8DetectionLoss):
 
 
 class YOLO27E2ELoss:
-    """Official YOLO27 dual-head loss with full primary ``one2many`` supervision and clean ``fg_branch``.
+    """Official YOLO27 dual-head loss with smooth normalized ``o2m + o2o = 1.0`` progression.
 
-    Why this outperforms YOLO26's ``E2ELoss``:
-      1. Full 1.0x ``one2many`` supervision across all epochs: in YOLO26, ``E2ELoss`` decays ``o2m``
-         down to ``0.1`` (starving backbone/neck gradients in the final 50 epochs because ``one2one``
-         inputs are detached via ``x.detach()``). Keeping ``o2m = 1.0`` gives uninterrupted dense
-         multi-positive supervision to the widened P2/P3 neck and default NMS ``one2many`` head,
-         while ``o2o = 1.0`` independently trains the detached ``one2one`` head with zero gradient
-         conflict in the shared backbone.
-      2. Non-interfering Foreground Alignment Supervision (``fg_gain = 0.05``): supervises only the
-         training-only ``fg_branch`` on shared neck features without distorting ``one2many`` or
-         ``one2one`` classification logits.
-      3. Dual-scale STAL safety: sets ``stride_val = 16`` when ``len(stride) == 2`` (``[8, 32]`` in
+    Key stability & accuracy properties:
+      1. Normalized gradient budget (``o2m + o2o == 1.0``): prevents ``2x`` combined gradient norms
+         from prematurely triggering ``BaseTrainer``'s global ``clip_grad_norm_(10.0)`` while keeping
+         ``one2many`` dominant (``0.85 -> 0.65`` via ``.update()``) so the primary ``one2many + NMS``
+         head receives dense multi-positive supervision and smoothly damps late-epoch / post-mosaic steps.
+      2. Progressive ``one2one`` ramp (``0.15 -> 0.35``): trains the detached ``one2one`` branch on
+         stabilized neck representations so optional ``nms=False`` inference stays accurate.
+      3. Non-interfering Foreground Alignment Supervision (``fg_gain = 0.04``): supervises only the
+         training-only ``fg_branch`` on shared neck features without distorting ``cls`` logits.
+      4. Dual-scale STAL safety: sets ``stride_val = 16`` when ``len(stride) == 2`` (``[8, 32]`` in
          ``yolo27n-lite``) so small defects are never forced onto stride 32.
     """
 
@@ -122,8 +121,11 @@ class YOLO27E2ELoss:
         self,
         model: torch.nn.Module,
         loss_fn=YOLO27DetectionLoss,
-        fg_gain: float = 0.05,
+        fg_gain: float = 0.04,
+        init_o2m: float = 0.85,
+        final_o2m: float = 0.65,
     ) -> None:
+        self.model_ref = [model]
         self.one2many = loss_fn(model, tal_topk=10)
         self.one2one = loss_fn(model, tal_topk=7, tal_topk2=1)
 
@@ -132,8 +134,13 @@ class YOLO27E2ELoss:
             self.one2many.assigner.stride_val = fine_stride_floor
             self.one2one.assigner.stride_val = fine_stride_floor
 
-        self.o2m = 1.0
-        self.o2o = 1.0
+        epochs = int(getattr(getattr(model, "args", None), "epochs", 150) or 150)
+        self.total_epochs = max(epochs, 1)
+        self.epoch_step = 0
+        self.init_o2m = float(init_o2m)
+        self.final_o2m = float(final_o2m)
+        self.o2m = self.init_o2m
+        self.o2o = 1.0 - self.o2m
         self.fg_gain = fg_gain
 
         base_names = list(getattr(self.one2many, "loss_names", ["box_loss", "cls_loss", "dfl_loss"]))
@@ -141,6 +148,13 @@ class YOLO27E2ELoss:
             self.loss_names = tuple([*base_names, "fg_loss"])
         else:
             self.loss_names = tuple(base_names)
+
+    def update(self) -> None:
+        """Advance one epoch along the smooth o2m/o2o schedule (called by BaseTrainer._do_train)."""
+        self.epoch_step += 1
+        progress = min(self.epoch_step / max(self.total_epochs - 1, 1), 1.0)
+        self.o2m = self.init_o2m - (self.init_o2m - self.final_o2m) * (progress**1.5)
+        self.o2o = 1.0 - self.o2m
 
     def _foreground_branch_loss(
         self,
@@ -177,7 +191,7 @@ class YOLO27E2ELoss:
 
         bs = one2many["boxes"].shape[0]
         o2m_assign, loss_o2m, loss_items_o2m = self.one2many.get_assigned_targets_and_loss(one2many, batch)
-        _, loss_o2o, _ = self.one2one.get_assigned_targets_and_loss(one2one, batch)
+        _, loss_o2o, loss_items_o2o = self.one2one.get_assigned_targets_and_loss(one2one, batch)
 
         det_loss = (loss_o2m * self.o2m + loss_o2o * self.o2o) * bs
         fg_loss = self._foreground_branch_loss(fg_logits, one2many, o2m_assign)
@@ -186,13 +200,15 @@ class YOLO27E2ELoss:
         total_loss = det_loss.sum() + fg_loss_scaled.sum()
 
         fg_scalar = fg_loss.detach() * self.fg_gain
-        if isinstance(loss_items_o2o := loss_items_o2m, dict):
+        head = self.model_ref[0].model[-1]
+        active_items = loss_items_o2o if getattr(head, "end2end", False) else loss_items_o2m
+        if isinstance(active_items, dict):
             loss_items: dict[str, torch.Tensor] | torch.Tensor = {
-                **loss_items_o2o,
+                **active_items,
                 "fg_loss": fg_scalar,
             }
         else:
-            fg_item = fg_scalar.flatten().to(loss_items_o2m.dtype)
-            loss_items = torch.cat([loss_items_o2m.detach().flatten(), fg_item])
+            fg_item = fg_scalar.flatten().to(active_items.dtype)
+            loss_items = torch.cat([active_items.detach().flatten(), fg_item])
 
         return total_loss, loss_items

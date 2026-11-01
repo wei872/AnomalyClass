@@ -5,7 +5,7 @@ Usage examples:
   1. Profile model parameters, FLOPs & structure:
        python train_yolo27n.py --mode profile
 
-  2. Train YOLO27n (apples-to-apples with pure yolo26n + zero-error Net2Wider warm-start + StripEnhancer):
+  2. Train YOLO27n (16-bin DFL sub-pixel regression + Net2Wider warm-start + default NMS validation):
        python train_yolo27n.py --mode train --model models/yolo27n.yaml --data dataset/fabric19.yaml --epochs 150 --batch 16
 
   3. Train with normaltrain/normalval defect-free background folders also included:

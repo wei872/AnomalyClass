@@ -1,15 +1,20 @@
 """Function-preserving Net2Wider pretrained warm-start for YOLO27n / YOLO27n-Lite.
 
-Transfers pretrained weights from ``yolo26n.pt`` (or ``yolo26s.pt``) into ``YOLO27DetectionModel``
-with **zero step-0 activation error** on shared channels:
+Transfers pretrained weights from ``yolo26n.pt`` (or ``yolo26s.pt`` / ``yolo11n.pt``) into
+``YOLO27DetectionModel`` cleanly:
   1. Exact-shape layers (stem Conv, P3/P4/P5 C3k2, SPPF, C2PSA, etc.) copy 1:1.
   2. Widened ``C3k2`` stages align both ``cv1`` (2-chunk split) and ``cv2`` (``(2+n)``-chunk concat).
   3. ``Concat`` consumers align input channel offsets per concatenated branch.
   4. Newly widened input-channel columns on consumer convolutions are zero-initialized (Net2Wider),
-     while newly widened output-channel filters keep small Kaiming variance (``0.05x``) so step-0
-     forward outputs match ``yolo26n.pt`` to ``< 1e-6`` while step-1 gradients unlock all new channels.
-  5. ``YOLO27Detect`` fixed ``scale_factors`` are pre-compensated (``1 / s_i``) on first-layer convs
-     when loading from an unscaled donor so pretrained BatchNorm statistics remain 100% calibrated.
+     while newly widened output-channel filters retain their full Kaiming initialization (preventing
+     ``BatchNorm`` running-variance shrinkage and ``20x`` backward Jacobian spikes) so step-0 outputs
+     on shared architectures match to ``< 1e-6`` while step-1 gradients cleanly unlock new channels.
+  5. Incompatible final head projection convs — ``.cv3.<scale>.2.`` when ``nc`` differs and
+     ``.cv2.<scale>.2.`` when ``reg_max`` differs (e.g., ``yolo26n.pt`` ``reg_max=1`` 4-ch scalar
+     head -> ``YOLO27n`` ``reg_max=16`` 64-ch DFL head) — are skipped so ``bias_init()`` priors stay
+     intact while all shared ``3x3`` head feature convs (``.0`` and ``.1``) transfer cleanly.
+  6. ``YOLO27Detect`` fixed ``scale_factors`` are pre-compensated (``1 / s_i``) on first-layer convs
+     when loading from an unscaled donor so pretrained BatchNorm statistics remain calibrated.
 """
 
 from __future__ import annotations
@@ -29,7 +34,6 @@ def _infer_layer_out_ch(sd: dict[str, torch.Tensor], seq_mods: Any, idx: int) ->
     """Infer output channel count of ``model.{idx}`` from state_dict tensors (following Upsample/Concat)."""
     if idx < 0:
         return None
-    # Direct BN / Conv weight keys on module idx
     for suffix in (".cv2.bn.weight", ".bn.weight", ".cv2.conv.weight", ".conv.weight"):
         t = sd.get(f"model.{idx}{suffix}")
         if t is not None and t.ndim >= 1:
@@ -91,12 +95,20 @@ def _copy_out_rows_with_chunked_in(
     out_pairs: list[tuple[int, int, int]],
     in_pairs: list[tuple[int, int, int]],
 ) -> int:
-    """Copy ``(out_src, out_dst, out_len) x (in_src, in_dst, in_len)`` blocks; zero extra cols on copied rows."""
-    # Scale extra widened output filters down (0.05x Kaiming) for clean symmetry breaking
-    dst.mul_(0.05)
+    """Copy ``(out_src, out_dst, out_len) x (in_src, in_dst, in_len)`` blocks; zero extra cols cleanly."""
+    # Keep full Kaiming initialization on newly widened output rows (no 0.05x BN variance shrinkage!),
+    # while zeroing newly widened input columns across ALL rows so step-0 shared outputs are exact.
+    for _, id_i, ilen in in_pairs:
+        pass
+    # Zero any input columns not covered by donor's shared input chunks
+    covered_in = torch.zeros(dst.shape[1], dtype=torch.bool, device=dst.device)
+    for _, id_i, ilen in in_pairs:
+        covered_in[id_i : id_i + ilen] = True
+    if not bool(covered_in.all()):
+        dst[:, ~covered_in] = 0.0
+
     copied = 0
     for os_i, od_i, olen in out_pairs:
-        # Zero all input columns on pretrained output rows so newly widened inputs inject 0 noise at step 0
         dst[od_i : od_i + olen].zero_()
         for is_i, id_i, ilen in in_pairs:
             dst[od_i : od_i + olen, id_i : id_i + ilen].copy_(
@@ -153,7 +165,6 @@ def _copy_sliced_tensor(
 
     # Depthwise conv (groups == out_channels -> shape[1] == 1)
     if dst.ndim == 4 and src.shape[1] == 1 and dst.shape[1] == 1:
-        dst.mul_(0.05)
         c_out = min(src.shape[0], dst.shape[0])
         dst[:c_out].copy_(src_cast[:c_out])
         return c_out * dst.shape[2] * dst.shape[3]
@@ -230,7 +241,6 @@ def _compensate_head_scale_factors(donor_obj: Any, target: nn.Module) -> None:
     if not scale_factors or getattr(head, "_scale_folded", False):
         return
 
-    # If donor already had identical YOLO27Detect scale_factors, weights are already compensated
     donor_mods = getattr(donor_obj, "model", None) if isinstance(donor_obj, nn.Module) else None
     donor_head = donor_mods[-1] if donor_mods is not None and len(donor_mods) > 0 else None
     if donor_head is not None and getattr(donor_head, "scale_factors", None) == scale_factors:
@@ -266,6 +276,13 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
         and target_cls_key in target_sd
         and donor_sd[donor_cls_key].shape == target_sd[target_cls_key].shape
     )
+    donor_box_key = f"model.{head_idx}.cv2.0.2.bias"
+    target_box_key = f"model.{head_idx}.cv2.0.2.bias"
+    same_reg_max = (
+        donor_box_key in donor_sd
+        and target_box_key in target_sd
+        and donor_sd[donor_box_key].shape == target_sd[target_box_key].shape
+    )
 
     # Support both 3-scale->3-scale (YOLO27n) and 3-scale->2-scale (YOLO27n-Lite) warm-start
     donor_has_3_scales = f"model.{head_idx}.cv2.2.0.conv.weight" in donor_sd
@@ -282,8 +299,11 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
         if dst.ndim == 0:
             continue
 
-        # Keep target dataset 19-class focal bias prior on final 1x1 projection, while warm-starting blocks 0 & 1
+        # Keep target dataset 19-class focal bias prior on final 1x1 projection when nc differs
         if not same_nc and any(tag in key for tag in (".cv3.", ".one2one_cv3.")) and ".2." in key:
+            continue
+        # Keep uniform 16-bin DFL bias prior on final 1x1 box projection when reg_max differs (e.g. yolo26n reg_max=1 -> yolo27n reg_max=16)
+        if not same_reg_max and any(tag in key for tag in (".cv2.", ".one2one_cv2.")) and ".2." in key:
             continue
         if any(tag in key for tag in (".fg_branch.", ".strip_adapters.")) and key not in donor_sd:
             continue
@@ -315,15 +335,17 @@ def transfer_pretrained_weights(donor: nn.Module | dict[str, torch.Tensor], targ
                 sliced_tensors += 1
                 copied_numel += n_copied
 
+    # Mirror cv2/cv3 feature convs into one2one_cv2/one2one_cv3 when donor is NMS-only (e.g. yolo11n.pt)
+    if target_mods is not None and len(target_mods) > 0:
+        head = target_mods[-1]
+        donor_has_o2o = any(".one2one_cv2." in k for k in donor_sd)
+        if not donor_has_o2o and getattr(head, "one2one_cv2", None) is not None:
+            for s in range(head.nl):
+                head.one2one_cv2[s].load_state_dict(head.cv2[s].state_dict())
+                head.one2one_cv3[s].load_state_dict(head.cv3[s].state_dict())
+
     # Pre-compensate fixed feature scale factors so step-0 outputs match unscaled donor 100% exactly
     _compensate_head_scale_factors(donor_obj, target)
-
-    # Ensure zero-residual strip adapters stay strictly zero-initialized at step 0 if not in donor
-    if target_mods is not None and len(target_mods) > 0:
-        strip_adapters = getattr(target_mods[-1], "strip_adapters", None)
-        if strip_adapters is not None and not any(".strip_adapters." in k for k in donor_sd):
-            for adapter in strip_adapters:
-                adapter.reset_zero_residual()
 
     ratio = copied_numel / max(total_numel, 1)
     LOGGER.info(
@@ -361,7 +383,6 @@ def resolve_donor_checkpoint(
                 dp = Path(str(d))
                 cand_paths.extend([dp / name, dp.parent / name, dp.parent.parent / name])
 
-    # Also check sibling project folders (e.g. Desktop/github/*/yolo26n.pt where pure yolo26n was tested)
     if cwd.parent.is_dir():
         try:
             for sub in cwd.parent.iterdir():
@@ -381,8 +402,6 @@ def resolve_donor_checkpoint(
     if not allow_download:
         return None
 
-    # Note: GitHub Releases redirects to AWS S3 GET-presigned URLs which reject HEAD with 403!
-    # Always probe with GET + Range: bytes=0-0 (returns 200/206 in <1s when reachable, fails fast offline).
     url = f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}"
     try:
         req = urllib.request.Request(url, method="GET", headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"})

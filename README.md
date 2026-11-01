@@ -34,10 +34,10 @@
   3. **纯正常布面样本（`normaltrain` / `normalval`）天然协同**：[`YOLO27Trainer`](yolo27/model.py) 自动识别 `dataset/fabric19.yaml` 中的 `normaltrain` 与 `normalval` 无缺陷正常布匹目录并挂载为负样本，前景对齐分支在正常布面上全锚点监督为 `0`，强力抑制纹理误报；
   4. **推理与导出完全剥离**：调用 `fuse()` 或导出 ONNX / TensorRT 时自动置空 `fg_branch = None`，**不增加任何部署延迟或模型体积**。
 
-### 5. 面向自定义数据集的快速收敛增强体系（Fast-Convergence Recipe）
-- **智能预训练权重子空间热启动（[`yolo27/weights.py`](yolo27/weights.py)）**：从 `.yaml` 构建 `YOLO27n` / `YOLO27n-Lite` 时自动从 `yolo26n.pt` 执行精确层 1:1 拷贝 + 加宽层（P2/P3/P4 `C3k2` 及双尺度 `cv2`/`cv3` 特征塔）通道对齐切片迁移（覆盖约 **80%+** 参数，同时完整保留 19 类目标的 Focal 偏置先验）。
-- **无衰减双头梯度 + 双尺度 STAL `stride_val=16` 校准（[`yolo27/loss.py`](yolo27/loss.py)）**：保持 `o2m=1.0, o2o=1.0` 全程无衰减（避免 `one2one` `x.detach()` 导致中后期主干梯度饥饿，并让端到端验证头从第 1 轮全速收敛）；修复双尺度 `[8, 32]` 下 `TaskAlignedAssigner` 默认将候选框下限放大为 `32px` 的问题，恢复为 `16px` 并提升 `tal_topk=13`。
-- **无 DFL 直接回归增益校准 + 小目标安全增强（[`yolo27/model.py`](yolo27/model.py)）**：匹配 `reg_max=1` 将归一化 L1 增益提升至 `dfl=6.0`；默认启用 `AdamW (lr0=0.0015) + cos_lr=True + warmup_bias_lr=0.0`（防止早期分类偏置爆炸），并设置 `erasing=0.0`（防止随机擦除抹掉微小瑕疵标签）、`flipud=0.5`、`close_mosaic=20`。
+### 5. 面向自定义数据集的平稳收敛与高精度增强体系（Smooth-Convergence & High-IoU Recipe）
+- **16-bin DFL 亚像素边界分布回归（`reg_max: 16`）**：YOLO26n 为追求纯无 NMS 速度将 `reg_max` 砍为 `1`（回归头仅 16~20 通道且 `dfl_loss` 失效），导致一对多（`tal_topk=10`）离轴正样本回归框散度偏大、穿透 `iou=0.7` NMS 引发 Precision 与 mAP 曲线剧烈抖动。`YOLO27n` 恢复 **16-bin Distribution Focal Loss（`c2=64` 通道 + 16 离散概率分布积分）**，使同一瑕疵上的多个正样本回归框高度重合（`IoU > 0.85`），被 NMS 干净坍缩为唯一高精度框，大幅提升 `mAP50-95` 并显著平滑收敛曲线（融合后仍仅 **2.73M 参数 / 6.98 GFLOPs**，严格低于官方 `3.0M / 7.2B` 预算）。
+- **智能 Net2Wider 预训练热启动与跨 `reg_max` 保护（[`yolo27/weights.py`](yolo27/weights.py)）**：从 `yolo26n.pt` 热启动时精确拷贝共享层、按拼接块零填充迁移加宽层（保留新增输出通道完整 Kaiming 方差，彻底消除 BatchNorm `20x` 反向梯度放大），并自动保护 19 类分类偏置与 16-bin 均匀 DFL 偏置先验。
+- **双头全偏置初始化 + 归一化渐进梯度平衡（[`yolo27/modules.py`](yolo27/modules.py) & [`yolo27/loss.py`](yolo27/loss.py)）**：修复默认 `end2end=False` 时 `one2one` 分类偏置未初始化导致的早期全局梯度裁剪（`clip_grad_norm_(10.0)`）抑制；采用 `o2m + o2o == 1.0` 渐进调度（`o2m: 0.85 -> 0.65`, `o2o: 0.15 -> 0.35`），全程以 `one2many` 主导特征学习并在训练后期与 `close_mosaic` 切换期平滑阻尼步长，同时训练 `one2one` 分支支持 `nms=False` 端到端导出。
 
 ---
 
@@ -45,9 +45,9 @@
 
 | 模型配置 | 配置文件 | 预测尺度 (Stride) | Anchor 数 | 训练态参数量 | 推理融合后参数量 | 融合后计算量 (FLOPs) | 适用场景 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准（强制无 NMS 单正样本头） |
-| **YOLO27n** (官方高精度版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 2.669 M | **2.481 M** | **6.26 B** | 默认一对多密集头+NMS高精度推理 + 无损继承 `yolo26n.pt` + P2/P3 加宽 + 前景对齐监督（低于官方 3.0M/7.2B 预算） |
-| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 0.825 M | **0.751 M** | **2.91 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
+| **YOLO26n** (前代基准) | `yolo26n.yaml` | `[8, 16, 32]` | 8,400 | 2.511 M | 2.379 M | 5.21 B | 前代三尺度基准（`reg_max=1` 无 DFL，强制无 NMS 单正样本头） |
+| **YOLO27n** (官方高精度版) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | 8,400 | 3.201 M | **2.731 M** | **6.98 B** | 16-bin DFL 亚像素回归 + 一对多密集头+NMS高精度推理 + 无损继承 `yolo26n.pt` + P2/P3 加宽 + 前景对齐监督（严格满足官方 ≤3.0M/7.2B 预算） |
+| **YOLO27n-Lite** (双尺度极轻) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **6,800** | 1.160 M | **0.918 M** | **3.84 B** | 算力受限边缘工控机 / 智能线阵相机极限加速 |
 
 ---
 

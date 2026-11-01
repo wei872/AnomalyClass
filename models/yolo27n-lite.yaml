@@ -2,19 +2,19 @@
 # YOLO27n-Lite — Extreme Edge-Lightweight Variant for Fabric Inspection Cameras
 #
 # Retains ALL core YOLO27n innovations (widened early P2/4 stage, dual-scale
-# [P3/8, P5/32] head with fixed feature scaling, DFL-free reg_max=1, and
+# [P3/8, P5/32] head with fixed feature scaling, 16-bin DFL reg_max=16, and
 # training-only Foreground Alignment Supervision), while further compressing
 # deeper stages via separable SCDown downsampling and [0.50, 0.1875, 768] scaling.
 #
 # Complexity @ 640x640 (Fused, nc=19):
-#   - Parameters: ~0.75M (750,665) — 75% fewer params than standard YOLO27n!
-#   - FLOPs:      ~3.0 GFLOPs      — 58% lower compute than standard YOLO27n!
+#   - Parameters: ~0.92M (918,153) — 66% fewer params than standard YOLO27n!
+#   - FLOPs:      ~3.84 GFLOPs     — 45% lower compute than standard YOLO27n!
 # =============================================================================
 
 nc: 19
 scale: n
 end2end: True
-reg_max: 1
+reg_max: 16
 scales:
   n: [0.50, 0.1875, 768]
 

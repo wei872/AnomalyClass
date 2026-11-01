@@ -1,54 +1,49 @@
 # =============================================================================
-# YOLO27n (Nano) — Fabric-Enhanced Lightest Scale
-# Reference: https://docs.ultralytics.com/zh/models/yolo27
+# YOLO27n — Dedicated Nano Configuration for Fabric19 Defect Detection
+# Reference: https://docs.ultralytics.com/models/yolo27
 #
-# Complexity @ 640x640 (Fused, Conv+BN folded, fg_branch & unused head stripped):
-#   - Fabric (nc=19): ~2.62M params | ~6.1 GFLOPs (lighter than official 3.0M / 7.2B)
-#   - COCO (nc=80):   ~2.68M params | ~6.2 GFLOPs
-#
-# Key Advantages over Pure YOLO26n on 19-Class Fabric Defect Detection:
-#   - 100.0% function-preserving warm-start from yolo26n.pt (0.0000 step-0 error!)
-#   - +50% widened P2/4 (96 ch) & +25% widened P3/8 (80 ch) for tiny defects
-#   - Zero-init 1x9 + 9x1 Orthogonal Strip-Context Enhancer for warp/weft defects
-#   - Training-only Foreground Alignment Supervision (stripped at fuse() = 0 deploy cost)
+# Complexity @ 640x640 (Fused, nc=19):
+#   - Parameters: 2.74M (2,735,443)  [Official YOLO27n budget: <= 3.0M]
+#   - FLOPs:      7.00 GFLOPs        [Official YOLO27n budget: <= 7.2B]
+#   - Inference:  One-to-many + NMS default (pass nms=False for E2E one-to-one)
 # =============================================================================
 
 nc: 19
 scale: n
 end2end: True
-reg_max: 1
+reg_max: 16
 scales:
   n: [0.50, 0.25, 1024]
 
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2   -> 16 ch, 320x320
-  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   -> 32 ch, 160x160
-  - [-1, 2, C3k2, [384, False, 0.25]]  # 2-P2/4   -> 96 ch, 160x160 (widened early stage for tiny defects)
-  - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   -> 64 ch, 80x80
-  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   -> 128 ch, 80x80
-  - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  -> 128 ch, 40x40
-  - [-1, 2, C3k2, [512, True]]         # 6-P4/16  -> 128 ch, 40x40
-  - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  -> 256 ch, 20x20
-  - [-1, 2, C3k2, [1024, True]]        # 8-P5/32  -> 256 ch, 20x20
-  - [-1, 1, SPPF, [1024, 5, 3, True]]  # 9-P5/32  -> 256 ch, 20x20
-  - [-1, 2, C2PSA, [1024]]             # 10-P5/32 -> 256 ch, 20x20
+  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2   (320x320)
+  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4   (160x160)
+  - [-1, 2, C3k2, [320, False, 0.25]]  # 2-P2/4   widened high-res stage (80 ch vs YOLO26n's 64 ch)
+  - [-1, 1, Conv, [256, 3, 2]]         # 3-P3/8   (80x80)
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 4-P3/8   small-object feature stage (128 ch)
+  - [-1, 1, Conv, [512, 3, 2]]         # 5-P4/16  (40x40)
+  - [-1, 2, C3k2, [512, True]]         # 6-P4/16  1:1 aligned with yolo26n.pt (128 ch)
+  - [-1, 1, Conv, [1024, 3, 2]]        # 7-P5/32  (20x20)
+  - [-1, 2, C3k2, [1024, True]]        # 8-P5/32  1:1 aligned with yolo26n.pt (256 ch)
+  - [-1, 1, SPPF, [1024, 5, 3, True]]  # 9-P5/32  1:1 aligned with yolo26n.pt (256 ch)
+  - [-1, 2, C2PSA, [1024]]             # 10-P5/32 1:1 aligned with yolo26n.pt (256 ch)
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, Concat, [1]]                  # 12: 256 + 128 = 384 ch (40x40)
-  - [-1, 2, C3k2, [512, True]]                 # 13: 128 ch (40x40)
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, True]]                 # 13: top-down P4 (128 ch)
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, Concat, [1]]                  # 15: 128 + 128 = 256 ch (80x80)
-  - [-1, 2, C3k2, [320, True]]                 # 16: 80 ch (80x80, P3/8-fine widened feature map)
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, C3k2, [288, True]]                 # 16: P3/8-fine prediction map (72 ch vs 64 ch)
 
-  - [-1, 1, Conv, [320, 3, 2]]                 # 17: 80 ch (40x40)
-  - [[-1, 13], 1, Concat, [1]]                 # 18: 80 + 128 = 208 ch (40x40)
-  - [-1, 2, C3k2, [512, True]]                 # 19: 128 ch (40x40, P4/16-medium feature map)
+  - [-1, 1, Conv, [288, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, True]]                 # 19: P4/16-medium prediction map (128 ch)
 
-  - [-1, 1, Conv, [512, 3, 2]]                 # 20: 128 ch (20x20)
-  - [[-1, 10], 1, Concat, [1]]                 # 21: 128 + 256 = 384 ch (20x20)
-  - [-1, 1, C3k2, [1024, True, 0.5, True]]     # 22: 256 ch (20x20, P5/32-coarse feature map)
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]     # 22: P5/32-coarse prediction map (256 ch)
 
-  - [[16, 19, 22], 1, Detect, [nc]]            # 23: YOLO27Detect (+ StripEnhancer + ForegroundAlignmentBranch)
+  - [[16, 19, 22], 1, Detect, [nc]]            # 23: YOLO27Detect(P3/8, P4/16, P5/32)
