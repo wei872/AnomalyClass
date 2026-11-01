@@ -18,8 +18,10 @@ prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from pathlib import Path
 from typing import Any
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -29,6 +31,7 @@ from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.modules import Detect
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import LOGGER, RANK
+from ultralytics.utils.torch_utils import unwrap_model
 
 from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
@@ -186,9 +189,10 @@ class YOLO27Trainer(DetectionTrainer):
         else:
             self._allow_warmstart = raw_pretrained is not False
 
-        # Smooth late-epoch convergence defaults (cosine LR + 15 clean un-mosaicked epochs)
+        # Smooth late-epoch convergence defaults: cosine LR + short 5-epoch close_mosaic tail
+        # (prevents small-dataset memorization/val_cls_loss spike seen when Mosaic closes 10~15 epochs early!)
         overrides.setdefault("cos_lr", True)
-        overrides.setdefault("close_mosaic", 15)
+        overrides.setdefault("close_mosaic", 5)
 
         # Protect training validation from evaluating weaker one2one head across 8.4.33..8.4.197:
         # In 8.4.33, default.yaml has nms=False (export flag) and end2end=None; in >=8.4.194, nms=None.
@@ -199,6 +203,46 @@ class YOLO27Trainer(DetectionTrainer):
 
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
+
+    def _setup_train(self, *args: Any, **kwargs: Any) -> None:
+        """Calibrate ``ModelEMA`` decay/tau and rare-class foreground recall weights for industrial datasets."""
+        super()._setup_train(*args, **kwargs)
+
+        nb = len(self.train_loader) if getattr(self, "train_loader", None) is not None else 0
+        # 1. Fix ModelEMA(tau=2000) single-batch jitter on small/medium datasets (<500 batches/epoch):
+        #    At nb~22 (350 images), stock tau=2000 reaches decay=0.66 (~3 batches!) at epoch 100.
+        if getattr(self, "ema", None) is not None and 0 < nb < 500:
+            decay_max = min(0.9999, 1.0 - 1.0 / max(5 * nb, 100))
+            tau_eff = min(2000, max(3 * nb, 80))
+            self.ema.decay = lambda x, d=decay_max, t=tau_eff: d * (1.0 - math.exp(-x / t))
+            if RANK in {-1, 0}:
+                LOGGER.info(
+                    f"YOLO27Trainer: calibrated ModelEMA for {nb} batches/epoch (decay={decay_max:.4f}, tau={tau_eff})"
+                )
+
+        # 2. Gentle foreground-only recall balancing [1.0, 1.40] for long-tail 10~20-shot defect classes
+        try:
+            labels_list = getattr(getattr(self.train_loader, "dataset", None), "labels", None)
+            nc = int(self.data["nc"])
+            if isinstance(labels_list, list) and len(labels_list) > 0 and nc > 1:
+                cls_arrays = [lb["cls"].reshape(-1) for lb in labels_list if isinstance(lb, dict) and "cls" in lb and len(lb["cls"])]
+                if cls_arrays:
+                    all_cls = np.concatenate(cls_arrays, axis=0).astype(np.int64)
+                    counts = np.bincount(all_cls[all_cls < nc], minlength=nc).astype(np.float32)
+                    nonzero = counts[counts > 0]
+                    if nonzero.size > 0 and float(counts.max() / nonzero.min()) >= 1.8:
+                        pos_w = torch.from_numpy(counts.max() / np.maximum(counts, 1.0)).pow(0.25).clamp(1.0, 1.40)
+                        raw_m = unwrap_model(self.model)
+                        raw_m._pos_class_weights = pos_w
+                        if getattr(raw_m, "criterion", None) is not None:
+                            raw_m.criterion = None
+                        if RANK in {-1, 0}:
+                            LOGGER.info(
+                                f"YOLO27Trainer: enabled tail-class foreground recall weights "
+                                f"(min={pos_w.min().item():.2f}, max={pos_w.max().item():.2f})"
+                            )
+        except Exception as exc:
+            LOGGER.debug(f"YOLO27Trainer: skipped class balance calibration ({exc})")
 
     def build_optimizer(
         self,
@@ -241,8 +285,14 @@ class YOLO27Trainer(DetectionTrainer):
         return data
 
     def _collect_dataset_search_dirs(self) -> list[str]:
-        """Gather dataset directories so ``yolo26n.pt`` stored beside datasets is found automatically."""
+        """Gather dataset & YAML directories so ``yolo26n.pt`` stored beside datasets is found automatically."""
         dirs: list[str] = []
+        raw_data_arg = getattr(self.args, "data", None)
+        if isinstance(raw_data_arg, (str, Path)):
+            try:
+                dirs.append(str(Path(raw_data_arg).resolve().parent))
+            except OSError:
+                pass
         data = getattr(self, "data", None)
         if isinstance(data, dict):
             for k in ("path", "train", "val"):

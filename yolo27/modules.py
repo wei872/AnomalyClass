@@ -3,13 +3,11 @@
 Reference: https://docs.ultralytics.com/zh/models/yolo27
 
 Key architectural elements implemented here:
-    1. DFL-Free High-Precision Regression Head (``reg_max=1``, widened ``c2=32``):
-       Stock ``YOLO26n`` (``reg_max=1``) collapses box head width ``c2`` down to ``16``
-       channels across all scales (``256 -> 16`` at P5), bottlenecking high-IoU edge
-       localization (``AP75..AP95`` / ``mAP50-95``). ``YOLO27Detect`` widens ``c2`` to
-       ``32`` channels (``24`` on ``yolo27n-lite``) while keeping ``reg_max=1`` and
-       ``c3=80``, preserving **exact step-0 Net2Wider equivalence** from ``yolo26n.pt``
-       and unconstrained coordinate span on full-width thin fabric strip defects.
+    1. DFL-Free 1:1 Pretrained Regression Head (``reg_max=1``, ``c2=16``, ``c3=80``):
+       Aligns box head width ``c2=16`` and cls head width ``c3=80`` 1:1 with
+       ``yolo26n.pt`` so P4/P5 box & cls convs transfer 100% exact without injecting
+       random Kaiming filters on few-shot (10~50 instances/class) fabric datasets,
+       while preserving unconstrained coordinate span on full-frame/thin strip defects.
     2. Deterministic Folded Fixed Feature Scaling (Zero EMA/BN Drift):
        Uses purely deterministic fixed cross-scale factors (``(1.0, 1/sqrt(2))`` for
        dual-scale ``[P3, P5]``, ``(1.0, 1.0, 1.0)`` for 3-scale ``[P3, P4, P5]``) with no
@@ -83,11 +81,10 @@ class YOLO27Detect(Detect):
     def __init__(self, nc: int = 80, end2end: bool = True, reg_max: int = 1, ch: tuple = ()) -> None:
         super().__init__(nc=nc, end2end=end2end, reg_max=reg_max, ch=ch)
 
-        # Upgrade cramped 16-ch reg_max=1 box tower to 32-ch (24-ch on lite) for high-IoU mAP50-95;
-        # Net2Wider copies all 16 pretrained yolo26n.pt box channels with exact step-0 equivalence.
+        # Lock c2=16 (when reg_max=1) 1:1 with yolo26n.pt even when ch[0]=80 (where Detect default
+        # ch[0]//4=20 would slice all 18 box convs with random channels on few-shot datasets!).
         if len(ch) > 0:
-            base_c2 = 32 if ch[0] > 64 else 24
-            c2 = max(base_c2, ch[0] // 4, self.reg_max * 4)
+            c2 = max(16, self.reg_max * 4)
             self.c2_width = c2
             self.cv2 = nn.ModuleList(
                 nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
@@ -95,7 +92,7 @@ class YOLO27Detect(Detect):
             if end2end:
                 self.one2one_cv2 = deepcopy(self.cv2)
         else:
-            self.c2_width = 32
+            self.c2_width = 16
 
         # Official YOLO27 inference default: one-to-many + NMS (highest mAP50-95),
         # while keeping dual-head architecture ready for nms=False switching.

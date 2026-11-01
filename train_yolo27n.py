@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--close-mosaic",
         type=int,
-        default=15,
-        help="Final un-mosaicked epochs for tight high-IoU box convergence (mAP50-95)",
+        default=5,
+        help="Final un-mosaicked epochs (5 prevents small-dataset overfitting spike while refining full-frame boxes)",
     )
     parser.add_argument("--project", type=str, default="runs/detect", help="Output root directory")
     parser.add_argument("--name", type=str, default="yolo27n_fabric19", help="Experiment run name")

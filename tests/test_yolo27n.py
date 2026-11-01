@@ -32,12 +32,12 @@ from yolo27 import (
 
 
 def test_yolo27n_footprints_box_tower_and_musgd_guard() -> None:
-    """Verify footprints, widened c2=32 box head, deterministic fixed scaling, and >10k-iter MuSGD protection."""
+    """Verify footprints, 1:1 pretrained c2=16/c3=80 head alignment, fixed scaling, and >10k-iter MuSGD protection."""
     model_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
     head = model_19.model[-1]
     assert isinstance(head, YOLO27Detect)
     assert head.reg_max == 1, f"Expected DFL-free reg_max=1, got {head.reg_max}"
-    assert head.c2_width == 32 and head.cv2[0][0].conv.out_channels == 32
+    assert head.c2_width == 16 and head.cv2[0][0].conv.out_channels == 16
     assert head.cv3[0][0][1].conv.out_channels == 80
     assert head.fg_branch is not None
     assert not hasattr(head, "feat_logit_scale") or getattr(head, "feat_logit_scale") is None
@@ -66,23 +66,23 @@ def test_yolo27n_footprints_box_tower_and_musgd_guard() -> None:
     fused_19 = deepcopy(model_19).eval().fuse(verbose=False)
     params_19 = get_num_params(fused_19) / 1e6
     flops_19 = get_flops(fused_19, imgsz=640)
-    assert 2.45 <= params_19 <= 2.70, f"Expected YOLO27n fused params ~2.57M, got {params_19:.3f}M"
-    assert 5.40 <= flops_19 <= 7.20, f"Expected YOLO27n FLOPs <=7.2B @ nc=19, got {flops_19:.2f}B"
+    assert 2.38 <= params_19 <= 2.60, f"Expected YOLO27n fused params ~2.50M, got {params_19:.3f}M"
+    assert 5.40 <= flops_19 <= 7.00, f"Expected YOLO27n FLOPs <=7.0B @ nc=19, got {flops_19:.2f}B"
     assert fused_19.model[-1].fg_branch is None
     assert fused_19.model[-1].cv2 is not None and fused_19.model[-1].one2one_cv2 is None
 
-    # Verify YOLO27n-Dual (~2.51M fused params, stride [8, 32])
+    # Verify YOLO27n-Dual (~2.45M fused params, stride [8, 32])
     model_dual = YOLO27DetectionModel("models/yolo27n-dual.yaml", nc=19, verbose=False)
     assert model_dual.model[-1].stride.tolist() == [8.0, 32.0]
-    assert model_dual.model[-1].cv2[0][0].conv.out_channels == 32
+    assert model_dual.model[-1].cv2[0][0].conv.out_channels == 16
     fused_dual = deepcopy(model_dual).eval().fuse(verbose=False)
     params_dual = get_num_params(fused_dual) / 1e6
-    assert 2.40 <= params_dual <= 2.65, f"Expected YOLO27n-Dual ~2.51M params, got {params_dual:.3f}M"
+    assert 2.35 <= params_dual <= 2.55, f"Expected YOLO27n-Dual ~2.45M params, got {params_dual:.3f}M"
 
     # Verify YOLO27n-Lite (<0.9M fused params, <3.6B FLOPs)
     model_lite = YOLO27DetectionModel("models/yolo27n-lite.yaml", nc=19, verbose=False)
     assert model_lite.model[-1].stride.tolist() == [8.0, 32.0]
-    assert model_lite.model[-1].cv2[0][0].conv.out_channels == 24
+    assert model_lite.model[-1].cv2[0][0].conv.out_channels == 16
     fused_lite = deepcopy(model_lite).eval().fuse(verbose=False)
     assert get_num_params(fused_lite) / 1e6 < 0.90
     assert get_flops(fused_lite, imgsz=640) < 3.60
@@ -101,10 +101,10 @@ def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
         donor_y26(calib_x)
     donor_y26.eval()
 
-    # 1. nc=80 -> nc=80: exact step-0 equivalence across BOTH one2many and one2one even with c2=32!
+    # 1. nc=80 -> nc=80: >=93% 1:1 pretrained coverage & exact step-0 equivalence across BOTH one2many and one2one!
     target_80 = YOLO27DetectionModel("models/yolo27n.yaml", nc=80, verbose=False).eval()
     stats_80 = transfer_pretrained_weights(donor_y26, target_80, verbose=False)
-    assert stats_80["ratio"] >= 0.88, f"Expected >=88% warm-start coverage @ nc=80 (c2=32), got {stats_80['ratio']:.3f}"
+    assert stats_80["ratio"] >= 0.93, f"Expected >=93% warm-start coverage @ nc=80, got {stats_80['ratio']:.3f}"
     with torch.no_grad():
         _, p_donor = donor_y26(calib_x[:1])
         _, p_target = target_80(calib_x[:1])
@@ -114,7 +114,7 @@ def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
         assert box_diff < 5e-5, f"Step-0 {branch_key} box drift: {box_diff}"
         assert score_diff < 5e-5, f"Step-0 {branch_key} score drift: {score_diff}"
 
-    # 2. nc=80 -> nc=19 (Fabric19): exact step-0 box equivalence vs YOLO26n(nc=19).load(donor)
+    # 2. nc=80 -> nc=19 (Fabric19): >=90% pretrained coverage & exact step-0 box equivalence vs YOLO26n(nc=19)
     y26_19_cfg = deepcopy(donor_y26.yaml)
     y26_19_cfg["nc"] = 19
     ref_y26_19 = DetectionModel(y26_19_cfg, nc=19, verbose=False)
@@ -124,7 +124,7 @@ def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
     target_19 = YOLO27DetectionModel("models/yolo27n.yaml", nc=19, verbose=False)
     orig_cls_bias = target_19.model[-1].cv3[0][-1].bias.detach().clone()
     stats_19 = transfer_pretrained_weights(donor_y26, target_19, verbose=False)
-    assert stats_19["ratio"] >= 0.85, f"Expected >=85% warm-start coverage @ nc=19 (c2=32), got {stats_19['ratio']:.3f}"
+    assert stats_19["ratio"] >= 0.90, f"Expected >=90% warm-start coverage @ nc=19, got {stats_19['ratio']:.3f}"
     assert torch.allclose(orig_cls_bias, target_19.model[-1].cv3[0][-1].bias)
     assert torch.allclose(orig_cls_bias, target_19.model[-1].one2one_cv3[0][-1].bias)
 
@@ -136,7 +136,7 @@ def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
         box_diff_19 = (p_ref19[branch_key]["boxes"] - p_t19[branch_key]["boxes"]).abs().max().item()
         assert box_diff_19 < 5e-5, f"Fabric19 step-0 {branch_key} box drift vs YOLO26n: {box_diff_19}"
 
-    # Confirm step-1 unlocks non-zero gradients on widened backbone, neck, AND widened c2=32 box head!
+    # Confirm step-1 unlocks non-zero gradients on widened backbone & neck stages
     target_19.train()
     target_19.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=100)
     crit = target_19.init_criterion()
@@ -155,7 +155,6 @@ def test_net2wider_exact_step0_equivalence_with_widened_c2() -> None:
             assert target_19.model[2].cv1.conv.weight.grad[16:20].abs().sum().item() > 0
             assert target_19.model[4].cv1.conv.weight.grad[32:64].abs().sum().item() > 0
             assert target_19.model[16].cv1.conv.weight.grad[16:20].abs().sum().item() > 0
-            assert target_19.model[-1].cv2[0][0].conv.weight.grad[16:32].abs().sum().item() > 0
         opt.step()
 
 
@@ -229,13 +228,21 @@ def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
     l_dfl_aniso.backward()
     assert pred_dist_aniso.grad[0, 0, 1].abs().item() > 4.0 * pred_dist_stock.grad[0, 0, 1].abs().item()
 
-    # 2. Verify live FG supervision & legacy 8.4.33 3-tuple compatibility
+    # 2. Verify live FG supervision, tail-class positive-only BCE, & legacy 8.4.33 3-tuple compatibility
     model = YOLO27DetectionModel("models/yolo27n-dual.yaml", nc=19, verbose=False).train()
+    model._pos_class_weights = torch.linspace(1.0, 1.40, steps=19)
     model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
     criterion = model.init_criterion()
     assert isinstance(criterion, YOLO27E2ELoss)
     assert isinstance(criterion.one2many.bbox_loss, YOLO27BboxLoss)
     assert criterion.one2many.assigner.stride_val == 16
+    # Verify negative background BCE is strictly 1.0x while rare-class positive BCE is boosted 1.40x
+    dummy_logits = torch.zeros((1, 2, 19))
+    dummy_targets = torch.zeros((1, 2, 19))
+    dummy_targets[0, 0, 18] = 1.0
+    bce_out = criterion.one2many.bce(dummy_logits, dummy_targets)
+    assert abs(bce_out[0, 1, 18].item() / bce_out[0, 1, 0].item() - 1.0) < 1e-6
+    assert abs(bce_out[0, 0, 18].item() / bce_out[0, 1, 0].item() - 1.40) < 1e-5
 
     imgs = torch.rand(2, 3, 256, 256)
     batch_mixed = {
@@ -378,6 +385,9 @@ def test_deep_donor_discovery_failfast_guard_and_pipeline() -> None:
         )
         assert y27.trainer.model.model[2].cv2.conv.out_channels == 80
         assert y27.trainer.args.cos_lr is True
+        assert y27.trainer.args.close_mosaic == 5
+        # Verify small-dataset ModelEMA calibration (decay at update 100 >> stock tau=2000's 0.048!)
+        assert y27.trainer.ema.decay(100) > 0.65
         shared_slice = y27.trainer.model.model[2].cv1.conv.weight[:16].detach().mean().item()
         assert abs(shared_slice - 0.125) < 0.02, f"Expected Net2Wider warm-start ~0.125, got {shared_slice}"
 

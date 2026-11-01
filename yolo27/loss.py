@@ -30,6 +30,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.loss import BboxLoss, v8DetectionLoss
@@ -46,6 +47,25 @@ def _varifocal_sum(pred_logits: torch.Tensor, gt_quality: torch.Tensor, fg_label
     lbl_f = fg_label.float()
     weight = 0.75 * pred_f.sigmoid().pow(2.0) * (1.0 - lbl_f) + gt_f * lbl_f
     return (F.binary_cross_entropy_with_logits(pred_f, gt_f, reduction="none") * weight).sum()
+
+
+class _ForegroundBalancedBCE(nn.Module):
+    """BCE loss boosting ONLY foreground positive targets on rare tail classes (keeping background at 1.0)."""
+
+    def __init__(self, pos_weights: torch.Tensor | None = None) -> None:
+        super().__init__()
+        if pos_weights is not None:
+            self.register_buffer("pos_weights", pos_weights.detach().float().view(1, 1, -1), persistent=False)
+        else:
+            self.pos_weights = None
+
+    def forward(self, pred_scores: torch.Tensor, target_scores: torch.Tensor) -> torch.Tensor:
+        loss = F.binary_cross_entropy_with_logits(pred_scores, target_scores, reduction="none")
+        if self.pos_weights is not None:
+            w = self.pos_weights.to(device=loss.device, dtype=loss.dtype)
+            pos_mask = (target_scores > 0.0).to(dtype=loss.dtype)
+            loss = loss * (1.0 + (w - 1.0) * pos_mask)
+        return loss
 
 
 class YOLO27BboxLoss(BboxLoss):
@@ -124,7 +144,10 @@ class YOLO27DetectionLoss(v8DetectionLoss):
         else:
             super().__init__(model, tal_topk=tal_topk2 or tal_topk)
 
-        self.bbox_loss = YOLO27BboxLoss(self.reg_max).to(self.device)
+        self.bbox_loss = YOLO27BboxLoss(self.reg_max, edge_gain=0.20).to(self.device)
+        pos_class_weights = getattr(model, "_pos_class_weights", None)
+        if pos_class_weights is not None:
+            self.bce = _ForegroundBalancedBCE(pos_class_weights).to(self.device)
 
         # >=8.4.194 defines self.loss_names & returns dict; <=8.4.33 returns 1D Tensor
         self._returns_dict: bool = hasattr(self, "loss_names")
