@@ -361,10 +361,17 @@ class YOLO27E2ELoss:
         loss_fg = 0.5 * vfl_clean + 0.5 * vfl_pert
 
         # Foreground defect feature cosine alignment: background changes, defect representation stays invariant!
+        # Uses symmetric stop-gradient (SimSiam-style) so neither branch collapses while both clean & perturbed
+        # Backbone+Neck pathways converge onto a background-invariant defect representation.
         if embed is not None and pert_embed is not None and fg_idx[0].numel() > 0:
-            cos_sim = (embed[fg_idx].float() * pert_embed[fg_idx].float()).sum(dim=-1, keepdim=True)
+            z_c = embed[fg_idx].float()
+            z_p = pert_embed[fg_idx].float()
+            cos_c2p = (z_c.detach() * z_p).sum(dim=-1, keepdim=True)
+            cos_p2c = (z_c * z_p.detach()).sum(dim=-1, keepdim=True)
             q_fg = fg_quality[fg_idx].float()
-            loss_invariance = ((1.0 - cos_sim).clamp(min=0.0) * q_fg).sum() / norm.float()
+            loss_invariance = (
+                (0.5 * (1.0 - cos_c2p).clamp(min=0.0) + 0.5 * (1.0 - cos_p2c).clamp(min=0.0)) * q_fg
+            ).sum() / norm.float()
             loss_fg = loss_fg + 0.5 * loss_invariance.to(dtype=loss_fg.dtype)
 
         return loss_fg * self.fg_gain

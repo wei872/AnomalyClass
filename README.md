@@ -27,14 +27,14 @@
 - 调用 `fuse()` 推理或导出时，缩放系数代数折叠进 `cv2`（`Conv2d`）与 `cv3`（`DWConv`）首层卷积核权重中，**部署阶段 0 额外参数、0 额外 FLOPs，融合前后误差 < 1e-4**。
 
 ### 4. 前景对齐辅助监督（背景发生改变，疵点不变，泛化能力增强 —— 训练期启用，推理剥离）
-在 `YOLO27n`、`YOLO27n-Dual`、`YOLO27n-Lite` 三套模型中全面启用**输入层 + 颈部特征层双级“背景改变、疵点不变”前景对齐辅助监督**（`YOLO26n` 无该机制）：
-- **输入图像级：无接缝布面底纹替换与疵点像素严格锁死（[`yolo27/augment.py`](yolo27/augment.py)）**：
-  - 训练期在 `YOLO27Trainer.preprocess_batch` 中将图像分解为多频段零均值纱线底纹残差（`h_fine` + `h_mid`），对背景区域跨样本交换已剔除瑕疵区域的纯净底纹并进行翻转/旋向与对比度调制，同时采用双级 `9×9` 羽化过渡消除边界伪影（**背景发生改变**）；
-  - 真值缺陷框（GT BBox）内部所有像素强制逐比特原样保留（`max_abs_diff == 0`，**疵点不变**），并对全幅纹理类异常（如覆盖率 `≥55%` 的 *纬斜*）自动跳过保护；末期 `close_mosaic=5` 校准轮自动关闭以贴合真实测试分布。
-- **活体颈部特征级：反事实背景扰动前景对齐分支（`ForegroundAlignmentBranch` + `YOLO27E2ELoss`）**：
-  - 基于无状态 `GroupNorm` 轻量编码器（不污染主干/颈部 BN 统计量）在未截断梯度的共享颈部特征上同步计算原始视图与反事实背景风格/空间上下文扰动视图（MixStyle 跨样本均值方差混合 + 背景邻域移位，前景锚点保持锚定）；
-  - 联合监督**双视图 IoU-Varifocal 前景显著性一致性**与**前景锚点 L2 归一化特征余弦不变性损失**（`1 - cos(z_clean, z_pert)`），迫使共享颈部学习对不同批次布匹底纹、织法疏密与光照变化不敏感的纯粹疵点表征（**泛化能力增强**）；
-  - **推理完全剥离**：调用 `model.fuse()`（验证 `.pt`、预测或导出 ONNX/TensorRT）时自动执行 `self.fg_branch = None`，**推理阶段 0 额外参数、0 额外计算量、0 延迟开销**。
+在 `YOLO27n`、`YOLO27n-Dual`、`YOLO27n-Lite` 三套模型中全面启用**端到端配对式“背景发生改变、疵点不变”前景对齐辅助监督**（`YOLO26n` 无该机制）：
+- **配对图像构造：无空洞底纹修补交换 + 真值疵点逐比特锁死（[`yolo27/augment.py`](yolo27/augment.py)）**：
+  - 训练期在 `YOLO27DetectionModel.loss(batch)` 内根据当前批次原图 $I$ 与真值框 $G$ 实时构造配对背景扰动图 $\tilde{I}$：先用同幅布面的平移洁净底纹修补供体图中的缺陷区域（避免跨样本交换引入平坦空白伪影），再交换多频段零均值纱线残差（`h_fine` + `h_mid`）、随机翻转/旋向、调制纹理对比度并叠加平滑环境光照梯度，且采用双级 `9×9` 羽化过渡消除边界阶跃（**背景发生改变**）；
+  - 所有 GT 缺陷框内部像素严格保持逐比特一致（`max_abs_diff == 0`，**疵点不变**），全幅纹理异常（如 `w * h >= 0.55` 的 *纬斜*）自动跳过保护。
+- **双视图共享主干+颈部对齐监督（`YOLO27DetectionModel` + `ForegroundAlignmentBranch` + `YOLO27E2ELoss`）**：
+  - 原图 $I$ 正常前向训练检测头并更新 `BatchNorm` 统计量；配对图 $\tilde{I}$ 在冻结 `BatchNorm` 滑动统计量（`_freeze_bn_running_stats`，确保推理 BN 零漂移）的前提下流经共享 **Backbone + Neck** 与无状态 `GroupNorm` 轻量分支 `ForegroundAlignmentBranch`；
+  - 联合监督 $(I, \tilde{I})$ 双视图的 **IoU-Varifocal 前景显著性一致性** 与正样本锚点 **对称停止梯度余弦特征对齐损失** $\frac{1}{2}(1-\cos(\text{sg}(z^{\text{clean}}), z^{\text{pert}})) + \frac{1}{2}(1-\cos(z^{\text{clean}}, \text{sg}(z^{\text{pert}})))$，将背景不变梯度直接回传至主干与颈部全层卷积核（**泛化能力增强**）；
+  - **推理完全剥离**：调用 `model.fuse()`（验证 `.pt`、预测或导出 ONNX/TensorRT）时自动执行 `self.fg_branch = None` 且不再构造 $\tilde{I}$，**推理阶段 0 额外参数、0 额外 FLOPs、0 延迟开销**。
 
 ---
 

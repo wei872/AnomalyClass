@@ -17,6 +17,7 @@ prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 import math
 from pathlib import Path
@@ -37,6 +38,24 @@ from .augment import apply_defect_invariant_bg_augment
 from .loss import YOLO27DetectionLoss, YOLO27E2ELoss
 from .modules import ForegroundAlignmentBranch, YOLO27Detect
 from .weights import resolve_donor_checkpoint, transfer_pretrained_weights
+
+
+@contextmanager
+def _freeze_bn_running_stats(module: nn.Module):
+    """Freeze BatchNorm running_mean/running_var accumulation during paired counterfactual forward pass."""
+    saved: list[tuple[nn.modules.batchnorm._BatchNorm, float | None, torch.Tensor | None]] = []
+    for m in module.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.track_running_stats:
+            nbt = m.num_batches_tracked.clone() if m.num_batches_tracked is not None else None
+            saved.append((m, m.momentum, nbt))
+            m.momentum = 0.0
+    try:
+        yield
+    finally:
+        for m, old_mom, old_nbt in saved:
+            m.momentum = old_mom
+            if old_nbt is not None and m.num_batches_tracked is not None:
+                m.num_batches_tracked.copy_(old_nbt)
 
 
 def _merge_split_paths(primary: Any, extra: Any) -> list[str]:
@@ -113,10 +132,72 @@ class YOLO27DetectionModel(DetectionModel):
         initialize_weights(self)
         if isinstance(m, YOLO27Detect):
             m.bias_init()
+        self._fg_pair_enabled: bool = True
 
         if verbose:
             self.info()
             LOGGER.info("")
+
+    def _extract_neck_features(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Run Backbone + Neck (excluding terminal Detect head) and return head input feature maps."""
+        y: list[torch.Tensor | None] = []
+        head = self.model[-1]
+        for m in self.model[:-1]:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # type: ignore[assignment]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+        if isinstance(head.f, int):
+            return [x if head.f == -1 else y[head.f]]  # type: ignore[list-item]
+        return [x if j == -1 else y[j] for j in head.f]  # type: ignore[misc]
+
+    def loss(self, batch: dict[str, Any], preds: Any = None):
+        """Compute detection + paired ``(I_clean, I_bg_changed)`` Foreground Alignment loss in training."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        head = self.model[-1]
+        use_fg_branch = (
+            self.training
+            and isinstance(head, YOLO27Detect)
+            and head.fg_branch is not None
+            and isinstance(batch, dict)
+            and isinstance(batch.get("img"), torch.Tensor)
+        )
+
+        if preds is None:
+            if use_fg_branch:
+                head._defer_fg_pert = True
+                try:
+                    preds = self.forward(batch["img"])
+                finally:
+                    head._defer_fg_pert = False
+
+                if (
+                    getattr(self, "_fg_pair_enabled", True)
+                    and isinstance(preds, dict)
+                    and isinstance(preds.get("fg_align"), dict)
+                    and isinstance(batch.get("bboxes"), torch.Tensor)
+                    and isinstance(batch.get("batch_idx"), torch.Tensor)
+                ):
+                    imgs = batch["img"]
+                    img_pert = apply_defect_invariant_bg_augment(
+                        imgs,
+                        batch_idx=batch["batch_idx"],
+                        bboxes=batch["bboxes"],
+                        prob=1.0,
+                    )
+                    if not torch.equal(img_pert, imgs):
+                        with _freeze_bn_running_stats(self):
+                            feats_pert = self._extract_neck_features(img_pert)
+                            x_bal_pert = head._apply_feature_scale(feats_pert)
+                            pert_logits, pert_embed = head.fg_branch.encode(x_bal_pert)
+                        preds["fg_align"]["pert_logits"] = pert_logits
+                        preds["fg_align"]["pert_embed"] = pert_embed
+            else:
+                preds = self.forward(batch["img"])
+
+        return self.criterion(preds, batch)
 
     @property
     def end2end(self) -> bool:
@@ -173,7 +254,7 @@ class YOLO27Trainer(DetectionTrainer):
     _preset_donor_weights: str | None = None
     _preset_allow_warmstart: bool | None = None
     _preset_allow_download: bool = True
-    _preset_bg_augment_prob: float = 0.50
+    _preset_bg_augment_prob: float = 0.0
 
     def __init__(self, cfg=DEFAULT_CFG_DICT, overrides: dict[str, Any] | None = None, _callbacks=None) -> None:
         overrides = dict(overrides or {})
@@ -208,23 +289,20 @@ class YOLO27Trainer(DetectionTrainer):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
 
     def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Preprocess batch and apply defect-invariant cloth background perturbation in training.
-
-        Alters background weave texture, cross-sample cloth grain, and local illumination while
-        preserving every pixel inside ground-truth defect bounding boxes bit-for-bit
-        (``背景发生改变，疵点不变，泛化能力增强``). Automatically turns off during the final
-        ``close_mosaic`` calibration epochs and never runs in validation or inference.
-        """
+        """Preprocess batch and sync paired Foreground Alignment schedule with ``close_mosaic`` tail."""
         batch = super().preprocess_batch(batch)
-        if self._bg_augment_prob <= 0.0:
-            return batch
-        if getattr(self, "model", None) is not None and not getattr(self.model, "training", True):
-            return batch
-
         epoch = int(getattr(self, "epoch", 0) or 0)
         epochs = int(getattr(self, "epochs", 150) or 150)
         close_mosaic = int(getattr(self.args, "close_mosaic", 0) or 0)
-        if close_mosaic > 0 and epochs > close_mosaic and epoch >= epochs - close_mosaic:
+        in_clean_tail = close_mosaic > 0 and epochs > close_mosaic and epoch >= epochs - close_mosaic
+
+        if getattr(self, "model", None) is not None:
+            raw_m = unwrap_model(self.model)
+            raw_m._fg_pair_enabled = not in_clean_tail
+
+        if self._bg_augment_prob <= 0.0 or in_clean_tail:
+            return batch
+        if getattr(self, "model", None) is not None and not getattr(self.model, "training", True):
             return batch
 
         imgs = batch.get("img")
@@ -433,7 +511,7 @@ class YOLO27(YOLO):
         use_normal = bool(train_kwargs.pop("use_normal", False))
         donor_weights = train_kwargs.pop("donor_weights", None)
         allow_download = bool(train_kwargs.pop("allow_download", True))
-        bg_augment_prob = float(train_kwargs.pop("bg_augment_prob", 0.50))
+        bg_augment_prob = float(train_kwargs.pop("bg_augment_prob", 0.0))
 
         is_yaml_start = str(self.overrides.get("model", "")).lower().endswith((".yaml", ".yml")) and not self.ckpt
         raw_pretrained = train_kwargs.get("pretrained", True)

@@ -1,18 +1,19 @@
-"""Training-only Defect-Invariant Background Perturbation (背景改变、疵点不变泛化增强).
+"""Training-only Defect-Invariant Background Perturbation (背景发生改变，疵点不变，泛化能力增强).
 
-Implements seam-free background weave variation during training while strictly preserving
-100% of pixels inside ground-truth defect bounding boxes:
-  - Foreground defect interiors (``fg_exact == 1``) remain bit-for-bit unchanged
-    (``max_abs_diff == 0`` — **疵点不变**).
-  - Surrounding fabric background (``bg_mask = 1 - fg_soft``) undergoes multi-band
-    zero-mean cloth weave texture swapping (from defect-masked cross-sample cloth donors
-    with random orientation flips/rotations) plus weave-contrast modulation (**背景发生改变**).
-  - Zero-mean residual decomposition + smooth two-stage ``9x9`` feather transitions
-    guarantee continuous local luminance across box borders with zero cut-and-paste
-    rectangular halo artifacts.
-  - Full-frame global anomalies (e.g. ``纬斜`` covering ``>= 55%`` of the frame) are
-    automatically excluded so global weave skew angles are never distorted.
-  - Active strictly in training (``YOLO27Trainer.preprocess_batch``); zero inference cost.
+Constructs paired counterfactual cloth images ``img_pert`` from ``(imgs, batch_idx, bboxes)``
+for YOLO27's Foreground Alignment Auxiliary Supervision:
+  - **疵点不变 (Defect Invariant)**: Every pixel inside every Ground-Truth defect bounding box
+    (``fg_exact == 1``) is preserved bit-for-bit (``max_abs_diff == 0.0``).
+  - **背景发生改变 (Background Changed)**:
+      1. Donor defect regions are first hole-filled with spatially shifted clean cloth weave
+         from the same roll so cross-sample weave swapping never introduces flat/blurry
+         ghost-box artifacts.
+      2. Multi-band zero-mean cloth yarn residuals (``h_fine``, ``h_mid``) are swapped across
+         batch samples with random flip/transpose grain orientations, modulated in weave
+         contrast, and paired with a smooth ambient illumination gradient strictly outside
+         the ``17 px`` feathered defect boundary.
+  - **全局纹理保护**: Full-frame global anomalies (e.g. ``纬斜`` with ``w * h >= 0.55``) are
+    automatically excluded so whole-cloth warp/weft skew cues are never distorted.
 """
 
 from __future__ import annotations
@@ -26,25 +27,25 @@ def apply_defect_invariant_bg_augment(
     imgs: torch.Tensor,
     batch_idx: torch.Tensor,
     bboxes: torch.Tensor,
-    prob: float = 0.5,
+    prob: float = 1.0,
     full_frame_area_thr: float = 0.55,
     *,
     p: float | None = None,
 ) -> torch.Tensor:
-    """Perturb fabric background weave while keeping ground-truth defect pixels 100% invariant.
+    """Perturb fabric background weave & lighting while keeping GT defect pixels 100% invariant.
 
     Args:
         imgs: Normalized ``(B, C, H, W)`` float tensor in ``[0, 1]``.
         batch_idx: ``(N_gt,)`` tensor mapping each GT box to sample index ``0 .. B-1``.
         bboxes: ``(N_gt, 4)`` normalized ``[cx, cy, w, h]`` boxes in ``[0, 1]``.
-        prob: Per-image probability of applying background weave perturbation.
+        prob: Per-image probability of applying background perturbation.
         full_frame_area_thr: Skip samples containing a GT box whose normalized area
             ``w * h >= full_frame_area_thr`` (e.g. full-image ``纬斜`` weft skew).
         p: Optional alias for ``prob``.
 
     Returns:
-        Augmented ``(B, C, H, W)`` float tensor in ``[0, 1]`` where pixels inside every
-        perturbed sample's GT defect boxes are strictly identical to ``imgs``.
+        Counterfactual ``(B, C, H, W)`` float tensor in ``[0, 1]`` with altered cloth
+        background and bit-identical pixels inside all GT defect boxes.
     """
     if p is not None:
         prob = float(p)
@@ -84,11 +85,14 @@ def apply_defect_invariant_bg_augment(
             dy2 = min(height, y2 + margin_y)
             fg_dilated[bi, 0, dy1:dy2, dx1:dx2] = 1.0
 
-    apply_mask = (torch.rand(bsz, device=device) < prob) & (~skip_sample)
+    if prob >= 1.0:
+        apply_mask = ~skip_sample
+    else:
+        apply_mask = (torch.rand(bsz, device=device) < prob) & (~skip_sample)
     if not bool(apply_mask.any()):
         return imgs
 
-    # Smooth feather ramp outside the dilated box, while clamping exact GT box interior to 1.0
+    # Two-stage 9x9 feather ramp outside dilated box while clamping exact GT box interior to 1.0
     fg_smooth = F.avg_pool2d(fg_dilated, kernel_size=9, stride=1, padding=4)
     fg_smooth = F.avg_pool2d(fg_smooth, kernel_size=9, stride=1, padding=4)
     fg_mask = torch.maximum(fg_exact, fg_smooth)
@@ -100,15 +104,23 @@ def apply_defect_invariant_bg_augment(
     h_fine = imgs - low_fine
     h_mid = low_fine - low_mid
 
+    # Inpaint donor defect regions with shifted clean cloth weave BEFORE cross-sample swapping
+    # so swapped weave never carries flat zero-texture holes shaped like donor bounding boxes.
     clean_gate = 1.0 - fg_dilated
+    shift_y = max(1, height // 3)
+    shift_x = max(1, width // 3)
+    alt_fine = torch.roll(h_fine, shifts=(shift_y, shift_x), dims=(2, 3))
+    alt_mid = torch.roll(h_mid, shifts=(shift_y, shift_x), dims=(2, 3))
+    alt_gate = torch.roll(clean_gate, shifts=(shift_y, shift_x), dims=(2, 3))
+    pure_fine = torch.where(clean_gate > 0.5, h_fine, torch.where(alt_gate > 0.5, alt_fine, torch.zeros_like(h_fine)))
+    pure_mid = torch.where(clean_gate > 0.5, h_mid, torch.where(alt_gate > 0.5, alt_mid, torch.zeros_like(h_mid)))
+
     if bsz >= 2:
-        donor_fine = torch.roll(h_fine * clean_gate, shifts=1, dims=0)
-        donor_mid = torch.roll(h_mid * clean_gate, shifts=1, dims=0)
+        donor_fine = torch.roll(pure_fine, shifts=1, dims=0)
+        donor_mid = torch.roll(pure_mid, shifts=1, dims=0)
     else:
-        shift_y = max(1, height // 3)
-        shift_x = max(1, width // 3)
-        donor_fine = torch.roll(h_fine * clean_gate, shifts=(shift_y, shift_x), dims=(2, 3))
-        donor_mid = torch.roll(h_mid * clean_gate, shifts=(shift_y, shift_x), dims=(2, 3))
+        donor_fine = torch.roll(pure_fine, shifts=(shift_y, shift_x), dims=(2, 3))
+        donor_mid = torch.roll(pure_mid, shifts=(shift_y, shift_x), dims=(2, 3))
 
     # Randomize donor weave grain orientation so background yarn patterns genuinely diversify
     if bool(torch.rand((), device=device) < 0.5):
@@ -121,15 +133,23 @@ def apply_defect_invariant_bg_augment(
         donor_fine = donor_fine.transpose(2, 3)
         donor_mid = donor_mid.transpose(2, 3)
 
-    alpha = torch.empty((bsz, 1, 1, 1), device=device, dtype=dtype).uniform_(0.35, 0.70)
+    alpha = torch.empty((bsz, 1, 1, 1), device=device, dtype=dtype).uniform_(0.40, 0.75)
     beta = torch.empty((bsz, 1, 1, 1), device=device, dtype=dtype).uniform_(-0.30, 0.35)
+
+    # Smooth ambient LED-bar illumination ramp strictly outside feathered defect boundaries
+    gx = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, width)
+    gy = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(1, 1, height, 1)
+    sx = torch.empty((bsz, 1, 1, 1), device=device, dtype=dtype).uniform_(-0.05, 0.05)
+    sy = torch.empty((bsz, 1, 1, 1), device=device, dtype=dtype).uniform_(-0.05, 0.05)
+    illum_shift = sx * gx + sy * gy
 
     delta_bg = (
         alpha * (donor_fine - h_fine)
         + (0.5 * alpha) * (donor_mid - h_mid)
         + beta * (h_fine + 0.5 * h_mid)
+        + illum_shift
     )
 
     out = (imgs + bg_mask * delta_bg).clamp(0.0, 1.0)
-    # Enforce exact floating-point bit identity inside fg_exact (handles boundary clamp edge cases)
+    # Enforce exact floating-point bit identity inside fg_exact (疵点不变)
     return torch.where(fg_exact > 0.5, imgs, out)

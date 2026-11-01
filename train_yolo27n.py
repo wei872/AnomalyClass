@@ -86,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bg-augment-prob",
         type=float,
-        default=0.50,
-        help="Per-sample probability of defect-invariant cloth background perturbation in training (0.0 disables)",
+        default=0.0,
+        help="Optional extra unpaired input BG augment prob (paired BG-changed FG alignment runs automatically)",
     )
     parser.add_argument("--project", type=str, default="runs/detect", help="Output root directory")
     parser.add_argument("--name", type=str, default="yolo27n_fabric19", help="Experiment run name")

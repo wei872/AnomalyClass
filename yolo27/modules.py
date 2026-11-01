@@ -14,13 +14,13 @@ Key architectural elements implemented here:
        pre-BatchNorm learnable scalar parameters, guaranteeing 100% synchronization
        between ``ModelEMA`` weights and ``BatchNorm2d.running_var`` during validation.
        Folded algebraically into the first head ``Conv`` / ``DWConv`` on ``fuse()``.
-    3. Background-Varied Foreground Alignment Auxiliary Branch (训练期启用，推理剥离):
+    3. Paired Foreground Alignment Auxiliary Branch (训练期启用，推理剥离):
        Enabled across ``YOLO27n``, ``YOLO27n-Dual``, and ``YOLO27n-Lite`` during training
-       and completely stripped (``self.fg_branch = None``) on ``fuse()``. Synthesizes a
-       counterfactual background-style/context-perturbed feature view while keeping
-       defect centers anchored, supervising both clean/perturbed IoU-Varifocal saliency
-       consistency and L2-normalized foreground defect embedding invariance
-       (``背景发生改变，疵点不变，泛化能力增强``).
+       (``YOLO26n``: 无) and completely stripped (``self.fg_branch = None``) on ``fuse()``.
+       Encodes shared Backbone+Neck features from paired ``(I_clean, I_bg_changed)`` views
+       (where cloth background changes while GT defect pixels remain bit-for-bit identical)
+       to supervise both dual-view IoU-Varifocal saliency consistency and L2-normalized
+       foreground defect embedding invariance (``背景发生改变，疵点不变，泛化能力增强``).
     4. Version-Safe Dual-Mode Fusion & Inference (``ultralytics 8.4.33`` .. ``>=8.4.197``):
        Defaults to ``one2many + NMS`` for maximum ``mAP50-95`` while retaining ``one2one``
        for optional ``nms=False`` end-to-end deployment.
@@ -38,13 +38,13 @@ from ultralytics.nn.modules import Conv, Detect
 
 
 class ForegroundAlignmentBranch(nn.Module):
-    """Training-only background-invariant foreground alignment auxiliary branch.
+    """Training-only Foreground Alignment Auxiliary Branch (训练期启用，推理剥离).
 
-    Evaluates shared live neck features under both the original cloth background and a
-    counterfactual cross-sample MixStyle + spatial-context perturbed background while
-    anchoring defect centers. Uses buffer-free ``GroupNorm`` so dual-pass forward never
-    perturbs BatchNorm running statistics or DDP buffer sync, and is completely stripped
-    upon ``fuse()`` for zero inference parameters, FLOPs, or latency.
+    Projects multi-scale Neck features via buffer-free ``GroupNorm`` depthwise-separable
+    encoders into per-anchor foreground saliency logits and FP32-safe L2-normalized
+    16-D defect embeddings. Paired with ``YOLO27DetectionModel.loss()``, aligns Neck
+    representations extracted from ``I_clean`` and background-perturbed ``I_bg_changed``
+    while stripping completely (``fg_branch = None``) upon ``fuse()``.
     """
 
     def __init__(self, ch: tuple[int, ...] | list[int], embed_dim: int = 16) -> None:
@@ -80,9 +80,10 @@ class ForegroundAlignmentBranch(nn.Module):
 
     @staticmethod
     def _perturb_background_features(feat: torch.Tensor, fg_prob_detached: torch.Tensor) -> torch.Tensor:
-        """Perturb background channel style & spatial context while keeping foreground defect centers anchored."""
+        """Fallback feature-level MixStyle background perturbation when no image pair is supplied."""
         bsz = feat.shape[0]
-        fg_gate = fg_prob_detached.clamp(0.0, 1.0)
+        peak = fg_prob_detached.amax(dim=(2, 3), keepdim=True).clamp(min=0.25)
+        fg_gate = (fg_prob_detached / peak).clamp(0.0, 1.0)
         bg_gate = 1.0 - fg_gate
 
         mu = feat.mean(dim=(2, 3), keepdim=True)
@@ -99,42 +100,64 @@ class ForegroundAlignmentBranch(nn.Module):
             mu_alt = mu + shift_j * std
             std_alt = std * scale_j
 
-        ctx_shift = 0.20 * torch.roll((feat - mu) * bg_gate, shifts=(1, 1), dims=(2, 3))
+        ctx_shift = 0.15 * torch.roll((feat - mu) * bg_gate, shifts=(1, 1), dims=(2, 3))
         feat_bg_varied = feat_norm * std_alt + mu_alt + ctx_shift
         return fg_gate * feat + bg_gate * feat_bg_varied
 
-    def forward(self, feats: list[torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Compute clean & background-perturbed foreground logits and L2-normalized embeddings."""
-        bsz = feats[0].shape[0]
-        logits_list: list[torch.Tensor] = []
-        pert_logits_list: list[torch.Tensor] = []
-        embed_list: list[torch.Tensor] = []
-        pert_embed_list: list[torch.Tensor] = []
-
+    def encode_per_level(
+        self, feats: list[torch.Tensor]
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Encode each scale feature map into spatial saliency logits and FP16-safe L2 embeddings."""
+        s_maps: list[torch.Tensor] = []
+        z_maps: list[torch.Tensor] = []
         for enc, sal_conv, emb_proj, feat in zip(self.encoders, self.saliency_convs, self.embed_projs, feats):
-            h_clean = enc(feat)
-            s_clean = sal_conv(h_clean)
-            z_clean = F.normalize(emb_proj(h_clean), dim=1, eps=1e-6)
+            h = enc(feat)
+            s = sal_conv(h)
+            z = F.normalize(emb_proj(h).float(), dim=1, eps=1e-6).to(dtype=h.dtype)
+            s_maps.append(s)
+            z_maps.append(z)
+        return s_maps, z_maps
 
-            if self.training:
-                feat_pert = self._perturb_background_features(feat, s_clean.detach().sigmoid())
-                h_pert = enc(feat_pert)
-                s_pert = sal_conv(h_pert)
-                z_pert = F.normalize(emb_proj(h_pert), dim=1, eps=1e-6)
-            else:
-                s_pert = s_clean
-                z_pert = z_clean
+    def encode(self, feats: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode multi-scale feature maps into flattened ``(B, N_anc, 1)`` logits and ``(B, N_anc, D)`` embeddings."""
+        bsz = feats[0].shape[0]
+        s_maps, z_maps = self.encode_per_level(feats)
+        logits = torch.cat([s.view(bsz, 1, -1) for s in s_maps], dim=2).permute(0, 2, 1)
+        embed = torch.cat([z.view(bsz, self.embed_dim, -1) for z in z_maps], dim=2).permute(0, 2, 1)
+        return logits, embed
 
-            logits_list.append(s_clean.view(bsz, 1, -1))
-            pert_logits_list.append(s_pert.view(bsz, 1, -1))
-            embed_list.append(z_clean.view(bsz, self.embed_dim, -1))
-            pert_embed_list.append(z_pert.view(bsz, self.embed_dim, -1))
+    def forward(
+        self,
+        feats: list[torch.Tensor],
+        pert_feats: list[torch.Tensor] | None = None,
+        clean_only: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Compute clean (and paired/fallback background-perturbed) foreground logits & embeddings."""
+        bsz = feats[0].shape[0]
+        s_clean_maps, z_clean_maps = self.encode_per_level(feats)
+        logits = torch.cat([s.view(bsz, 1, -1) for s in s_clean_maps], dim=2).permute(0, 2, 1)
+        embed = torch.cat([z.view(bsz, self.embed_dim, -1) for z in z_clean_maps], dim=2).permute(0, 2, 1)
+
+        if clean_only:
+            return {"logits": logits, "embed": embed}
+
+        if not self.training:
+            return {"logits": logits, "pert_logits": logits, "embed": embed, "pert_embed": embed}
+
+        if pert_feats is not None:
+            pert_logits, pert_embed = self.encode(pert_feats)
+        else:
+            fallback_pert = [
+                self._perturb_background_features(feat, s_clean.detach().sigmoid())
+                for feat, s_clean in zip(feats, s_clean_maps)
+            ]
+            pert_logits, pert_embed = self.encode(fallback_pert)
 
         return {
-            "logits": torch.cat(logits_list, dim=2).permute(0, 2, 1),
-            "pert_logits": torch.cat(pert_logits_list, dim=2).permute(0, 2, 1),
-            "embed": torch.cat(embed_list, dim=2).permute(0, 2, 1),
-            "pert_embed": torch.cat(pert_embed_list, dim=2).permute(0, 2, 1),
+            "logits": logits,
+            "pert_logits": pert_logits,
+            "embed": embed,
+            "pert_embed": pert_embed,
         }
 
 
@@ -175,6 +198,7 @@ class YOLO27Detect(Detect):
             self.scale_factors = tuple(1.0 for _ in range(self.nl))
 
         self._scale_folded: bool = False
+        self._defer_fg_pert: bool = False
         # Enabled across ALL YOLO27 variants (YOLO27n / YOLO27n-Dual / YOLO27n-Lite) in training;
         # stripped to None on fuse() for zero inference cost.
         self.fg_branch: ForegroundAlignmentBranch | None = ForegroundAlignmentBranch(ch) if len(ch) > 0 else None
@@ -207,7 +231,10 @@ class YOLO27Detect(Detect):
             preds = self.forward_head(x_bal, **self.one2many)
             if self.training:
                 if self.fg_branch is not None:
-                    return {"one2many": preds, "fg_align": self.fg_branch(x_bal)}
+                    return {
+                        "one2many": preds,
+                        "fg_align": self.fg_branch(x_bal, clean_only=self._defer_fg_pert),
+                    }
                 return preds
             y = self._inference(preds)
             return y if self.export else (y, preds)
@@ -218,8 +245,8 @@ class YOLO27Detect(Detect):
             one2one = self.forward_head(x_detach, **self.one2one)
             out: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {"one2many": one2many, "one2one": one2one}
             if self.fg_branch is not None:
-                # Live x_bal (NOT detached!) so background-invariant FG alignment refines shared neck features
-                out["fg_align"] = self.fg_branch(x_bal)
+                # Live x_bal (NOT detached!) so background-invariant FG alignment refines Backbone + Neck
+                out["fg_align"] = self.fg_branch(x_bal, clean_only=self._defer_fg_pert)
             return out
 
         active_head = self.one2one if self.end2end else self.one2many
