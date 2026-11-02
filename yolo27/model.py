@@ -1,18 +1,19 @@
 """YOLO27 high-level model, trainer, and validator interfaces.
 
 Integrates ``YOLO27DetectionModel`` seamlessly into Ultralytics' training, validation,
-prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4.197``:
-    - Upgraded ``YOLO27Detect`` head (``reg_max=1`` unconstrained regression, widened
-      ``c2=32`` box regression tower, deterministic folded scale factors, and training-only
-      ``ForegroundAlignmentBranch``).
+prediction, and export pipelines across both ``ultralytics==8.4.33`` and ``>=8.4.198``:
+    - Upgraded ``YOLO27Detect`` head (``reg_max=1`` unconstrained regression, 1:1 pretrained
+      ``c2=16 / c3=80`` towers, deterministic folded scale factors, and training-only
+      full-channel ``ForegroundAlignmentBranch`` stripped to ``None`` on ``fuse()``).
+    - Active Paired Foreground Alignment Supervision (``fg_bg_prob=1.0`` in training):
+      ``YOLO27Trainer.preprocess_batch`` constructs ``batch['img_bg_pert']`` (cloth weave &
+      lighting changed, GT defect pixels bit-for-bit identical) and ``YOLO27DetectionModel.loss``
+      jointly aligns shared Backbone + Neck + ``one2many`` (``cv2`` box & ``cv3`` cls) outputs.
     - Zero-shock Net2Wider warm-start from ``yolo26n.pt`` / ``yolo26s.pt`` with multi-level
-      Windows/Linux directory & ``SETTINGS`` discovery plus fail-fast guard so training
-      never silently falls back to scratch (``mAP50-95 < 0.60``).
-    - Anti-oscillation fine-tuning defaults: ``cos_lr=True``, ``close_mosaic=15``, and
-      protection against ``optimizer='auto'`` flipping to ``MuSGD(muon=0.2, lr=0.01)`` on
-      offline-augmented datasets with ``>10,000`` iterations.
-    - Full ``ultralytics 8.4.33`` .. ``>=8.4.197`` compatibility for ``model.end2end``
-      setter, ``YOLO27DetectionModel.fuse()``, and ``nms=True/False`` head selection.
+      Windows/Linux directory & ``SETTINGS`` discovery plus fail-fast guard.
+    - Calibrated industrial few-shot defaults: ``cos_lr=True``, ``close_mosaic=5``, adaptive
+      small-dataset ``ModelEMA``, rare-class positive BCE recall balancing, and ``AdamW`` guard
+      against ``MuSGD`` shock above ``10,000`` iterations.
 """
 
 from __future__ import annotations
@@ -152,7 +153,7 @@ class YOLO27DetectionModel(DetectionModel):
         return [x if j == -1 else y[j] for j in head.f]  # type: ignore[misc]
 
     def loss(self, batch: dict[str, Any], preds: Any = None):
-        """Compute detection + paired ``(I_clean, I_bg_changed)`` Foreground Alignment loss in training."""
+        """Compute detection + full-channel paired ``(I_clean, I_bg_changed)`` Foreground Alignment loss."""
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
@@ -172,30 +173,43 @@ class YOLO27DetectionModel(DetectionModel):
                     preds = self.forward(batch["img"])
                 finally:
                     head._defer_fg_pert = False
+            else:
+                preds = self.forward(batch["img"])
 
-                if (
-                    getattr(self, "_fg_pair_enabled", True)
-                    and isinstance(preds, dict)
-                    and isinstance(preds.get("fg_align"), dict)
-                    and isinstance(batch.get("bboxes"), torch.Tensor)
+        if (
+            use_fg_branch
+            and isinstance(preds, dict)
+            and isinstance(preds.get("fg_align"), dict)
+            and isinstance(preds.get("one2many"), dict)
+        ):
+            fg_dict: dict[str, Any] = preds["fg_align"]
+            h_clean_maps: list[torch.Tensor] | None = fg_dict.pop("_h_clean", None)
+            x_bal_clean: list[torch.Tensor] = preds["one2many"]["feats"]
+
+            if getattr(self, "_fg_pair_enabled", True):
+                imgs = batch["img"]
+                img_pert = batch.get("img_bg_pert")
+                if not isinstance(img_pert, torch.Tensor) and (
+                    isinstance(batch.get("bboxes"), torch.Tensor)
                     and isinstance(batch.get("batch_idx"), torch.Tensor)
                 ):
-                    imgs = batch["img"]
                     img_pert = apply_defect_invariant_bg_augment(
                         imgs,
                         batch_idx=batch["batch_idx"],
                         bboxes=batch["bboxes"],
                         prob=1.0,
                     )
-                    if not torch.equal(img_pert, imgs):
-                        with _freeze_bn_running_stats(self):
-                            feats_pert = self._extract_neck_features(img_pert)
-                            x_bal_pert = head._apply_feature_scale(feats_pert)
-                            pert_logits, pert_embed = head.fg_branch.encode(x_bal_pert)
-                        preds["fg_align"]["pert_logits"] = pert_logits
-                        preds["fg_align"]["pert_embed"] = pert_embed
-            else:
-                preds = self.forward(batch["img"])
+
+                if isinstance(img_pert, torch.Tensor) and not torch.equal(img_pert, imgs):
+                    if h_clean_maps is None:
+                        h_clean_maps, _ = head.fg_branch.encode_maps(x_bal_clean)
+                    with _freeze_bn_running_stats(self):
+                        feats_pert = self._extract_neck_features(img_pert)
+                        x_bal_pert = head._apply_feature_scale(feats_pert)
+                        paired_fg = head.fg_branch.align_paired(x_bal_clean, h_clean_maps, x_bal_pert)
+                        o2m_pert = head.forward_head(x_bal_pert, **head.one2many)
+                    fg_dict.update(paired_fg)
+                    fg_dict["o2m_pert"] = o2m_pert
 
         return self.criterion(preds, batch)
 
@@ -206,7 +220,7 @@ class YOLO27DetectionModel(DetectionModel):
 
     @end2end.setter
     def end2end(self, value: bool) -> None:
-        """Toggle active inference head across both Ultralytics 8.4.33 (no base setter) and >=8.4.197."""
+        """Toggle active inference head across both Ultralytics 8.4.33 (no base setter) and >=8.4.198."""
         if isinstance(self.model[-1], Detect):
             self.model[-1].end2end = bool(value)
 
@@ -248,20 +262,21 @@ class YOLO27Validator(DetectionValidator):
 
 
 class YOLO27Trainer(DetectionTrainer):
-    """Trainer building ``YOLO27DetectionModel`` with guaranteed Net2Wider warm-start and smooth cosine convergence."""
+    """Trainer building ``YOLO27DetectionModel`` with paired FG alignment, Net2Wider warm-start, and smooth EMA."""
 
     _preset_use_normal: bool = False
     _preset_donor_weights: str | None = None
     _preset_allow_warmstart: bool | None = None
     _preset_allow_download: bool = True
-    _preset_bg_augment_prob: float = 0.0
+    _preset_fg_bg_prob: float = 1.0
 
     def __init__(self, cfg=DEFAULT_CFG_DICT, overrides: dict[str, Any] | None = None, _callbacks=None) -> None:
         overrides = dict(overrides or {})
         self._use_normal: bool = bool(overrides.pop("use_normal", self._preset_use_normal))
         self._donor_weights: str | None = overrides.pop("donor_weights", self._preset_donor_weights)
         self._allow_download: bool = bool(overrides.pop("allow_download", self._preset_allow_download))
-        self._bg_augment_prob: float = float(overrides.pop("bg_augment_prob", self._preset_bg_augment_prob))
+        raw_fg_prob = overrides.pop("fg_bg_prob", overrides.pop("bg_augment_prob", self._preset_fg_bg_prob))
+        self._fg_bg_prob: float = float(raw_fg_prob)
 
         raw_pretrained = overrides.get("pretrained", True)
         if isinstance(raw_pretrained, (str, Path)) and self._donor_weights is None:
@@ -274,12 +289,10 @@ class YOLO27Trainer(DetectionTrainer):
             self._allow_warmstart = raw_pretrained is not False
 
         # Smooth late-epoch convergence defaults: cosine LR + short 5-epoch close_mosaic tail
-        # (prevents small-dataset memorization/val_cls_loss spike seen when Mosaic closes 10~15 epochs early!)
         overrides.setdefault("cos_lr", True)
         overrides.setdefault("close_mosaic", 5)
 
-        # Protect training validation from evaluating weaker one2one head across 8.4.33..8.4.197:
-        # In 8.4.33, default.yaml has nms=False (export flag) and end2end=None; in >=8.4.194, nms=None.
+        # Protect training validation from evaluating weaker one2one head across 8.4.33..8.4.198
         if "end2end" in DEFAULT_CFG_DICT:
             overrides.setdefault("end2end", False)
         elif "nms" in DEFAULT_CFG_DICT:
@@ -289,31 +302,40 @@ class YOLO27Trainer(DetectionTrainer):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss", "fg_loss"
 
     def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Preprocess batch and sync paired Foreground Alignment schedule with ``close_mosaic`` tail."""
+        """Preprocess batch and actively construct paired ``batch['img_bg_pert']`` (背景发生改变，疵点不变).
+
+        Enabled by default (``_fg_bg_prob = 1.0``) for all YOLO27 variants during training epochs
+        prior to the final ``close_mosaic`` calibration window; skipped in validation/inference.
+        """
         batch = super().preprocess_batch(batch)
         epoch = int(getattr(self, "epoch", 0) or 0)
         epochs = int(getattr(self, "epochs", 150) or 150)
         close_mosaic = int(getattr(self.args, "close_mosaic", 0) or 0)
         in_clean_tail = close_mosaic > 0 and epochs > close_mosaic and epoch >= epochs - close_mosaic
 
-        if getattr(self, "model", None) is not None:
-            raw_m = unwrap_model(self.model)
-            raw_m._fg_pair_enabled = not in_clean_tail
+        raw_m = unwrap_model(self.model) if getattr(self, "model", None) is not None else None
+        is_training = getattr(raw_m, "training", True) if raw_m is not None else True
+        has_fg_branch = (
+            raw_m is None
+            or not hasattr(raw_m, "model")
+            or getattr(raw_m.model[-1], "fg_branch", None) is not None
+        )
+        pair_active = is_training and has_fg_branch and (not in_clean_tail) and (self._fg_bg_prob > 0.0)
+        if raw_m is not None:
+            raw_m._fg_pair_enabled = pair_active
 
-        if self._bg_augment_prob <= 0.0 or in_clean_tail:
-            return batch
-        if getattr(self, "model", None) is not None and not getattr(self.model, "training", True):
+        if not pair_active:
             return batch
 
         imgs = batch.get("img")
         bboxes = batch.get("bboxes")
         batch_idx = batch.get("batch_idx")
         if isinstance(imgs, torch.Tensor) and isinstance(bboxes, torch.Tensor) and isinstance(batch_idx, torch.Tensor):
-            batch["img"] = apply_defect_invariant_bg_augment(
+            batch["img_bg_pert"] = apply_defect_invariant_bg_augment(
                 imgs,
                 batch_idx=batch_idx,
                 bboxes=bboxes,
-                prob=self._bg_augment_prob,
+                prob=self._fg_bg_prob,
             )
         return batch
 
@@ -338,7 +360,11 @@ class YOLO27Trainer(DetectionTrainer):
             labels_list = getattr(getattr(self.train_loader, "dataset", None), "labels", None)
             nc = int(self.data["nc"])
             if isinstance(labels_list, list) and len(labels_list) > 0 and nc > 1:
-                cls_arrays = [lb["cls"].reshape(-1) for lb in labels_list if isinstance(lb, dict) and "cls" in lb and len(lb["cls"])]
+                cls_arrays = [
+                    lb["cls"].reshape(-1)
+                    for lb in labels_list
+                    if isinstance(lb, dict) and "cls" in lb and len(lb["cls"])
+                ]
                 if cls_arrays:
                     all_cls = np.concatenate(cls_arrays, axis=0).astype(np.int64)
                     counts = np.bincount(all_cls[all_cls < nc], minlength=nc).astype(np.float32)
@@ -366,15 +392,7 @@ class YOLO27Trainer(DetectionTrainer):
         decay: float = 1e-5,
         iterations: float = 1e5,
     ):
-        """Prevent ``optimizer='auto'`` from switching to ``MuSGD(muon=0.2, lr=0.01)`` on Net2Wider warm-start.
-
-        When ``iterations > 10,000`` (common on 5x offline-augmented fabric datasets at 150 epochs),
-        Ultralytics' ``auto`` mode switches from ``AdamW`` to ``MuSGD(lr=0.01, lr_cv3=0.03)``, whose
-        Newton-Schulz orthogonalization amplifies tiny gradients on Net2Wider zero-padded blocks to unit
-        singular values and causes late-epoch curve oscillation. Clamping ``auto`` iteration heuristic
-        selects Ultralytics' calibrated ``AdamW(lr = 0.002 * 5 / (4 + nc))`` cleanly while respecting any
-        explicit ``optimizer`` choice (``SGD``, ``MuSGD``, ``AdamW``, etc.).
-        """
+        """Prevent ``optimizer='auto'`` from switching to ``MuSGD(muon=0.2, lr=0.01)`` on Net2Wider warm-start."""
         eff_iterations = min(iterations, 9000) if (name == "auto" and self._allow_warmstart) else iterations
         return super().build_optimizer(
             model=model,
@@ -469,7 +487,7 @@ def _translate_nms_kwarg(
     model: nn.Module | None,
     default_nms: bool | None = True,
 ) -> dict[str, Any]:
-    """Translate ``nms=True/False/None`` cleanly across Ultralytics 8.4.33 and >=8.4.197."""
+    """Translate ``nms=True/False/None`` cleanly across Ultralytics 8.4.33 and >=8.4.198."""
     out = dict(kwargs)
     nms_flag = out.pop("nms", default_nms)
     use_end2end = nms_flag is False
@@ -511,7 +529,7 @@ class YOLO27(YOLO):
         use_normal = bool(train_kwargs.pop("use_normal", False))
         donor_weights = train_kwargs.pop("donor_weights", None)
         allow_download = bool(train_kwargs.pop("allow_download", True))
-        bg_augment_prob = float(train_kwargs.pop("bg_augment_prob", 0.0))
+        fg_bg_prob = float(train_kwargs.pop("fg_bg_prob", train_kwargs.pop("bg_augment_prob", 1.0)))
 
         is_yaml_start = str(self.overrides.get("model", "")).lower().endswith((".yaml", ".yml")) and not self.ckpt
         raw_pretrained = train_kwargs.get("pretrained", True)
@@ -532,7 +550,7 @@ class YOLO27(YOLO):
             _preset_donor_weights = str(donor_weights) if donor_weights is not None else None
             _preset_allow_warmstart = allow_warmstart
             _preset_allow_download = allow_download
-            _preset_bg_augment_prob = bg_augment_prob
+            _preset_fg_bg_prob = fg_bg_prob
 
         return super().train(trainer=_BoundYOLO27Trainer, **train_kwargs)
 

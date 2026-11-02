@@ -84,10 +84,12 @@ def parse_args() -> argparse.Namespace:
         help="Final un-mosaicked epochs (5 prevents small-dataset overfitting spike while refining full-frame boxes)",
     )
     parser.add_argument(
+        "--fg-bg-prob",
         "--bg-augment-prob",
+        dest="fg_bg_prob",
         type=float,
-        default=0.0,
-        help="Optional extra unpaired input BG augment prob (paired BG-changed FG alignment runs automatically)",
+        default=1.0,
+        help="Probability of paired defect-invariant cloth background perturbation in training (default: 1.0, active)",
     )
     parser.add_argument("--project", type=str, default="runs/detect", help="Output root directory")
     parser.add_argument("--name", type=str, default="yolo27n_fabric19", help="Experiment run name")
@@ -201,7 +203,7 @@ def main() -> None:
             "optimizer": args.optimizer,
             "cos_lr": True,
             "close_mosaic": args.close_mosaic,
-            "bg_augment_prob": args.bg_augment_prob,
+            "fg_bg_prob": args.fg_bg_prob,
             "project": args.project,
             "name": args.name,
             "use_normal": args.use_normal,

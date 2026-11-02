@@ -14,14 +14,12 @@ Key architectural elements implemented here:
        pre-BatchNorm learnable scalar parameters, guaranteeing 100% synchronization
        between ``ModelEMA`` weights and ``BatchNorm2d.running_var`` during validation.
        Folded algebraically into the first head ``Conv`` / ``DWConv`` on ``fuse()``.
-    3. Paired Foreground Alignment Auxiliary Branch (训练期启用，推理剥离):
+    3. Full-Channel Paired Foreground Alignment Auxiliary Branch (训练期启用，推理剥离):
        Enabled across ``YOLO27n``, ``YOLO27n-Dual``, and ``YOLO27n-Lite`` during training
        (``YOLO26n``: 无) and completely stripped (``self.fg_branch = None``) on ``fuse()``.
-       Encodes shared Backbone+Neck features from paired ``(I_clean, I_bg_changed)`` views
-       (where cloth background changes while GT defect pixels remain bit-for-bit identical)
-       to supervise both dual-view IoU-Varifocal saliency consistency and L2-normalized
-       foreground defect embedding invariance (``背景发生改变，疵点不变，泛化能力增强``).
-    4. Version-Safe Dual-Mode Fusion & Inference (``ultralytics 8.4.33`` .. ``>=8.4.197``):
+       Jointly aligns ALL multi-scale Neck channels (``80/128/256``, zero nullspace) and
+       foreground saliency between ``I_clean`` and ``I_bg_changed`` (``背景发生改变，疵点不变，泛化能力增强``).
+    4. Version-Safe Dual-Mode Fusion & Inference (``ultralytics 8.4.33`` .. ``>=8.4.198``):
        Defaults to ``one2many + NMS`` for maximum ``mAP50-95`` while retaining ``one2one``
        for optional ``nms=False`` end-to-end deployment.
 """
@@ -37,22 +35,30 @@ import torch.nn.functional as F
 from ultralytics.nn.modules import Conv, Detect
 
 
-class ForegroundAlignmentBranch(nn.Module):
-    """Training-only Foreground Alignment Auxiliary Branch (训练期启用，推理剥离).
+def _sym_cosine_dist_map(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Compute per-anchor FP32-safe symmetric stop-grad cosine distance ``(B, 1, H*W)`` across ALL channels."""
+    bsz = a.shape[0]
+    za = F.normalize(a.float(), dim=1, eps=1e-6)
+    zb = F.normalize(b.float(), dim=1, eps=1e-6)
+    cos_a2b = (za.detach() * zb).sum(dim=1, keepdim=True).view(bsz, 1, -1)
+    cos_b2a = (za * zb.detach()).sum(dim=1, keepdim=True).view(bsz, 1, -1)
+    dist = 0.5 * (1.0 - cos_a2b).clamp(min=0.0) + 0.5 * (1.0 - cos_b2a).clamp(min=0.0)
+    return dist.to(dtype=a.dtype)
 
-    Projects multi-scale Neck features via buffer-free ``GroupNorm`` depthwise-separable
-    encoders into per-anchor foreground saliency logits and FP32-safe L2-normalized
-    16-D defect embeddings. Paired with ``YOLO27DetectionModel.loss()``, aligns Neck
-    representations extracted from ``I_clean`` and background-perturbed ``I_bg_changed``
-    while stripping completely (``fg_branch = None``) upon ``fuse()``.
+
+class ForegroundAlignmentBranch(nn.Module):
+    """Training-only Full-Channel Foreground Alignment Auxiliary Branch (训练期启用，推理剥离).
+
+    Uses buffer-free ``GroupNorm`` depthwise-separable encoders to predict foreground
+    saliency logits and full-channel per-anchor feature invariance distances across all
+    scales ``[P3, (P4), P5]`` without any low-dimensional bottleneck nullspace. Stripped
+    to ``None`` upon ``fuse()`` for zero inference parameters, FLOPs, or latency.
     """
 
-    def __init__(self, ch: tuple[int, ...] | list[int], embed_dim: int = 16) -> None:
+    def __init__(self, ch: tuple[int, ...] | list[int]) -> None:
         super().__init__()
-        self.embed_dim = int(embed_dim)
         self.encoders = nn.ModuleList()
         self.saliency_convs = nn.ModuleList()
-        self.embed_projs = nn.ModuleList()
 
         for c in ch:
             mid = max(c // 2, 16)
@@ -69,7 +75,6 @@ class ForegroundAlignmentBranch(nn.Module):
                 )
             )
             self.saliency_convs.append(nn.Conv2d(mid, 1, kernel_size=1))
-            self.embed_projs.append(nn.Conv2d(mid, self.embed_dim, kernel_size=1, bias=False))
 
     def bias_init(self, prior_prob: float = 0.01) -> None:
         """Initialize foreground saliency logit bias with a focal-style prior probability."""
@@ -80,7 +85,7 @@ class ForegroundAlignmentBranch(nn.Module):
 
     @staticmethod
     def _perturb_background_features(feat: torch.Tensor, fg_prob_detached: torch.Tensor) -> torch.Tensor:
-        """Fallback feature-level MixStyle background perturbation when no image pair is supplied."""
+        """Fallback feature-level MixStyle background perturbation when called without an image pair."""
         bsz = feat.shape[0]
         peak = fg_prob_detached.amax(dim=(2, 3), keepdim=True).clamp(min=0.25)
         fg_gate = (fg_prob_detached / peak).clamp(0.0, 1.0)
@@ -104,60 +109,68 @@ class ForegroundAlignmentBranch(nn.Module):
         feat_bg_varied = feat_norm * std_alt + mu_alt + ctx_shift
         return fg_gate * feat + bg_gate * feat_bg_varied
 
-    def encode_per_level(
-        self, feats: list[torch.Tensor]
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Encode each scale feature map into spatial saliency logits and FP16-safe L2 embeddings."""
+    def encode_maps(self, feats: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Encode each scale feature map into encoded feature maps ``h_maps`` and saliency maps ``s_maps``."""
+        h_maps: list[torch.Tensor] = []
         s_maps: list[torch.Tensor] = []
-        z_maps: list[torch.Tensor] = []
-        for enc, sal_conv, emb_proj, feat in zip(self.encoders, self.saliency_convs, self.embed_projs, feats):
+        for enc, sal_conv, feat in zip(self.encoders, self.saliency_convs, feats):
             h = enc(feat)
             s = sal_conv(h)
-            z = F.normalize(emb_proj(h).float(), dim=1, eps=1e-6).to(dtype=h.dtype)
+            h_maps.append(h)
             s_maps.append(s)
-            z_maps.append(z)
-        return s_maps, z_maps
+        return h_maps, s_maps
 
-    def encode(self, feats: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode multi-scale feature maps into flattened ``(B, N_anc, 1)`` logits and ``(B, N_anc, D)`` embeddings."""
-        bsz = feats[0].shape[0]
-        s_maps, z_maps = self.encode_per_level(feats)
-        logits = torch.cat([s.view(bsz, 1, -1) for s in s_maps], dim=2).permute(0, 2, 1)
-        embed = torch.cat([z.view(bsz, self.embed_dim, -1) for z in z_maps], dim=2).permute(0, 2, 1)
-        return logits, embed
+    def align_paired(
+        self,
+        feats_clean: list[torch.Tensor],
+        h_clean_maps: list[torch.Tensor],
+        feats_pert: list[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Align clean & background-changed views across ALL raw Neck channels and FG-encoded channels."""
+        bsz = feats_pert[0].shape[0]
+        h_pert_maps, s_pert_maps = self.encode_maps(feats_pert)
+        pert_logits = torch.cat([s.view(bsz, 1, -1) for s in s_pert_maps], dim=2).permute(0, 2, 1)
+
+        inv_dists: list[torch.Tensor] = []
+        for fc, fp, hc, hp in zip(feats_clean, feats_pert, h_clean_maps, h_pert_maps):
+            # 50% direct full-channel raw Neck alignment (all 80/128/256 ch entering cv2/cv3!)
+            # + 50% 3x3 spatial foreground-encoded alignment
+            d_raw = _sym_cosine_dist_map(fc, fp)
+            d_enc = _sym_cosine_dist_map(hc, hp)
+            inv_dists.append(0.5 * d_raw + 0.5 * d_enc)
+
+        inv_dist = torch.cat(inv_dists, dim=2).permute(0, 2, 1)
+        return {"pert_logits": pert_logits, "inv_dist": inv_dist}
 
     def forward(
         self,
         feats: list[torch.Tensor],
         pert_feats: list[torch.Tensor] | None = None,
         clean_only: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """Compute clean (and paired/fallback background-perturbed) foreground logits & embeddings."""
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        """Compute clean foreground saliency and paired/fallback full-channel background-invariance outputs."""
         bsz = feats[0].shape[0]
-        s_clean_maps, z_clean_maps = self.encode_per_level(feats)
+        h_clean_maps, s_clean_maps = self.encode_maps(feats)
         logits = torch.cat([s.view(bsz, 1, -1) for s in s_clean_maps], dim=2).permute(0, 2, 1)
-        embed = torch.cat([z.view(bsz, self.embed_dim, -1) for z in z_clean_maps], dim=2).permute(0, 2, 1)
 
         if clean_only:
-            return {"logits": logits, "embed": embed}
+            return {"logits": logits, "_h_clean": h_clean_maps}
 
         if not self.training:
-            return {"logits": logits, "pert_logits": logits, "embed": embed, "pert_embed": embed}
+            zeros = torch.zeros_like(logits)
+            return {"logits": logits, "pert_logits": logits, "inv_dist": zeros}
 
-        if pert_feats is not None:
-            pert_logits, pert_embed = self.encode(pert_feats)
-        else:
-            fallback_pert = [
+        if pert_feats is None:
+            pert_feats = [
                 self._perturb_background_features(feat, s_clean.detach().sigmoid())
                 for feat, s_clean in zip(feats, s_clean_maps)
             ]
-            pert_logits, pert_embed = self.encode(fallback_pert)
 
+        paired = self.align_paired(feats, h_clean_maps, pert_feats)
         return {
             "logits": logits,
-            "pert_logits": pert_logits,
-            "embed": embed,
-            "pert_embed": pert_embed,
+            "pert_logits": paired["pert_logits"],
+            "inv_dist": paired["inv_dist"],
         }
 
 
@@ -243,7 +256,7 @@ class YOLO27Detect(Detect):
             one2many = self.forward_head(x_bal, **self.one2many)
             x_detach = [xi.detach() for xi in x_bal]
             one2one = self.forward_head(x_detach, **self.one2one)
-            out: dict[str, torch.Tensor | dict[str, torch.Tensor]] = {"one2many": one2many, "one2one": one2one}
+            out: dict[str, Any] = {"one2many": one2many, "one2one": one2one}
             if self.fg_branch is not None:
                 # Live x_bal (NOT detached!) so background-invariant FG alignment refines Backbone + Neck
                 out["fg_align"] = self.fg_branch(x_bal, clean_only=self._defer_fg_pert)

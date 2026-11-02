@@ -31,10 +31,10 @@
 - **配对图像构造：无空洞底纹修补交换 + 真值疵点逐比特锁死（[`yolo27/augment.py`](yolo27/augment.py)）**：
   - 训练期在 `YOLO27DetectionModel.loss(batch)` 内根据当前批次原图 $I$ 与真值框 $G$ 实时构造配对背景扰动图 $\tilde{I}$：先用同幅布面的平移洁净底纹修补供体图中的缺陷区域（避免跨样本交换引入平坦空白伪影），再交换多频段零均值纱线残差（`h_fine` + `h_mid`）、随机翻转/旋向、调制纹理对比度并叠加平滑环境光照梯度，且采用双级 `9×9` 羽化过渡消除边界阶跃（**背景发生改变**）；
   - 所有 GT 缺陷框内部像素严格保持逐比特一致（`max_abs_diff == 0`，**疵点不变**），全幅纹理异常（如 `w * h >= 0.55` 的 *纬斜*）自动跳过保护。
-- **双视图共享主干+颈部对齐监督（`YOLO27DetectionModel` + `ForegroundAlignmentBranch` + `YOLO27E2ELoss`）**：
-  - 原图 $I$ 正常前向训练检测头并更新 `BatchNorm` 统计量；配对图 $\tilde{I}$ 在冻结 `BatchNorm` 滑动统计量（`_freeze_bn_running_stats`，确保推理 BN 零漂移）的前提下流经共享 **Backbone + Neck** 与无状态 `GroupNorm` 轻量分支 `ForegroundAlignmentBranch`；
-  - 联合监督 $(I, \tilde{I})$ 双视图的 **IoU-Varifocal 前景显著性一致性** 与正样本锚点 **对称停止梯度余弦特征对齐损失** $\frac{1}{2}(1-\cos(\text{sg}(z^{\text{clean}}), z^{\text{pert}})) + \frac{1}{2}(1-\cos(z^{\text{clean}}, \text{sg}(z^{\text{pert}})))$，将背景不变梯度直接回传至主干与颈部全层卷积核（**泛化能力增强**）；
-  - **推理完全剥离**：调用 `model.fuse()`（验证 `.pt`、预测或导出 ONNX/TensorRT）时自动执行 `self.fg_branch = None` 且不再构造 $\tilde{I}$，**推理阶段 0 额外参数、0 额外 FLOPs、0 延迟开销**。
+- **全通道主干+颈部+检测头四重对齐监督（`YOLO27DetectionModel` + `ForegroundAlignmentBranch` + `YOLO27E2ELoss`）**：
+  - `YOLO27Trainer.preprocess_batch` 默认启用（`_preset_fg_bg_prob = 1.0`）实时构造配对背景扰动图 `batch["img_bg_pert"]`；原图 $I$ 正常前向训练检测头并更新 `BatchNorm` 统计量，配对图 $\tilde{I}$ 在冻结 `BatchNorm` 滑动统计量（`_freeze_bn_running_stats`）的前提下流经共享 **Backbone + Neck + `ForegroundAlignmentBranch` + `one2many` 头**；
+  - 联合监督：① 双视图 **IoU-Varifocal 前景显著性一致性**；② **全通道（`80/128/256 ch` 零低维瓶颈零空间）原始颈部 + 前景编码特征对称余弦对齐**；③ `cv3` 19 类**焦点加权二元 KL 概率不变性**（防漏检同时压制新底纹虚警）；④ `cv2` 正样本锚点 **CIoU 边界框回归不变性**，让推理保留的全部网络层均具备跨底纹泛化能力（**泛化能力增强**）；
+  - **推理完全剥离**：调用 `model.fuse()`（验证 `.pt`、预测或导出 ONNX/TensorRT）时自动执行 `self.fg_branch = None` 且不再构造 `img_bg_pert`，**推理阶段 0 额外参数、0 额外 FLOPs、0 延迟开销**。
 
 ---
 
@@ -43,9 +43,9 @@
 | 模型变体 | 配置文件 | 预测尺度 (Stride) | 前景对齐辅助监督 | 训练态参数量 | 推理融合后参数量 | 融合后 FLOPs | 特点与适用场景 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
 | **YOLO26n** (基准) | `yolo26n.yaml` | `[8, 16, 32]` | 无 | 2.511 M | 2.379 M | 5.33 B | 原生前代基准 |
-| **YOLO27n** (推荐默认) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | **有（训练期启用，推理剥离）** | 2.697 M | **2.491 M** | **6.55 B** | 参数贴近 YOLO26n（仅 `+0.11M`），跨底纹泛化与小目标/细长条精度最高 |
-| **YOLO27n-Dual** (双尺度版) | [`models/yolo27n-dual.yaml`](models/yolo27n-dual.yaml) | `[8, 32]` | **有（训练期启用，推理剥离）** | 2.603 M | **2.450 M** | **6.42 B** | 官方 YOLO27 双尺度头，参数与 YOLO26n 几乎一致 |
-| **YOLO27n-Lite** (极轻版) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **有（训练期启用，推理剥离）** | 0.861 M | **0.776 M** | **3.29 B** | 工业边缘相机极限高帧率部署，兼备背景不变泛化训练 |
+| **YOLO27n** (推荐默认) | [`models/yolo27n.yaml`](models/yolo27n.yaml) | `[8, 16, 32]` | **有（训练期启用，推理剥离）** | 2.694 M | **2.491 M** | **6.55 B** | 参数贴近 YOLO26n（仅 `+0.11M`），跨底纹泛化与小目标/细长条精度最高 |
+| **YOLO27n-Dual** (双尺度版) | [`models/yolo27n-dual.yaml`](models/yolo27n-dual.yaml) | `[8, 32]` | **有（训练期启用，推理剥离）** | 2.601 M | **2.450 M** | **6.42 B** | 官方 YOLO27 双尺度头，参数与 YOLO26n 几乎一致 |
+| **YOLO27n-Lite** (极轻版) | [`models/yolo27n-lite.yaml`](models/yolo27n-lite.yaml) | `[8, 32]` | **有（训练期启用，推理剥离）** | 0.860 M | **0.776 M** | **3.29 B** | 工业边缘相机极限高帧率部署，兼备背景不变泛化训练 |
 
 ---
 

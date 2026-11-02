@@ -256,7 +256,7 @@ def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
     model.zero_grad()
     preds = model(imgs)
     assert isinstance(preds["fg_align"], dict)
-    assert set(preds["fg_align"].keys()) == {"logits", "pert_logits", "embed", "pert_embed"}
+    assert set(preds["fg_align"].keys()) == {"logits", "pert_logits", "inv_dist"}
     fg_only = criterion._compute_fg_alignment_loss(preds["fg_align"], preds["one2many"], batch_mixed)
     fg_only.backward()
     assert model.model[16].cv2.conv.weight.grad.abs().sum().item() > 0
@@ -267,7 +267,15 @@ def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
     fake_fg_mask[0, :4] = True
     fake_t_scores = torch.zeros((2, n_anc, 19))
     fake_t_scores[0, :4, 3] = 0.85
-    legacy_fg_dict = {k: v.detach().requires_grad_(True) for k, v in preds["fg_align"].items()}
+    legacy_fg_dict = {
+        "logits": preds["fg_align"]["logits"].detach().requires_grad_(True),
+        "pert_logits": preds["fg_align"]["pert_logits"].detach().requires_grad_(True),
+        "inv_dist": preds["fg_align"]["inv_dist"].detach().add(0.1).requires_grad_(True),
+        "o2m_pert": {
+            "boxes": (preds["one2many"]["boxes"].detach() + 0.05).requires_grad_(True),
+            "scores": (preds["one2many"]["scores"].detach() + 0.10).requires_grad_(True),
+        },
+    }
     legacy_fg_loss = criterion._compute_fg_alignment_from_o2m(
         legacy_fg_dict,
         preds["one2many"],
@@ -277,7 +285,9 @@ def test_anisotropic_edge_loss_and_reused_fg_supervision() -> None:
     legacy_fg_loss.backward()
     assert torch.isfinite(legacy_fg_loss) and legacy_fg_loss.item() > 0.0
     assert legacy_fg_dict["pert_logits"].grad.abs().sum().item() > 0.0
-    assert legacy_fg_dict["pert_embed"].grad.abs().sum().item() > 0.0
+    assert legacy_fg_dict["inv_dist"].grad.abs().sum().item() > 0.0
+    assert legacy_fg_dict["o2m_pert"]["boxes"].grad.abs().sum().item() > 0.0
+    assert legacy_fg_dict["o2m_pert"]["scores"].grad.abs().sum().item() > 0.0
 
 
 def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
@@ -298,7 +308,7 @@ def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
         x = torch.rand(2, 3, 192, 192)
         out = m_train(x)
         assert isinstance(out["fg_align"], dict)
-        assert out["fg_align"]["embed"].shape[-1] == 16
+        assert out["fg_align"]["inv_dist"].shape[-1] == 1
         # Verify counterfactual background perturbation changes features while anchoring fg_prob=1 centers
         f0 = torch.randn(2, 16, 12, 12)
         fg_ones = torch.ones(2, 1, 12, 12)
@@ -313,7 +323,7 @@ def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
             "bboxes": torch.tensor([[0.30, 0.30, 0.08, 0.08], [0.50, 0.60, 0.80, 0.05]]),
         }
         # Verify exact BaseTrainer._do_train path: m_train(batch) -> paired (I_clean, I_bg_changed) alignment
-        # with zero BN running-stat drift vs single clean pass AND live gradients into Backbone + Neck from fg_loss!
+        # with zero BN running-stat drift vs single clean pass AND live gradients into Backbone + Neck + cv2 + cv3!
         m_single_ref = deepcopy(m_train).train()
         with torch.no_grad():
             m_single_ref(x)
@@ -330,9 +340,11 @@ def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
         assert torch.isfinite(loss_pair)
         fg_val = items["fg_loss"].item() if isinstance(items, dict) else items[3].item()
         assert fg_val > 0.0
-        # Pure fg_loss sends paired background-invariance gradients into BOTH Backbone (model[2]) and Neck (model[16])!
+        # Pure fg_loss sends background-invariance gradients into Backbone, Neck, AND inference cv2 + cv3 towers!
         assert m_fg_only.model[2].cv1.conv.weight.grad.abs().sum().item() > 0.0
         assert m_fg_only.model[16].cv2.conv.weight.grad.abs().sum().item() > 0.0
+        assert m_fg_only.model[-1].cv2[0][-1].weight.grad.abs().sum().item() > 0.0
+        assert m_fg_only.model[-1].cv3[0][-1].weight.grad.abs().sum().item() > 0.0
 
         m_fused = deepcopy(m_train).eval().fuse(verbose=False)
         assert m_fused.model[-1].fg_branch is None, f"{cfg} must strip ForegroundAlignmentBranch on fuse()"
@@ -366,21 +378,27 @@ def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
     # Full-frame global defect (sample 2, 纬斜 w*h >= 0.55) is automatically skipped without distorting cloth skew
     assert (aug[2] - imgs[2]).abs().max().item() == 0.0
 
-    # Verify YOLO27Trainer.preprocess_batch syncs _fg_pair_enabled cleanly with final close_mosaic epochs
+    # Verify YOLO27Trainer defaults to _preset_fg_bg_prob=1.0 (active!) and preprocess_batch builds img_bg_pert
+    assert YOLO27Trainer._preset_fg_bg_prob == 1.0
     dummy_t = YOLO27Trainer.__new__(YOLO27Trainer)
     dummy_t.device = torch.device("cpu")
-    dummy_t._bg_augment_prob = 0.0
-    dummy_t.model = SimpleNamespace(training=True, _fg_pair_enabled=True)
+    dummy_t._fg_bg_prob = YOLO27Trainer._preset_fg_bg_prob
+    dummy_t.model = SimpleNamespace(training=True, _fg_pair_enabled=True, model=[SimpleNamespace(fg_branch=True)])
     dummy_t.epochs = 150
     dummy_t.args = SimpleNamespace(multi_scale=0.0, close_mosaic=5)
 
     raw_uint8 = (imgs[:2] * 255.0).round().to(torch.uint8)
     dummy_t.epoch = 10
-    _ = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
+    b_active = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
     assert dummy_t.model._fg_pair_enabled is True
+    assert "img_bg_pert" in b_active
+    assert (b_active["img_bg_pert"][0, :, 32:56, 40:64] - b_active["img"][0, :, 32:56, 40:64]).abs().max().item() == 0.0
+    assert (b_active["img_bg_pert"][0, :, :20, :28] - b_active["img"][0, :, :20, :28]).abs().mean().item() > 0.01
+
     dummy_t.epoch = 147  # inside final close_mosaic=5 calibration window
-    _ = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
+    b_tail = dummy_t.preprocess_batch({"img": raw_uint8.clone(), "bboxes": bboxes[:2], "batch_idx": batch_idx[:2]})
     assert dummy_t.model._fg_pair_enabled is False
+    assert "img_bg_pert" not in b_tail
 
 
 def test_deep_donor_discovery_failfast_guard_and_pipeline() -> None:

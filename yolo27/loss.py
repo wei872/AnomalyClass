@@ -15,11 +15,13 @@ Key training-dynamics and ``mAP50-95`` localization improvements over stock ``E2
        Preserves strong multi-positive gradient signal on the shared neck and default
        ``one2many + NMS`` head throughout ``close_mosaic`` fine-tuning while keeping
        ``o2m + o2o == 1.0``.
-    3. Zero-Jitter Native TAL + Reused Foreground Alignment Supervision (``fg_gain = 0.05``):
-       Runs native Ultralytics ``v8DetectionLoss`` for both heads (zero ``fg_prior``
-       perturbation of ``one2one`` positive anchors) and reuses ``one2many``'s foreground
-       assignment to supervise ``ForegroundAlignmentBranch`` on live neck features without
-       invoking ``TaskAlignedAssigner`` a 3rd time per batch.
+    3. Full-Channel Paired Foreground Alignment Supervision (``fg_gain = 0.08``):
+       Jointly supervises ``(I_clean, I_bg_changed)`` pairs (where cloth background changes
+       while GT defect pixels remain bit-for-bit identical) via:
+         - Dual-view IoU-Varifocal foreground saliency consistency,
+         - Full-channel (``80/128/256``) Neck + FG-encoder cosine invariance on positive anchors,
+         - Paired ``one2many`` 19-class zero-minimum focal KL invariance & false-alarm suppression,
+         - Paired ``one2many`` CIoU bounding-box coordinate invariance on positive anchors.
     4. Dual-Scale STAL Calibration:
        Adjusts ``stride_val = 16`` when ``[P3/8, P5/32]`` is used so Small-Target-Aware
        Label Assignment activates accurately on tiny ``< 16 px`` fabric defects.
@@ -265,7 +267,7 @@ class YOLO27E2ELoss:
         self,
         model: torch.nn.Module,
         class_weights: torch.Tensor | None = None,
-        fg_gain: float = 0.05,
+        fg_gain: float = 0.08,
         init_o2m: float = 0.80,
         final_o2m: float = 0.55,
     ) -> None:
@@ -301,33 +303,43 @@ class YOLO27E2ELoss:
 
     def _compute_fg_alignment_from_o2m(
         self,
-        fg_out: torch.Tensor | dict[str, torch.Tensor],
+        fg_out: torch.Tensor | dict[str, Any],
         o2m_preds: dict[str, torch.Tensor],
         o2m_assign: tuple[Any, ...],
         has_gt: bool,
     ) -> torch.Tensor:
-        """Supervise background-invariant foreground saliency & defect embedding alignment on live neck features."""
+        """Supervise full-channel Neck + ``one2many`` head invariance under changed cloth backgrounds."""
         if isinstance(fg_out, dict):
-            fg_logits = fg_out["logits"]
+            fg_logits: torch.Tensor = fg_out["logits"]
             pert_logits: torch.Tensor | None = fg_out.get("pert_logits")
-            embed: torch.Tensor | None = fg_out.get("embed")
-            pert_embed: torch.Tensor | None = fg_out.get("pert_embed")
+            inv_dist: torch.Tensor | None = fg_out.get("inv_dist")
+            o2m_pert: dict[str, torch.Tensor] | None = fg_out.get("o2m_pert")
         else:
             fg_logits = fg_out
             pert_logits = None
-            embed = None
-            pert_embed = None
+            inv_dist = None
+            o2m_pert = None
 
         dtype = fg_logits.dtype
-        batch_size = fg_logits.shape[0]
+        batch_size = max(int(fg_logits.shape[0]), 1)
 
         if not has_gt:
             fg_zero = torch.zeros_like(fg_logits)
-            vfl_clean = _varifocal_sum(fg_logits, fg_zero, fg_zero) / max(batch_size, 1)
+            loss_fg = _varifocal_sum(fg_logits, fg_zero, fg_zero) / batch_size
             if pert_logits is not None:
-                vfl_pert = _varifocal_sum(pert_logits, fg_zero, fg_zero) / max(batch_size, 1)
-                return (0.5 * vfl_clean + 0.5 * vfl_pert) * self.fg_gain
-            return vfl_clean * self.fg_gain
+                vfl_pert = _varifocal_sum(pert_logits, fg_zero, fg_zero) / batch_size
+                loss_fg = 0.5 * loss_fg + 0.5 * vfl_pert
+            if o2m_pert is not None:
+                s_clean = o2m_preds["scores"].detach().float()
+                s_pert = o2m_pert["scores"].float()
+                p_clean = s_clean.sigmoid()
+                kl_bg = (
+                    F.binary_cross_entropy_with_logits(s_pert, p_clean, reduction="none")
+                    - F.binary_cross_entropy_with_logits(s_clean, p_clean, reduction="none")
+                ).clamp(min=0.0)
+                focal_w = (s_pert.sigmoid() - p_clean).pow(2.0)
+                loss_fg = loss_fg + (kl_bg * focal_w).sum() / batch_size
+            return loss_fg.to(dtype=dtype) * self.fg_gain
 
         with torch.no_grad():
             if len(o2m_assign) == 3:
@@ -336,6 +348,7 @@ class YOLO27E2ELoss:
                 fg_idx = fg_mask.nonzero(as_tuple=True)
                 fg_quality = target_scores.amax(dim=-1, keepdim=True).clamp(0.0, 1.0).to(dtype)
                 fg_label = fg_mask.unsqueeze(-1).to(dtype)
+                anchor_points, stride_tensor = make_anchors(o2m_preds["feats"], self.one2many.stride, 0.5)
             else:
                 # Ultralytics >=8.4.194 returns (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor)
                 fg_mask, _, target_bboxes, anchor_points, stride_tensor = o2m_assign
@@ -351,30 +364,53 @@ class YOLO27E2ELoss:
                     fg_quality[fg_idx[0], fg_idx[1], 0] = iou_fg.to(dtype)
                 fg_label = fg_mask.unsqueeze(-1).to(dtype)
 
-            norm = fg_quality.sum().clamp(min=1.0)
+            norm = fg_quality.sum().float().clamp(min=1.0)
 
+        # 1. Clean & background-perturbed foreground saliency Varifocal supervision
         vfl_clean = _varifocal_sum(fg_logits, fg_quality, fg_label) / norm
         if pert_logits is None:
-            return vfl_clean * self.fg_gain
+            return vfl_clean.to(dtype=dtype) * self.fg_gain
 
         vfl_pert = _varifocal_sum(pert_logits, fg_quality, fg_label) / norm
         loss_fg = 0.5 * vfl_clean + 0.5 * vfl_pert
 
-        # Foreground defect feature cosine alignment: background changes, defect representation stays invariant!
-        # Uses symmetric stop-gradient (SimSiam-style) so neither branch collapses while both clean & perturbed
-        # Backbone+Neck pathways converge onto a background-invariant defect representation.
-        if embed is not None and pert_embed is not None and fg_idx[0].numel() > 0:
-            z_c = embed[fg_idx].float()
-            z_p = pert_embed[fg_idx].float()
-            cos_c2p = (z_c.detach() * z_p).sum(dim=-1, keepdim=True)
-            cos_p2c = (z_c * z_p.detach()).sum(dim=-1, keepdim=True)
-            q_fg = fg_quality[fg_idx].float()
-            loss_invariance = (
-                (0.5 * (1.0 - cos_c2p).clamp(min=0.0) + 0.5 * (1.0 - cos_p2c).clamp(min=0.0)) * q_fg
-            ).sum() / norm.float()
-            loss_fg = loss_fg + 0.5 * loss_invariance.to(dtype=loss_fg.dtype)
+        has_pos = fg_idx[0].numel() > 0
+        q_fg = fg_quality[fg_idx].float() if has_pos else None
 
-        return loss_fg * self.fg_gain
+        # 2. Full-channel (80/128/256) Neck + FG-encoder symmetric cosine invariance on defect anchors
+        if inv_dist is not None and has_pos and q_fg is not None:
+            loss_feat_inv = (inv_dist[fg_idx].float() * q_fg).sum() / norm
+            loss_fg = loss_fg + loss_feat_inv
+
+        # 3. Direct detection head (cv3 19-class + cv2 box) consistency on background-changed image
+        if o2m_pert is not None:
+            s_clean_cls = o2m_preds["scores"].detach().float()
+            s_pert_cls = o2m_pert["scores"].float()
+            p_clean = s_clean_cls.sigmoid()
+            kl_cls = (
+                F.binary_cross_entropy_with_logits(s_pert_cls, p_clean, reduction="none")
+                - F.binary_cross_entropy_with_logits(s_clean_cls, p_clean, reduction="none")
+            ).clamp(min=0.0)
+            focal_diff = (s_pert_cls.sigmoid() - p_clean).pow(2.0)
+            loss_cls_cons = (kl_cls * focal_diff).sum() / norm
+            loss_fg = loss_fg + 1.5 * loss_cls_cons
+
+            if has_pos and q_fg is not None:
+                dist_clean = o2m_preds["boxes"].detach().permute(0, 2, 1).contiguous()
+                dist_pert = o2m_pert["boxes"].permute(0, 2, 1).contiguous()
+                boxes_clean_fg = (
+                    self.one2many.bbox_decode(anchor_points, dist_clean)[fg_idx].float()
+                    * stride_tensor[fg_idx[1]].float()
+                )
+                boxes_pert_fg = (
+                    self.one2many.bbox_decode(anchor_points, dist_pert)[fg_idx].float()
+                    * stride_tensor[fg_idx[1]].float()
+                )
+                ciou_cons = bbox_iou(boxes_pert_fg, boxes_clean_fg.detach(), xywh=False, CIoU=True).squeeze(-1)
+                loss_box_cons = ((1.0 - ciou_cons).clamp(min=0.0) * q_fg).sum() / norm
+                loss_fg = loss_fg + loss_box_cons
+
+        return loss_fg.to(dtype=dtype) * self.fg_gain
 
     def _compute_fg_alignment_loss(
         self,
