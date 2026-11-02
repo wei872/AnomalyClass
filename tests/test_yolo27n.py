@@ -20,6 +20,7 @@ from ultralytics.utils import YAML
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
 from yolo27 import (
+    ForegroundAlignmentBranch,
     YOLO27,
     YOLO27BboxLoss,
     YOLO27Detect,
@@ -383,7 +384,11 @@ def test_foreground_alignment_and_defect_invariant_bg_augment() -> None:
     dummy_t = YOLO27Trainer.__new__(YOLO27Trainer)
     dummy_t.device = torch.device("cpu")
     dummy_t._fg_bg_prob = YOLO27Trainer._preset_fg_bg_prob
-    dummy_t.model = SimpleNamespace(training=True, _fg_pair_enabled=True, model=[SimpleNamespace(fg_branch=True)])
+    dummy_t.model = SimpleNamespace(
+        training=True,
+        _fg_pair_enabled=True,
+        model=[SimpleNamespace(fg_branch=ForegroundAlignmentBranch((16,)))],
+    )
     dummy_t.epochs = 150
     dummy_t.args = SimpleNamespace(multi_scale=0.0, close_mosaic=5)
 

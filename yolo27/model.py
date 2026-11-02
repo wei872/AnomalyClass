@@ -79,13 +79,15 @@ def _merge_split_paths(primary: Any, extra: Any) -> list[str]:
 
 
 def _upgrade_detect_head(model: DetectionModel, reg_max_override: int | None = None) -> None:
-    """Replace terminal ``Detect`` head with ``YOLO27Detect`` while preserving graph metadata."""
+    """Replace terminal ``Detect`` head with ``YOLO27Detect`` (mounting ``ForegroundAlignmentBranch``)."""
     head = model.model[-1]
     if isinstance(head, Detect) and not isinstance(head, YOLO27Detect):
         ch = tuple(int(m[0].conv.in_channels) for m in head.cv2)
         end2end = hasattr(head, "one2one_cv2") and head.one2one_cv2 is not None
         reg_max = int(reg_max_override if reg_max_override is not None else getattr(head, "reg_max", 1))
         new_head = YOLO27Detect(nc=head.nc, end2end=end2end, reg_max=reg_max, ch=ch)
+        if len(ch) > 0 and not isinstance(new_head.fg_branch, ForegroundAlignmentBranch):
+            new_head.fg_branch = ForegroundAlignmentBranch(ch)
         new_head.i = head.i
         new_head.f = head.f
         new_head.type = f"{YOLO27Detect.__module__}.{YOLO27Detect.__qualname__}"
@@ -158,10 +160,11 @@ class YOLO27DetectionModel(DetectionModel):
             self.criterion = self.init_criterion()
 
         head = self.model[-1]
+        fg_branch = head.fg_branch if isinstance(head, YOLO27Detect) else None
         use_fg_branch = (
             self.training
             and isinstance(head, YOLO27Detect)
-            and head.fg_branch is not None
+            and isinstance(fg_branch, ForegroundAlignmentBranch)
             and isinstance(batch, dict)
             and isinstance(batch.get("img"), torch.Tensor)
         )
@@ -178,6 +181,7 @@ class YOLO27DetectionModel(DetectionModel):
 
         if (
             use_fg_branch
+            and isinstance(fg_branch, ForegroundAlignmentBranch)
             and isinstance(preds, dict)
             and isinstance(preds.get("fg_align"), dict)
             and isinstance(preds.get("one2many"), dict)
@@ -202,11 +206,11 @@ class YOLO27DetectionModel(DetectionModel):
 
                 if isinstance(img_pert, torch.Tensor) and not torch.equal(img_pert, imgs):
                     if h_clean_maps is None:
-                        h_clean_maps, _ = head.fg_branch.encode_maps(x_bal_clean)
+                        h_clean_maps, _ = fg_branch.encode_maps(x_bal_clean)
                     with _freeze_bn_running_stats(self):
                         feats_pert = self._extract_neck_features(img_pert)
                         x_bal_pert = head._apply_feature_scale(feats_pert)
-                        paired_fg = head.fg_branch.align_paired(x_bal_clean, h_clean_maps, x_bal_pert)
+                        paired_fg = fg_branch.align_paired(x_bal_clean, h_clean_maps, x_bal_pert)
                         o2m_pert = head.forward_head(x_bal_pert, **head.one2many)
                     fg_dict.update(paired_fg)
                     fg_dict["o2m_pert"] = o2m_pert
@@ -318,7 +322,7 @@ class YOLO27Trainer(DetectionTrainer):
         has_fg_branch = (
             raw_m is None
             or not hasattr(raw_m, "model")
-            or getattr(raw_m.model[-1], "fg_branch", None) is not None
+            or isinstance(getattr(raw_m.model[-1], "fg_branch", None), ForegroundAlignmentBranch)
         )
         pair_active = is_training and has_fg_branch and (not in_clean_tail) and (self._fg_bg_prob > 0.0)
         if raw_m is not None:
@@ -342,6 +346,15 @@ class YOLO27Trainer(DetectionTrainer):
     def _setup_train(self, *args: Any, **kwargs: Any) -> None:
         """Calibrate ``ModelEMA`` decay/tau and rare-class foreground recall weights for industrial datasets."""
         super()._setup_train(*args, **kwargs)
+
+        raw_model = unwrap_model(self.model) if getattr(self, "model", None) is not None else None
+        fg_branch = getattr(raw_model.model[-1], "fg_branch", None) if hasattr(raw_model, "model") else None
+        if isinstance(fg_branch, ForegroundAlignmentBranch) and RANK in {-1, 0}:
+            fg_params = sum(p.numel() for p in fg_branch.parameters())
+            LOGGER.info(
+                f"YOLO27Trainer: ForegroundAlignmentBranch active "
+                f"({fg_params:,} train-only params, fg_bg_prob={self._fg_bg_prob:.2f}; stripped on fuse())"
+            )
 
         nb = len(self.train_loader) if getattr(self, "train_loader", None) is not None else 0
         # 1. Fix ModelEMA(tau=2000) single-batch jitter on small/medium datasets (<500 batches/epoch):
