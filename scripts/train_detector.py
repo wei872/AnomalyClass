@@ -37,6 +37,9 @@ def main():
     p.add_argument('--lr', type=float, default=2e-3)
     p.add_argument('--warmup', type=int, default=100)
     p.add_argument('--eval-interval', type=int, default=5000)
+    p.add_argument('--save-interval', type=int, default=1000,
+                   help='每 N 个 iter 无条件保存 model_last.pth (即使评估失败也不丢权重)')
+    p.add_argument('--no-eval', action='store_true', help='训练期间跳过 val 评估 (只保存权重)')
     p.add_argument('--out', default='checkpoints/detector')
     p.add_argument('--weights-dir', default=None, help='backbone 预训练权重目录')
     p.add_argument('--num-workers', type=int, default=4)
@@ -60,7 +63,7 @@ def main():
                    eval_interval=args.eval_interval, eval_dir=cfg.val_images, eval_labels_dir=cfg.val_labels,
                    device=args.device, num_workers=args.num_workers, seed=args.seed,
                    weights_dir=args.weights_dir, allow_random_init=args.allow_random_init,
-                   resume=args.resume, logger=log)
+                   resume=args.resume, logger=log, save_interval=args.save_interval, no_eval=args.no_eval)
 
 
 if __name__ == '__main__':

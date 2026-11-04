@@ -191,7 +191,8 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                    total_iters: int = 40000, batch_size: int = 16, lr: float = 2e-3, warmup: int = 100,
                    eval_interval: int = 5000, eval_dir: Optional[str] = None, eval_labels_dir: Optional[str] = None,
                    device: str = 'cuda', num_workers: int = 4, seed: int = 1, weights_dir: str = None,
-                   allow_random_init: bool = False, resume: Optional[str] = None, logger=None):
+                   allow_random_init: bool = False, resume: Optional[str] = None, logger=None,
+                   save_interval: int = 1000, no_eval: bool = False):
     """在纯正常图上训练 Dinomaly2 检测器. 返回保存路径."""
     from .data.yolo import YoloDefectDataset
     log = logger or get_logger('train_detector')
@@ -246,18 +247,25 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
             if it % 100 == 0:
                 log(f'iter [{it}/{total_iters}] loss={loss_meter.avg:.4f} lr={optimizer.param_groups[-1]["lr"]:.2e}')
                 loss_meter.reset()
-            if it % eval_interval == 0 or it == total_iters:
-                if eval_dir:
-                    auroc = evaluate_detector(model, eval_dir, eval_labels_dir, device, image_size, crop_size,
-                                              logger=log)
-                    if auroc > best_auroc:
-                        best_auroc = auroc
-                        AnomalyDetector(model, device, image_size, crop_size).save(best_path, hparams)
-                        log(f'*** 新最优 I-AUROC={auroc:.4f}, 保存 {best_path}')
+            if it % save_interval == 0 or it == total_iters:
+                # 先无条件保存 last —— 即使评估炸了, 也不能丢掉已训练的权重
                 AnomalyDetector(model, device, image_size, crop_size).save(last_path, hparams)
+                log(f'已保存 {last_path}')
+                if eval_dir and not no_eval:
+                    try:
+                        auroc = evaluate_detector(model, eval_dir, eval_labels_dir, device, image_size,
+                                                  crop_size, logger=log)
+                        if auroc > best_auroc:
+                            best_auroc = auroc
+                            AnomalyDetector(model, device, image_size, crop_size).save(best_path, hparams)
+                            log(f'*** 新最优 I-AUROC={auroc:.4f}, 保存 {best_path}')
+                    except Exception as e:
+                        log(f'警告: 评估失败 ({e}), 已跳过, 不影响 checkpoint 保存 (last 已保存)')
                 model.train()
             if it >= total_iters:
                 break
+    # 兜底: 保证至少有一个 checkpoint
+    AnomalyDetector(model, device, image_size, crop_size).save(last_path, hparams)
     if not os.path.exists(best_path):
         AnomalyDetector(model, device, image_size, crop_size).save(best_path, hparams)
     log(f'训练完成. best={best_path} (I-AUROC={best_auroc:.4f}), last={last_path}')
@@ -267,38 +275,59 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
 # ------------------------- 评估 / 校准 -------------------------
 @torch.no_grad()
 def evaluate_detector(model: nn.Module, images_dir: str, labels_dir: Optional[str], device: str = 'cuda',
-                      image_size: int = 448, crop_size: int = 392, batch_size: int = 8, logger=None) -> float:
-    """在带标签的 val 集上评估 (框栅格化为像素 GT): 返回图级 AUROC."""
+                      image_size: int = 448, crop_size: int = 392, batch_size: int = 8, logger=None,
+                      eval_size: int = 256, read_max_side: int = 1024) -> float:
+    """在带标签的 val 集上评估: 返回图级 AUROC.
+
+    内存有界: 读图长边封顶 read_max_side; 像素级指标统一在 eval_size×eval_size 上计算
+    (YOLO 框是归一化坐标, 缩放无关), 不会把异常图放大到原图全分辨率导致 OOM.
+    """
     from .data.yolo import YoloDefectDataset
     log = logger or get_logger('eval')
     det = AnomalyDetector(model, device, image_size, crop_size)
-    ds = YoloDefectDataset(images_dir, labels_dir)
+    ds = YoloDefectDataset(images_dir, labels_dir, max_side=read_max_side)
     tf = get_eval_transform(image_size, crop_size)
     gt_sp, pr_sp, gt_px, pr_px = [], [], [], []
     for i in range(len(ds)):
-        img, boxes, mask, path = ds[i]
+        img, boxes, _, path = ds[i]
+        h, w = img.shape[:2]
         x = tf(img).unsqueeze(0).to(device)
         en, de = model(x)
         amap, _ = cal_anomaly_maps(en, de, x.shape[-1])
-        amap = det.gaussian(amap.float())
+        amap = det.gaussian(amap.float())                       # (1,1,C,C)
+        amap = F.interpolate(amap, size=(eval_size, eval_size), mode='bilinear', align_corners=False)
         amap = amap[0, 0].cpu().numpy()
         score = float(amap.max())
-        full = cv2.resize(amap, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+        # GT: 像素框 -> eval_size 分辨率掩码
+        mask = rasterize_boxes(eval_size, eval_size,
+                               [(c, x1 / w * eval_size, y1 / h * eval_size,
+                                 x2 / w * eval_size, y2 / h * eval_size) for c, x1, y1, x2, y2 in boxes])
         gt_sp.append(1 if len(boxes) > 0 else 0)
         pr_sp.append(score)
         gt_px.append(mask.ravel())
-        pr_px.append(full.ravel())
+        pr_px.append(amap.ravel())
     gt_px = np.concatenate(gt_px)
     pr_px = np.concatenate(pr_px)
-    i_auroc = roc_auc(gt_sp, pr_sp)
-    p_auroc = roc_auc(gt_px, pr_px)
-    i_ap = average_precision(gt_sp, pr_sp)
-    p_ap = average_precision(gt_px, pr_px)
-    i_f1 = f1_max(gt_sp, pr_sp)
-    p_f1 = f1_max(gt_px, pr_px)
+    gt_sp = np.asarray(gt_sp)
+    pr_sp = np.asarray(pr_sp)
+
+    def _safe(fn, y, s, default=float('nan')):
+        try:
+            if len(np.unique(y)) < 2:
+                return default
+            return float(fn(y, s))
+        except Exception:
+            return default
+
+    i_auroc = _safe(roc_auc, gt_sp, pr_sp)
+    p_auroc = _safe(roc_auc, gt_px, pr_px)
+    i_ap = _safe(average_precision, gt_sp, pr_sp)
+    p_ap = _safe(average_precision, gt_px, pr_px)
+    i_f1 = _safe(f1_max, gt_sp, pr_sp)
+    p_f1 = _safe(f1_max, gt_px, pr_px)
     log(f'[eval] I-AUROC={i_auroc:.4f} I-AP={i_ap:.4f} I-F1={i_f1:.4f} | '
         f'P-AUROC={p_auroc:.4f} P-AP={p_ap:.4f} P-F1={p_f1:.4f} (n={len(gt_sp)})')
-    return i_auroc
+    return i_auroc if i_auroc == i_auroc else 0.0   # NaN -> 0.0, 保证 best 逻辑可用
 
 
 @torch.no_grad()

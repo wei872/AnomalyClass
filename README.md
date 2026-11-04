@@ -141,6 +141,7 @@ tests/smoke_test.py    # 合成数据端到端冒烟测试（CPU, 无需下载�
 - **坏文件容错**：数据集初始化时会逐张探测可解码性，坏文件自动跳过并打印诊断（大小/文件头魔数），不会让一张坏图中断训练。也可用 `python scripts/check_images.py --data-yaml dataset/fabric19.yaml` 扫描全部目录定位坏文件。
 - **超大图内存封顶**：读图长边默认封顶 2048；推理异常图长边封顶 1024（框自动映射回原图坐标）；评估像素指标统一在 256×256 计算（YOLO 归一化框，缩放无关）；可视化显示长边封顶 1600。布匹原图再大也不会 OOM。
 - **训练速度**：GTX 1660 上 bs=16 约 2s/iter，40000 iters 约 20+ 小时。你的正常样本只有几百张时，**10000–20000 iters 已足够**（loss 通常几千 iter 就收敛），或把 `--batch-size` 调大到 24–32（6GB 显存够用）。
+- **断点保护**：`--save-interval N`（默认 1000）每 N 个 iter **无条件保存 `model_last.pth`**，训练结束也兜底保存；即使 val 评估报错也只会打警告、不会丢权重（`model_best.pth` 按 I-AUROC 保存，无评估时与 last 相同）。`--no-eval` 可完全跳过评估。
 - **Windows 兼容**：所有脚本都有 `if __name__ == '__main__'` 保护；DataLoader 用的数据集类均为模块级（spawn 多进程需要可 pickle，已用 spawn context 实测通过）；checkpoint 统一用 `torch_load()`（`weights_only=True`，无 FutureWarning 且防 pickle 注入）。
 - 检测器评估指标（I/P-AUROC、AP、F1）在 `calibrate.py` / 训练日志中输出；像素级 GT 由 YOLO 框栅格化得到。
 - 中文可视化标签需要系统有中文字体（Windows 自带黑体/微软雅黑会自动使用）；也可 `--font 路径` 指定，或把字体放进 `assets/fonts/`。
