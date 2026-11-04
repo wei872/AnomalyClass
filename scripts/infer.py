@@ -74,13 +74,19 @@ def main():
         return d
 
     if args.image:
-        img = cv2.imread(args.image, cv2.IMREAD_COLOR)
+        img = imread_unicode(args.image, cv2.IMREAD_COLOR)
+        if img is None:
+            raise IOError(f'无法读取图片: {args.image}')
         d = run_one(img, os.path.basename(args.image))
         _append_json(os.path.join(args.out, 'results.json'), d)
     elif args.dir:
         results = []
         for f in list_images(args.dir):
-            results.append(run_one(cv2.imread(f, cv2.IMREAD_COLOR), os.path.basename(f)))
+            img = imread_unicode(f, cv2.IMREAD_COLOR)
+            if img is None:
+                log(f'跳过无法读取的图片: {f}')
+                continue
+            results.append(run_one(img, os.path.basename(f)))
         with open(os.path.join(args.out, 'results.json'), 'w', encoding='utf-8') as fo:
             json.dump(results, fo, ensure_ascii=False, indent=2)
         log(f'共处理 {len(results)} 张, 结果: {os.path.join(args.out, "results.json")}')

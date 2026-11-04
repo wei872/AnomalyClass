@@ -40,9 +40,11 @@ class YoloDefectDataset(Dataset):
     verify=True 时在初始化探测并跳过坏文件 (避免训练中途崩溃).
     """
 
-    def __init__(self, images_dir: str, labels_dir: Optional[str] = None, verify: bool = True, logger=None):
+    def __init__(self, images_dir: str, labels_dir: Optional[str] = None, verify: bool = True, logger=None,
+                 max_side: int = 2048):
         self.images = list_images(images_dir)
         self.labels_dir = labels_dir
+        self.max_side = max_side
         self.skipped: List[str] = []
         if verify:
             self.images, self.skipped = verify_images(self.images, logger=logger, tag=images_dir)
@@ -52,11 +54,19 @@ class YoloDefectDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
+    def _read(self, img_path: str):
         img = imread_unicode(img_path, cv2.IMREAD_COLOR)
         if img is None:
             raise IOError(f'无法读取图片: {img_path}  诊断: {image_diag(img_path)}')
+        if self.max_side and max(img.shape[:2]) > self.max_side:   # 超大图先缩小, 防内存爆炸
+            s = self.max_side / max(img.shape[:2])
+            img = cv2.resize(img, (max(1, round(img.shape[1] * s)), max(1, round(img.shape[0] * s))),
+                             interpolation=cv2.INTER_AREA)
+        return img
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        img = self._read(img_path)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
         yolo = read_yolo_label(label_path_for(img_path, self.labels_dir)) if self.labels_dir else []

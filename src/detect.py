@@ -22,7 +22,7 @@ from torchvision import transforms as T
 from .dinomaly import build_dinomaly
 from .dinomaly.losses import global_cosine, global_cosine_hm_percent
 from .util import (AverageMeter, cal_anomaly_maps, get_gaussian_kernel, list_images, mask_to_boxes,
-                   roc_auc, average_precision, f1_max, get_logger, torch_load)
+                   rasterize_boxes, roc_auc, average_precision, f1_max, get_logger, torch_load)
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -87,16 +87,26 @@ class AnomalyDetector:
         return amap[0, 0].cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
-    def predict(self, img_rgb: np.ndarray) -> Tuple[np.ndarray, float]:
-        """返回 (全图异常图 H0×W0 float32, 图级异常分数)."""
+    def predict(self, img_rgb: np.ndarray, max_map_side: int = 1024) -> Tuple[np.ndarray, float, Tuple[float, float]]:
+        """返回 (异常图 float32, 图级异常分数, 坐标缩放(sx,sy)).
+
+        异常图长边封顶 max_map_side (防止超大原图把全分辨率图撑爆内存);
+        返回的缩放 (sx,sy) = 原图宽高 / 异常图宽高, 用于把异常图上的框映射回原图坐标.
+        """
         h0, w0 = img_rgb.shape[:2]
         amap_c = self.anomaly_map_crop(img_rgb)                     # C×C
         score = float(amap_c.max())
         canvas = np.zeros((self.image_size, self.image_size), dtype=np.float32)
         o = self.offset
         canvas[o:o + self.crop_size, o:o + self.crop_size] = amap_c
-        full = cv2.resize(canvas, (w0, h0), interpolation=cv2.INTER_LINEAR)
-        return full, score
+        long = max(h0, w0)
+        if long > max_map_side:
+            nh = max(1, round(h0 * max_map_side / long))
+            nw = max(1, round(w0 * max_map_side / long))
+        else:
+            nh, nw = h0, w0
+        full = cv2.resize(canvas, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        return full, score, (w0 / nw, h0 / nh)
 
     # ---- 区域分割 ----
     def segment(self, full_map: np.ndarray, mask_thr: float, min_area_ratio: float = 2e-4,
@@ -305,7 +315,7 @@ def calibrate(detector: AnomalyDetector, normal_dir: str, img_quantile: float = 
     scores, pix_all = [], []
     for i in range(len(ds)):
         img, path = ds[i]
-        full, score = detector.predict(img)
+        full, score, _ = detector.predict(img)
         scores.append(score)
         pix_all.append(full.ravel())
         if (i + 1) % 50 == 0:

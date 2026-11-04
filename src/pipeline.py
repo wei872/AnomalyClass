@@ -68,7 +68,7 @@ class FabricAnomalyPipeline:
     def __init__(self, detector: AnomalyDetector, classifier: Optional[RegionClassifier],
                  class_names: List[str], img_thr: float, pix_thr: Optional[float] = None,
                  mask_ratio: float = 0.5, min_area_ratio: float = 2e-4, dilate: int = 7, box_pad: float = 0.2,
-                 device: str = 'cuda', logger=None):
+                 device: str = 'cuda', logger=None, max_map_side: int = 1024, max_vis_side: int = 1600):
         self.det = detector
         self.cls = classifier
         self.class_names = class_names          # 长度 nc+1, 末尾为 '未知类型'
@@ -81,6 +81,8 @@ class FabricAnomalyPipeline:
         self.dilate = dilate
         self.box_pad = box_pad
         self.device = device
+        self.max_map_side = max_map_side
+        self.max_vis_side = max_vis_side
         self.log = logger or get_logger('pipeline')
 
     # ---------------- 核心推理 ----------------
@@ -90,35 +92,40 @@ class FabricAnomalyPipeline:
         t0 = time.perf_counter()
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h0, w0 = img_rgb.shape[:2]
-        full_map, score = self.det.predict(img_rgb)
+        # 异常图长边封顶 max_map_side (防超大图内存爆炸), 框再映射回原图坐标
+        full_map, score, (sx, sy) = self.det.predict(img_rgb, max_map_side=self.max_map_side)
         is_anom = score > self.img_thr
         conf = deviation_confidence(score, self.img_thr)
         result = ImageResult(image=image_name, width=w0, height=h0, is_anomaly=bool(is_anom),
                              anomaly_score=score, anomaly_conf=conf, img_thr=self.img_thr)
         if is_anom:
             regions = self.det.segment(full_map, self.mask_thr, self.min_area_ratio, self.dilate, self.box_pad)
-            if regions and self.cls is not None:
-                crops = [img_rgb[y1:y2, x1:x2] for r in regions
-                         for (x1, y1, x2, y2) in [r['box']]]
-                cls_results = self.cls.predict(crops)
-                for r, cr in zip(regions, cls_results):
+            for r in regions:
+                x1, y1, x2, y2 = r['box']
+                box = (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy)))
+                r_conf = deviation_confidence(r['mean_score'], self.img_thr)
+                if self.cls is not None:
+                    bx1, by1, bx2, by2 = box
+                    bx1, by1 = max(0, bx1), max(0, by1)
+                    bx2, by2 = min(w0, bx2), min(h0, by2)
+                    crop = img_rgb[by1:by2, bx1:bx2]
+                    cr = self.cls.predict([crop])[0] if crop.size else None
+                    if cr is None:
+                        cr = {'class_id': self.nc, 'class_conf': 0.0, 'probs': []}
                     cid = cr['class_id']
-                    r_conf = deviation_confidence(r['mean_score'], self.img_thr)
                     result.regions.append(RegionResult(
-                        box=r['box'], area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
+                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
                         class_id=cid, class_name=self.class_names[cid] if cid < len(self.class_names) else '未知类型',
                         class_conf=cr['class_conf'], probs=cr['probs']))
-            elif regions:
-                for r in regions:
-                    r_conf = deviation_confidence(r['mean_score'], self.img_thr)
+                else:
                     result.regions.append(RegionResult(
-                        box=r['box'], area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
+                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
                         class_id=self.nc, class_name='未知类型', class_conf=0.0, probs=[]))
         result.latency_ms = (time.perf_counter() - t0) * 1000
         return result
 
     def process_file(self, path: str) -> ImageResult:
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = imread_unicode(path, cv2.IMREAD_COLOR)
         if img is None:
             raise IOError(f'无法读取图片: {path}')
         return self.process(img, image_name=os.path.basename(path))
@@ -126,18 +133,28 @@ class FabricAnomalyPipeline:
     # ---------------- 可视化 ----------------
     def visualize(self, img_bgr: np.ndarray, result: ImageResult, font_path: Optional[str] = None,
                   show_heatmap: bool = True) -> np.ndarray:
-        """画热力图 + 缺陷框 + 标签 (中文名 + 分类置信度 + 异常置信度)."""
+        """画热力图 + 缺陷框 + 标签 (中文名 + 分类置信度 + 异常置信度).
+
+        显示图长边封顶 max_vis_side (超大原图不至于把可视化撑爆); result.regions 仍是原图坐标.
+        """
         from PIL import Image, ImageDraw
-        vis = img_bgr.copy()
+        h0, w0 = img_bgr.shape[:2]
+        vscale = min(1.0, self.max_vis_side / max(h0, w0))
+        if vscale < 1.0:
+            vis = cv2.resize(img_bgr, (max(1, round(w0 * vscale)), max(1, round(h0 * vscale))),
+                             interpolation=cv2.INTER_AREA)
+        else:
+            vis = img_bgr.copy()
         if show_heatmap and result.is_anomaly:
-            full_map, _ = self.det.predict(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-            m = full_map.copy()
+            full_map, _, (sx, sy) = self.det.predict(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+                                                     max_map_side=self.max_map_side)
+            m = cv2.resize(full_map, (vis.shape[1], vis.shape[0]), interpolation=cv2.INTER_LINEAR)
             lo, hi = np.percentile(m, 50), max(np.percentile(m, 99), 1e-6)
             mn = np.clip((m - lo) / (hi - lo), 0, 1)
             heat = cv2.applyColorMap((mn * 255).astype(np.uint8), cv2.COLORMAP_JET)
             vis = cv2.addWeighted(vis, 0.65, heat, 0.35, 0)
         for r in result.regions:
-            x1, y1, x2, y2 = r.box
+            x1, y1, x2, y2 = [int(round(v * vscale)) for v in r.box]
             color = UNKNOWN_COLOR if r.class_id == self.nc else class_color(r.class_id)
             # cv2 画框用 BGR
             bgr = (color[2], color[1], color[0])
