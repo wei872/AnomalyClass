@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from .data.yolo import build_crop_samples, pil_to_tensor_batch
-from .util import get_logger
+from .util import get_logger, torch_load
 
 ARCHS = ['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34']
 
@@ -105,7 +105,7 @@ class RegionClassifier:
     @classmethod
     def load(cls, path: str, nc: int, names: List[str], device: str = 'cuda', logger=None):
         log = logger or (lambda *a, **k: print(*a))
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        ckpt = torch_load(path, map_location='cpu')
         meta = ckpt['meta']
         model = build_classifier(meta['arch'], num_classes=nc, pretrained=False, logger=log)
         model.load_state_dict(ckpt['model'])
@@ -237,7 +237,7 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
             log(f'  *** 新最优 val_acc={acc:.4f}, 保存 {best_path}')
 
     # 校准 temperature 和 unknown_thr
-    ckpt = torch.load(best_path, map_location='cpu', weights_only=False)
+    ckpt = torch_load(best_path, map_location='cpu')
     model.load_state_dict(ckpt['model'])
     temperature = calibrate_temperature(model, val_loader, device, log)
     max_probs = _max_probs(model, val_loader, device, temperature)

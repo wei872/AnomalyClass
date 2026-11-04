@@ -22,7 +22,7 @@ from torchvision import transforms as T
 from .dinomaly import build_dinomaly
 from .dinomaly.losses import global_cosine, global_cosine_hm_percent
 from .util import (AverageMeter, cal_anomaly_maps, get_gaussian_kernel, list_images, mask_to_boxes,
-                   roc_auc, average_precision, f1_max, get_logger)
+                   roc_auc, average_precision, f1_max, get_logger, torch_load)
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -126,7 +126,7 @@ class AnomalyDetector:
     def load(cls, path: str, device: str = 'cuda', allow_random_init: bool = False, logger=None,
              half: bool = False):
         log = logger or (lambda *a, **k: print(*a))
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        ckpt = torch_load(path, map_location='cpu')
         hp = ckpt['hparams']
         model = build_dinomaly(hp['backbone'], dropout=hp.get('dropout', 0.4), la=bool(hp.get('la', 1)),
                                lc=hp.get('lc', 2), cr=bool(hp.get('cr', 1)), allow_random_init=allow_random_init,
@@ -137,6 +137,23 @@ class AnomalyDetector:
 
 
 # ------------------------- 训练 -------------------------
+class NormalTransformDataset(torch.utils.data.Dataset):
+    """正常图 + 训练 transform. 必须放在模块级别: Windows 上 DataLoader(num_workers>0)
+    用 spawn 方式启动子进程, 会 pickle 数据集类, 函数内的局部类无法 pickle."""
+
+    def __init__(self, images_dir: str, transform):
+        from .data.yolo import NormalImageDataset
+        self.base = NormalImageDataset(images_dir)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        img, _ = self.base[i]
+        return self.transform(img)
+
+
 class WarmupCosineScheduler:
     def __init__(self, optimizer, total_epochs: int, warmup_epochs: int = 100, final_ratio: float = 1.0):
         self.optimizer = optimizer
@@ -166,26 +183,14 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                    device: str = 'cuda', num_workers: int = 4, seed: int = 1, weights_dir: str = None,
                    allow_random_init: bool = False, resume: Optional[str] = None, logger=None):
     """在纯正常图上训练 Dinomaly2 检测器. 返回保存路径."""
-    from .data.yolo import NormalImageDataset, YoloDefectDataset
+    from .data.yolo import YoloDefectDataset
     log = logger or get_logger('train_detector')
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
     tf = get_train_transform(image_size, crop_size)
-
-    class _DS(torch.utils.data.Dataset):
-        def __init__(self, d):
-            self.d = d
-
-        def __len__(self):
-            return len(self.d)
-
-        def __getitem__(self, i):
-            img, _ = self.d[i]
-            return tf(img)
-
-    train_ds = _DS(NormalImageDataset(normal_train_dir))
+    train_ds = NormalTransformDataset(normal_train_dir, tf)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                               drop_last=True, pin_memory=True)
     log(f'训练正常样本数: {len(train_ds)}, batch={batch_size}, iters={total_iters}')
@@ -193,7 +198,7 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
     model = build_dinomaly(backbone, dropout=dropout, la=la, lc=lc, cr=cr, weights_dir=weights_dir,
                            allow_random_init=allow_random_init, logger=log).to(device)
     if resume:
-        model.load_state_dict(torch.load(resume, map_location='cpu', weights_only=False)['model'])
+        model.load_state_dict(torch_load(resume, map_location='cpu')['model'])
         log(f'从 {resume} 恢复')
     model.train()
     for p in model.encoder.parameters():

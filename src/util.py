@@ -182,6 +182,18 @@ def count_parameters(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def torch_load(path: str, map_location='cpu'):
+    """安全的 torch.load: 优先 weights_only=True (只允许张量/基本类型, 防 pickle 注入).
+
+    本项目所有 checkpoint (detector / classifier / DINOv2 官方权重) 都是纯 state_dict 或
+    {state_dict, 基本类型字典}, 均兼容 weights_only=True; 老版本 torch 无该参数时回退.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def cal_anomaly_maps(fs_list, ft_list, out_size=224):
     """与 Dinomaly2 utils.cal_anomaly_maps 一致: 1 - cos(en, de), 上采样后按组平均."""
     if not isinstance(out_size, tuple):

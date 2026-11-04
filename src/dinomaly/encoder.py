@@ -74,7 +74,8 @@ def load_encoder(name: str, weights_dir: str = None, allow_random_init: bool = F
                 f'下载 DINOv2 权重失败: {e}\n'
                 f'请手动下载 {url} 放到 {ckpt_path}, 或检查网络后重试.')
     log(f'[encoder] 加载权重: {ckpt_path}')
-    state = torch.load(ckpt_path, map_location='cpu')
+    from ..util import torch_load
+    state = torch_load(ckpt_path, map_location='cpu')
     if isinstance(state, dict) and 'model' in state and isinstance(state['model'], dict):
         state = state['model']
     missing, unexpected = model.load_state_dict(state, strict=False)
