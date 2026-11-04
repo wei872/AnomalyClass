@@ -55,23 +55,60 @@ def list_images(folder: str) -> List[str]:
 
 
 def imread_unicode(path: str, flags: int = None):
-    """安全读图 (支持中文/非 ASCII 路径, 支持 bmp/png/jpg 等).
+    """安全读图 (支持中文/非 ASCII 路径, bmp/png/jpg 等任意 cv2/PIL 可解格式).
 
-    原理: Windows 上 cv2.imread / np.fromfile 都可能不认 Unicode 路径,
-    而 Python 内置 open() 走宽字符 API, 任何路径都能读 -> 读成 bytes 后 cv2.imdecode.
+    三级回退:
+      1. 内置 open(path,'rb') 读字节 (Windows 上走宽字符 API, 任何路径都可靠) -> cv2.imdecode
+      2. PIL.Image.open(path) (同样 Unicode 安全, 能解部分 cv2 解不了的格式) -> 转 BGR ndarray
+      3. cv2.imread(path) 兜底 (ASCII 路径 / 非 Windows 平台)
+    全部失败返回 None.
     """
     import cv2
     if flags is None:
         flags = cv2.IMREAD_COLOR
+    # 1) open + cv2.imdecode
     try:
-        with open(path, 'rb') as f:                       # 唯一可靠的 Unicode 文件读取方式
-            data = np.frombuffer(f.read(), dtype=np.uint8)
-        img = cv2.imdecode(data, flags)
+        with open(path, 'rb') as f:
+            data = f.read()
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), flags)
         if img is not None:
             return img
     except Exception:
         pass
-    return cv2.imread(path, flags)                         # 兜底: ASCII 路径 / 非 Windows 平台
+    # 2) PIL
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            if flags == cv2.IMREAD_UNCHANGED:
+                arr = np.array(im)
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+                if arr.ndim == 3:
+                    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                return arr
+            if flags == cv2.IMREAD_GRAYSCALE:
+                return np.array(im.convert('L'))
+            return cv2.cvtColor(np.array(im.convert('RGB')), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
+    # 3) cv2.imread 兜底
+    try:
+        return cv2.imread(path, flags)
+    except Exception:
+        return None
+
+
+def image_diag(path: str) -> dict:
+    """读图失败时的诊断信息: 是否存在 / 大小 / 文件头魔数."""
+    info = {'path': path, 'exists': os.path.exists(path)}
+    try:
+        info['size'] = os.path.getsize(path) if info['exists'] else None
+        if info['exists']:
+            with open(path, 'rb') as f:
+                info['magic_hex'] = f.read(16).hex()
+    except Exception as e:
+        info['error'] = str(e)
+    return info
 
 
 def imwrite_unicode(path: str, img: np.ndarray) -> bool:

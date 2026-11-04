@@ -141,9 +141,9 @@ class NormalTransformDataset(torch.utils.data.Dataset):
     """正常图 + 训练 transform. 必须放在模块级别: Windows 上 DataLoader(num_workers>0)
     用 spawn 方式启动子进程, 会 pickle 数据集类, 函数内的局部类无法 pickle."""
 
-    def __init__(self, images_dir: str, transform):
+    def __init__(self, images_dir: str, transform, logger=None):
         from .data.yolo import NormalImageDataset
-        self.base = NormalImageDataset(images_dir)
+        self.base = NormalImageDataset(images_dir, verify=True, logger=logger)
         self.transform = transform
 
     def __len__(self):

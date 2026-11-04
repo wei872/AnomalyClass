@@ -7,7 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..util import list_images, read_yolo_label, yolo_to_xyxy, rasterize_boxes, imread_unicode
+from ..util import (list_images, read_yolo_label, yolo_to_xyxy, rasterize_boxes, imread_unicode,
+                    image_diag)
 
 IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
 
@@ -17,15 +18,36 @@ def label_path_for(img_path: str, labels_dir: str) -> str:
     return os.path.join(labels_dir, base)
 
 
+def verify_images(paths: List[str], logger=None, tag: str = '') -> Tuple[List[str], List[str]]:
+    """逐个探测图片是否可解码; 返回 (可读列表, 坏文件列表). 坏文件会被跳过并打日志."""
+    ok, bad = [], []
+    for i, p in enumerate(paths):
+        if imread_unicode(p, cv2.IMREAD_COLOR) is None:
+            bad.append(p)
+            if logger:
+                logger(f'[data] 跳过无法解码的图片: {p}  诊断: {image_diag(p)}')
+        else:
+            ok.append(p)
+        if logger and (i + 1) % 500 == 0:
+            logger(f'[data] {tag} 探测进度 {i + 1}/{len(paths)} (坏文件 {len(bad)})')
+    return ok, bad
+
+
 class YoloDefectDataset(Dataset):
     """带 YOLO 框标注的缺陷数据集 (train / val 共用).
 
     每项: (img_rgb np.uint8 HWC, boxes_xyxy [(cls,x1,y1,x2,y2)], mask np.uint8, img_path)
+    verify=True 时在初始化探测并跳过坏文件 (避免训练中途崩溃).
     """
 
-    def __init__(self, images_dir: str, labels_dir: Optional[str] = None):
+    def __init__(self, images_dir: str, labels_dir: Optional[str] = None, verify: bool = True, logger=None):
         self.images = list_images(images_dir)
         self.labels_dir = labels_dir
+        self.skipped: List[str] = []
+        if verify:
+            self.images, self.skipped = verify_images(self.images, logger=logger, tag=images_dir)
+            if not self.images:
+                raise FileNotFoundError(f'目录中没有可解码的图片: {images_dir}')
 
     def __len__(self):
         return len(self.images)
@@ -34,7 +56,7 @@ class YoloDefectDataset(Dataset):
         img_path = self.images[idx]
         img = imread_unicode(img_path, cv2.IMREAD_COLOR)
         if img is None:
-            raise IOError(f'无法读取图片: {img_path}')
+            raise IOError(f'无法读取图片: {img_path}  诊断: {image_diag(img_path)}')
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
         yolo = read_yolo_label(label_path_for(img_path, self.labels_dir)) if self.labels_dir else []
@@ -44,19 +66,28 @@ class YoloDefectDataset(Dataset):
 
 
 class NormalImageDataset(Dataset):
-    """纯正常样本 (无标签), 用于无监督检测器训练 / 校准. 返回 (img_rgb, img_path)."""
+    """纯正常样本 (无标签), 用于无监督检测器训练 / 校准. 返回 (img_rgb, img_path).
 
-    def __init__(self, images_dir: str):
+    注意: 读图必须用 imread_unicode (Windows 上 cv2.imread 不认中文路径).
+    verify=True 时在初始化探测并跳过坏文件.
+    """
+
+    def __init__(self, images_dir: str, verify: bool = True, logger=None):
         self.images = list_images(images_dir)
+        self.skipped: List[str] = []
+        if verify:
+            self.images, self.skipped = verify_images(self.images, logger=logger, tag=images_dir)
+            if not self.images:
+                raise FileNotFoundError(f'目录中没有可解码的图片: {images_dir}')
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         img_path = self.images[idx]
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        img = imread_unicode(img_path, cv2.IMREAD_COLOR)
         if img is None:
-            raise IOError(f'无法读取图片: {img_path}')
+            raise IOError(f'无法读取图片: {img_path}  诊断: {image_diag(img_path)}')
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), img_path
 
 

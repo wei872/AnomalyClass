@@ -79,6 +79,9 @@ def build_dataset(root):
         os.makedirs(f'{root}/normal/images/{split}', exist_ok=True)
         for i in range(20 if split == 'train' else 8):
             imwrite_unicode(f'{root}/normal/images/{split}/正常_{i:03d}.png', make_texture(rng))
+        # 故意放一个 0 字节的坏文件 (中文名 bmp), 应被探测并跳过而不是炸训练
+        with open(f'{root}/normal/images/{split}/坏文件_000 - 副本.bmp', 'wb') as f:
+            f.write(b'')
     yaml_path = f'{root}/fabric_test.yaml'
     with open(yaml_path, 'w', encoding='utf-8') as f:
         f.write(f'path: {root}\ntrain: {root}/images/train\nval: {root}/images/val\n'
@@ -97,6 +100,13 @@ def main():
         cfg = load_fabric_config(yaml_path)
         log(cfg.summary())
         assert cfg.nc == NC and cfg.class_names[-1] == '未知类型'
+
+        # 坏文件应被跳过
+        from src.data.yolo import NormalImageDataset
+        nds = NormalImageDataset(cfg.normaltrain_images, verify=True, logger=log)
+        assert len(nds.skipped) == 1 and '坏文件' in nds.skipped[0]
+        assert len(nds.images) == 20
+        log(f'坏文件跳过正常: skipped={nds.skipped}')
 
         device = 'cpu'
         # 1) 训练检测器 (tiny, 少量迭代)
