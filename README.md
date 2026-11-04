@@ -137,7 +137,7 @@ tests/smoke_test.py    # 合成数据端到端冒烟测试（CPU, 无需下载�
 
 ## 8. 备注
 
-- **中文文件名**：完全支持。Python 侧（目录扫描、YOLO 标签 `.txt`、yaml 类名、JSON 输出）原生支持 Unicode；图片读写统一走 `src/util.py` 的 `imread_unicode / imwrite_unicode`（`np.fromfile`+`cv2.imdecode` / `cv2.imencode`+`np.tofile`），绕开 Windows 上 `cv2.imread/imwrite` 不认中文路径的问题。标签文件名只需与图片同名（如 `布匹样本_001.png` ↔ `布匹样本_001.txt`）。
+- **中文文件名**：完全支持（含 `xxx - 副本.bmp` 这类带空格+中文的 bmp）。Python 侧（目录扫描、YOLO 标签 `.txt`、yaml 类名、JSON 输出）原生支持 Unicode；图片读写统一走 `src/util.py` 的 `imread_unicode / imwrite_unicode`：用内置 `open(path,'rb'/'wb')`（Windows 宽字符 API，任何路径都可靠）收发字节，再 `cv2.imdecode / cv2.imencode`，绕开 Windows 上 `cv2.imread`、部分 numpy 版本的 `np.fromfile` 不认 Unicode 路径的问题。标签文件名只需与图片同名（如 `布匹样本_001.bmp` ↔ `布匹样本_001.txt`）。
 - **Windows 兼容**：所有脚本都有 `if __name__ == '__main__'` 保护；DataLoader 用的数据集类均为模块级（spawn 多进程需要可 pickle，已用 spawn context 实测通过）；checkpoint 统一用 `torch_load()`（`weights_only=True`，无 FutureWarning 且防 pickle 注入）。
 - 检测器评估指标（I/P-AUROC、AP、F1）在 `calibrate.py` / 训练日志中输出；像素级 GT 由 YOLO 框栅格化得到。
 - 中文可视化标签需要系统有中文字体（Windows 自带黑体/微软雅黑会自动使用）；也可 `--font 路径` 指定，或把字体放进 `assets/fonts/`。

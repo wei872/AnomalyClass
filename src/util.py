@@ -55,29 +55,35 @@ def list_images(folder: str) -> List[str]:
 
 
 def imread_unicode(path: str, flags: int = None):
-    """安全读图: Windows 上 cv2.imread 不支持中文/非 ASCII 路径, 用 np.fromfile + cv2.imdecode 绕开."""
+    """安全读图 (支持中文/非 ASCII 路径, 支持 bmp/png/jpg 等).
+
+    原理: Windows 上 cv2.imread / np.fromfile 都可能不认 Unicode 路径,
+    而 Python 内置 open() 走宽字符 API, 任何路径都能读 -> 读成 bytes 后 cv2.imdecode.
+    """
     import cv2
     if flags is None:
         flags = cv2.IMREAD_COLOR
     try:
-        data = np.fromfile(path, dtype=np.uint8)   # np.fromfile 走 Unicode 路径, 中文名没问题
+        with open(path, 'rb') as f:                       # 唯一可靠的 Unicode 文件读取方式
+            data = np.frombuffer(f.read(), dtype=np.uint8)
         img = cv2.imdecode(data, flags)
+        if img is not None:
+            return img
     except Exception:
-        img = None
-    if img is None:                                 # 兜底: 直接 cv2.imread (Linux/macOS 或已是 ASCII 路径)
-        img = cv2.imread(path, flags)
-    return img
+        pass
+    return cv2.imread(path, flags)                         # 兜底: ASCII 路径 / 非 Windows 平台
 
 
 def imwrite_unicode(path: str, img: np.ndarray) -> bool:
-    """安全写图: 同上, 用 cv2.imencode + np.tofile 支持中文路径."""
+    """安全写图 (支持中文路径): cv2.imencode 编码后用内置 open('wb') 写出."""
     import cv2
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     ext = os.path.splitext(path)[1] or '.png'
     try:
         ok, buf = cv2.imencode(ext, img)
         if ok:
-            buf.tofile(path)
+            with open(path, 'wb') as f:
+                f.write(buf.tobytes())
             return True
     except Exception:
         pass
