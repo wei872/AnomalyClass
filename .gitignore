@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+checkpoints/
+runs/
+backbones/
+assets/fonts/*.ttc
+assets/fonts/*.otf
+.pytest_cache/

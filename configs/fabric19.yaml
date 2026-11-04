@@ -1,0 +1,29 @@
+# AnomalyClass 流水线默认配置 (dataset/fabric19.yaml 只放数据集路径与类别)
+detector:
+  backbone: dinov2reg_vit_small_14   # 1660 实时推荐; 更准可换 dinov2reg_vit_base_14
+  image_size: 448                    # 推理输入尺寸; 想更快用 336 (约 2.5x 加速)
+  crop_size: 392
+  dropout: 0.4
+  la: 1                              # 线性注意力
+  lc: 2                              # loose constraint: 2 组
+  cr: 1                              # context-aware recenter
+  half: false                        # GTX 1660 上可开 true (FP16, 约 2x 加速)
+
+calibration:                         # 在 normalval 纯正常样本上校准
+  img_quantile: 1.0                  # 图级分数分位数 (1.0 = 正常最大值)
+  img_factor: 1.0                    # 安全系数
+  pix_quantile: 0.9999               # 像素级分位数
+  pix_factor: 1.0
+
+segmentation:                        # 异常图 -> 区域框
+  mask_ratio: 0.5                    # 掩码阈值 = mask_ratio * pix_thr
+  min_area_ratio: 0.0002             # 最小区域面积 (占图像比例)
+  dilate: 7                          # 连通域前膨胀核大小 (合并邻近区域)
+  box_pad: 0.2                       # 框向外扩展比例 (给分类器更多上下文)
+
+classifier:
+  arch: mobilenet_v3_small           # mobilenet_v3_small(推荐) / resnet18 ...
+  crop_size: 224
+  crop_pad: 0.3                      # 训练裁剪时四周扩展比例
+  unknown_thr: null                  # null = 训练时按 val 分位数自动校准; 也可手动指定 (0.5~0.8)
+  temperature: null                  # null = 训练时自动温度缩放

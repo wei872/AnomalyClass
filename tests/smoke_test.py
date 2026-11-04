@@ -1,0 +1,155 @@
+"""端到端冒烟测试 (CPU, 合成数据, tiny 模型, 无需下载权重).
+
+流程: 造合成布匹数据集(正常纹理 + 缺陷块, YOLO 标注) -> 训练检测器几步 -> 校准阈值
+      -> 训练分类器几轮 -> 跑完整流水线 -> 校验输出结构.
+
+运行: python tests/smoke_test.py
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.classify import train_classifier, RegionClassifier
+from src.data import load_fabric_config
+from src.detect import AnomalyDetector, calibrate, train_detector, deviation_confidence
+from src.pipeline import FabricAnomalyPipeline
+from src.util import get_logger, setup_seed, xyxy_to_yolo
+
+NC = 3
+NAMES = ['污点', '破洞', '色差']
+
+
+def make_texture(rng, h=160, w=160):
+    base = rng.integers(120, 180, size=(h, w, 3), dtype=np.uint8)
+    for _ in range(40):
+        y, x = rng.integers(0, h), rng.integers(0, w)
+        cv2.line(base, (x, y), (min(w - 1, x + rng.integers(5, 30)), min(h - 1, y + rng.integers(1, 4))),
+                 (200, 200, 200), 1)
+    return base
+
+
+def make_sample(rng, defect=None):
+    img = make_texture(rng)
+    boxes = []
+    if defect is not None:
+        h, w = img.shape[:2]
+        bw = int(w * 0.25)
+        bh = int(h * 0.25)
+        x1 = int(rng.integers(10, w - bw - 10))
+        y1 = int(rng.integers(10, h - bh - 10))
+        x2, y2 = x1 + bw, y1 + bh
+        if defect == 0:      # 污点: 深色块
+            cv2.rectangle(img, (x1, y1), (x2, y2), (30, 30, 30), -1)
+        elif defect == 1:    # 破洞: 白色块
+            cv2.rectangle(img, (x1, y1), (x2, y2), (245, 245, 245), -1)
+        else:                # 色差: 红色块
+            cv2.rectangle(img, (x1, y1), (x2, y2), (40, 40, 220), -1)
+        boxes.append((defect, x1, y1, x2, y2))
+    return img, boxes
+
+
+def write_yolo(txt, boxes, w, h):
+    with open(txt, 'w') as f:
+        for c, x1, y1, x2, y2 in boxes:
+            f.write(' '.join(map(str, xyxy_to_yolo([(c, x1, y1, x2, y2)], w, h)[0])) + '\n')
+
+
+def build_dataset(root):
+    rng = np.random.default_rng(7)
+    for split in ['train', 'val']:
+        os.makedirs(f'{root}/images/{split}', exist_ok=True)
+        os.makedirs(f'{root}/labels/{split}', exist_ok=True)
+        n = 24 if split == 'train' else 10
+        for i in range(n):
+            defect = None if i % 3 == 0 else i % NC
+            img, boxes = make_sample(rng, defect)
+            cv2.imwrite(f'{root}/images/{split}/{i:03d}.png', img)
+            write_yolo(f'{root}/labels/{split}/{i:03d}.txt', boxes, img.shape[1], img.shape[0])
+    for split in ['train', 'val']:
+        os.makedirs(f'{root}/normal/images/{split}', exist_ok=True)
+        for i in range(20 if split == 'train' else 8):
+            cv2.imwrite(f'{root}/normal/images/{split}/{i:03d}.png', make_texture(rng))
+    yaml_path = f'{root}/fabric_test.yaml'
+    with open(yaml_path, 'w', encoding='utf-8') as f:
+        f.write(f'path: {root}\ntrain: {root}/images/train\nval: {root}/images/val\n'
+                f'normaltrain: {root}/normal/images/train\nnormalval: {root}/normal/images/val\n'
+                f'nc: {NC}\nnames: {NAMES}\n')
+    return yaml_path
+
+
+def main():
+    log = get_logger('smoke')
+    setup_seed(1)
+    tmp = tempfile.mkdtemp(prefix='anomalyclass_smoke_')
+    log(f'临时目录: {tmp}')
+    try:
+        yaml_path = build_dataset(tmp)
+        cfg = load_fabric_config(yaml_path)
+        log(cfg.summary())
+        assert cfg.nc == NC and cfg.class_names[-1] == '未知类型'
+
+        device = 'cpu'
+        # 1) 训练检测器 (tiny, 少量迭代)
+        det_dir = os.path.join(tmp, 'det')
+        best = train_detector(cfg.normaltrain_images, det_dir, backbone='tiny_test_14',
+                              image_size=112, crop_size=98, total_iters=6, batch_size=4,
+                              eval_interval=6, eval_dir=cfg.val_images, eval_labels_dir=cfg.val_labels,
+                              device=device, num_workers=0, allow_random_init=True, logger=log)
+        assert os.path.exists(best)
+
+        # 2) 校准阈值
+        det = AnomalyDetector.load(best, device=device, allow_random_init=True, logger=log)
+        thr = calibrate(det, cfg.normalval_images, logger=log)
+        assert thr['img_thr'] > 0
+        thr_path = os.path.join(tmp, 'thresholds.json')
+        with open(thr_path, 'w') as f:
+            json.dump(thr, f)
+
+        # 3) 训练分类器
+        cls_dir = os.path.join(tmp, 'cls')
+        cls_best = train_classifier(cfg.train_images, cfg.train_labels, cfg.val_images, cfg.val_labels,
+                                    out_dir=cls_dir, nc=NC, names=NAMES, arch='mobilenet_v3_small',
+                                    crop_size=64, epochs=2, batch_size=8, num_workers=0,
+                                    pretrained=False, device=device, logger=log)
+        assert os.path.exists(cls_best)
+        cls = RegionClassifier.load(cls_best, nc=NC, names=NAMES + ['未知类型'], device=device, logger=log)
+
+        # 4) 完整流水线
+        pipe = FabricAnomalyPipeline(det, cls, cfg.class_names, img_thr=thr['img_thr'], pix_thr=thr['pix_thr'],
+                                     device=device, logger=log)
+        rng = np.random.default_rng(99)
+        img_def, boxes = make_sample(rng, defect=2)
+        img_norm, _ = make_sample(rng, defect=None)
+        res_def = pipe.process(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), 'defect.png')
+        res_norm = pipe.process(cv2.cvtColor(img_norm, cv2.COLOR_BGR2RGB), 'normal.png')
+        d = res_def.to_dict()
+        json.dumps(d, ensure_ascii=False)  # 必须可 JSON 序列化
+        log(f'defect: is_anomaly={d["is_anomaly"]} conf={d["anomaly_conf"]:.3f} regions={len(d["regions"])}')
+        log(f'normal: is_anomaly={res_norm.is_anomaly} conf={res_norm.anomaly_conf:.3f}')
+        for r in d['regions']:
+            log(f'  region box={r["box"]} class={r["class_name"]}({r["class_id"]}) '
+                f'class_conf={r["class_conf"]:.3f} anomaly_conf={r["anomaly_conf"]:.3f} probs_len={len(r["probs"])}')
+            assert 0 <= r['class_id'] <= NC
+            assert len(r['probs']) == NC + 1
+            assert 0.0 <= r['anomaly_conf'] < 1.0
+        assert 0.0 <= d['anomaly_conf'] < 1.0
+        # 可视化也要能跑通
+        vis = pipe.visualize(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), res_def)
+        assert vis.shape[:2] == img_def.shape[:2]
+        log(f'deviation_confidence(0)={deviation_confidence(0.0, thr["img_thr"]):.3f}, '
+            f'({thr["img_thr"]})={deviation_confidence(thr["img_thr"], thr["img_thr"]):.3f} (应为0.5)')
+        assert abs(deviation_confidence(thr['img_thr'], thr['img_thr']) - 0.5) < 1e-6
+        log('SMOKE TEST PASSED ✅')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    main()
