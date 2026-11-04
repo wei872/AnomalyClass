@@ -137,6 +137,7 @@ tests/smoke_test.py    # 合成数据端到端冒烟测试（CPU, 无需下载�
 
 ## 8. 备注
 
+- **中文文件名**：完全支持。Python 侧（目录扫描、YOLO 标签 `.txt`、yaml 类名、JSON 输出）原生支持 Unicode；图片读写统一走 `src/util.py` 的 `imread_unicode / imwrite_unicode`（`np.fromfile`+`cv2.imdecode` / `cv2.imencode`+`np.tofile`），绕开 Windows 上 `cv2.imread/imwrite` 不认中文路径的问题。标签文件名只需与图片同名（如 `布匹样本_001.png` ↔ `布匹样本_001.txt`）。
 - 检测器评估指标（I/P-AUROC、AP、F1）在 `calibrate.py` / 训练日志中输出；像素级 GT 由 YOLO 框栅格化得到。
 - 中文可视化标签需要系统有中文字体（Windows 自带黑体/微软雅黑会自动使用）；也可 `--font 路径` 指定，或把字体放进 `assets/fonts/`。
 - 本实现代码来自 Dinomaly2（Apache-2.0），如用于论文/产品，请按其要求在致谢中注明。

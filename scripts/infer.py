@@ -25,7 +25,7 @@ import cv2
 
 from src.data import load_fabric_config
 from src.pipeline import build_pipeline
-from src.util import FpsMeter, get_logger, list_images
+from src.util import FpsMeter, get_logger, list_images, imread_unicode, imwrite_unicode
 
 
 def main():
@@ -63,7 +63,7 @@ def main():
         res = pipe.process(img_bgr, name)
         vis = pipe.visualize(img_bgr, res, font_path=args.font, show_heatmap=not args.no_heatmap)
         out_img = os.path.join(args.out, os.path.splitext(os.path.basename(name))[0] + '_vis.png')
-        cv2.imwrite(out_img, vis)
+        imwrite_unicode(out_img, vis)   # 支持中文文件名
         d = res.to_dict()
         d['vis'] = out_img
         log(f'{name}: is_anomaly={d["is_anomaly"]} anomaly_conf={d["anomaly_conf"]:.3f} '

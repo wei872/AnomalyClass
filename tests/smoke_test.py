@@ -20,7 +20,7 @@ from src.classify import train_classifier, RegionClassifier
 from src.data import load_fabric_config
 from src.detect import AnomalyDetector, calibrate, train_detector, deviation_confidence
 from src.pipeline import FabricAnomalyPipeline
-from src.util import get_logger, setup_seed, xyxy_to_yolo
+from src.util import get_logger, setup_seed, xyxy_to_yolo, imwrite_unicode, imread_unicode
 
 NC = 3
 NAMES = ['污点', '破洞', '色差']
@@ -70,12 +70,15 @@ def build_dataset(root):
         for i in range(n):
             defect = None if i % 3 == 0 else i % NC
             img, boxes = make_sample(rng, defect)
-            cv2.imwrite(f'{root}/images/{split}/{i:03d}.png', img)
-            write_yolo(f'{root}/labels/{split}/{i:03d}.txt', boxes, img.shape[1], img.shape[0])
+            # 故意用中文文件名, 验证 Unicode 路径读写
+            name = f'布匹样本_{i:03d}.png' if i % 2 == 0 else f'{i:03d}.png'
+            imwrite_unicode(f'{root}/images/{split}/{name}', img)
+            stem = os.path.splitext(name)[0]
+            write_yolo(f'{root}/labels/{split}/{stem}.txt', boxes, img.shape[1], img.shape[0])
     for split in ['train', 'val']:
         os.makedirs(f'{root}/normal/images/{split}', exist_ok=True)
         for i in range(20 if split == 'train' else 8):
-            cv2.imwrite(f'{root}/normal/images/{split}/{i:03d}.png', make_texture(rng))
+            imwrite_unicode(f'{root}/normal/images/{split}/正常_{i:03d}.png', make_texture(rng))
     yaml_path = f'{root}/fabric_test.yaml'
     with open(yaml_path, 'w', encoding='utf-8') as f:
         f.write(f'path: {root}\ntrain: {root}/images/train\nval: {root}/images/val\n'
@@ -127,8 +130,14 @@ def main():
         rng = np.random.default_rng(99)
         img_def, boxes = make_sample(rng, defect=2)
         img_norm, _ = make_sample(rng, defect=None)
-        res_def = pipe.process(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), 'defect.png')
-        res_norm = pipe.process(cv2.cvtColor(img_norm, cv2.COLOR_BGR2RGB), 'normal.png')
+        res_def = pipe.process(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), '缺陷图.png')
+        res_norm = pipe.process(cv2.cvtColor(img_norm, cv2.COLOR_BGR2RGB), '正常图.png')
+        # 中文路径的文件级读写也要通
+        p_cn = os.path.join(tmp, '中文目录_测试图.png')
+        assert imwrite_unicode(p_cn, cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB))
+        assert imread_unicode(p_cn) is not None
+        res_file = pipe.process_file(p_cn)
+        assert res_file.is_anomaly == res_def.is_anomaly
         d = res_def.to_dict()
         json.dumps(d, ensure_ascii=False)  # 必须可 JSON 序列化
         log(f'defect: is_anomaly={d["is_anomaly"]} conf={d["anomaly_conf"]:.3f} regions={len(d["regions"])}')

@@ -16,7 +16,7 @@ import torch
 
 from .classify import RegionClassifier
 from .detect import AnomalyDetector, deviation_confidence
-from .util import (class_color, get_cjk_font, get_logger, UNKNOWN_COLOR)
+from .util import (class_color, get_cjk_font, get_logger, imread_unicode, UNKNOWN_COLOR)
 
 
 @dataclass

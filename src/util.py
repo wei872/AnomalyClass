@@ -54,6 +54,36 @@ def list_images(folder: str) -> List[str]:
     return files
 
 
+def imread_unicode(path: str, flags: int = None):
+    """安全读图: Windows 上 cv2.imread 不支持中文/非 ASCII 路径, 用 np.fromfile + cv2.imdecode 绕开."""
+    import cv2
+    if flags is None:
+        flags = cv2.IMREAD_COLOR
+    try:
+        data = np.fromfile(path, dtype=np.uint8)   # np.fromfile 走 Unicode 路径, 中文名没问题
+        img = cv2.imdecode(data, flags)
+    except Exception:
+        img = None
+    if img is None:                                 # 兜底: 直接 cv2.imread (Linux/macOS 或已是 ASCII 路径)
+        img = cv2.imread(path, flags)
+    return img
+
+
+def imwrite_unicode(path: str, img: np.ndarray) -> bool:
+    """安全写图: 同上, 用 cv2.imencode + np.tofile 支持中文路径."""
+    import cv2
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    ext = os.path.splitext(path)[1] or '.png'
+    try:
+        ok, buf = cv2.imencode(ext, img)
+        if ok:
+            buf.tofile(path)
+            return True
+    except Exception:
+        pass
+    return cv2.imwrite(path, img)
+
+
 def get_gaussian_kernel(kernel_size: int = 5, sigma: float = 4, channels: int = 1, device='cpu'):
     """与 Dinomaly2 utils.get_gaussian_kernel 相同: depthwise 高斯卷积 (nn.Conv2d, 可直接调用)."""
     import torch.nn as nn

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..util import list_images, read_yolo_label, yolo_to_xyxy, rasterize_boxes
+from ..util import list_images, read_yolo_label, yolo_to_xyxy, rasterize_boxes, imread_unicode
 
 IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
 
@@ -32,7 +32,7 @@ class YoloDefectDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.images[idx]
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        img = imread_unicode(img_path, cv2.IMREAD_COLOR)
         if img is None:
             raise IOError(f'无法读取图片: {img_path}')
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
