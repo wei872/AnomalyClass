@@ -117,9 +117,36 @@ def extract_crops(img: np.ndarray, boxes: List[Tuple], pad: float = 0.3, min_sid
     return crops
 
 
+def build_crop_index(images_dir: str, labels_dir: Optional[str], pad: float = 0.3):
+    """轻量裁剪索引: ([(img_path, (cls, cx, cy, w, h) 归一化, pad)], 坏文件列表).
+
+    只存路径 + 归一化框, 不加载任何像素 -> 整个索引可以安全 pickle
+    (Windows spawn 的 DataLoader worker 需要 pickle 数据集, 存像素会 MemoryError).
+    坏文件用 PIL 头部校验快速跳过 (Unicode 路径安全).
+    """
+    files = list_images(images_dir)
+    index, bad = [], []
+    for p in files:
+        try:
+            from PIL import Image
+            with Image.open(p) as im:
+                im.verify()
+        except Exception:
+            bad.append(p)
+            continue
+        yolo = read_yolo_label(label_path_for(p, labels_dir)) if labels_dir else []
+        for c, cx, cy, w, h in yolo:
+            if w > 0.002 and h > 0.002:
+                index.append((p, (int(c), float(cx), float(cy), float(w), float(h)), float(pad)))
+    return index, bad
+
+
 def build_crop_samples(images_dir: str, labels_dir: Optional[str], pad: float = 0.3,
                        max_per_image: Optional[int] = None):
-    """遍历整个 YOLO 数据集, 产出全部缺陷裁剪样本: [(crop_rgb, cls, img_path, box)]."""
+    """遍历整个 YOLO 数据集, 产出全部缺陷裁剪样本: [(crop_rgb, cls, img_path, box)].
+
+    注意: 会把所有裁剪像素加载进内存, 大数据集请用 build_crop_index + 惰性数据集.
+    """
     ds = YoloDefectDataset(images_dir, labels_dir)
     samples = []
     for i in range(len(ds)):

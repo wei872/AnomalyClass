@@ -9,13 +9,14 @@ import json
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from .data.yolo import build_crop_samples, pil_to_tensor_batch
-from .util import get_logger, torch_load
+from .data.yolo import build_crop_index, pil_to_tensor_batch
+from .util import get_logger, torch_load, imread_unicode, image_diag
 
 ARCHS = ['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34']
 
@@ -41,20 +42,51 @@ def build_classifier(arch: str = 'mobilenet_v3_small', num_classes: int = 19, pr
 
 
 class CropDataset(Dataset):
-    """缺陷裁剪数据集: samples = [(crop_rgb, cls, img_path, box)]."""
+    """惰性缺陷裁剪数据集: 只保存轻量索引 [(img_path, (cls,cx,cy,w,h), pad)],
+    在 __getitem__ 里才读图 + 裁剪. 这样整个数据集可安全 pickle (Windows spawn 的
+    DataLoader worker 要 pickle 数据集; 若把所有裁剪像素存在内存里会 MemoryError).
+    """
 
-    def __init__(self, samples, crop_size: int = 224, augment: bool = False):
-        self.samples = samples
+    def __init__(self, index, crop_size: int = 224, augment: bool = False, max_side: int = 1024):
+        self.index = index
         self.crop_size = crop_size
         self.augment = augment
+        self.max_side = max_side
+        self._last_path = None
+        self._last_img = None
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.index)
+
+    def _load(self, path: str):
+        if path != self._last_path:
+            img = imread_unicode(path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise IOError(f'无法读取图片: {path}  诊断: {image_diag(path)}')
+            if self.max_side and max(img.shape[:2]) > self.max_side:
+                s = self.max_side / max(img.shape[:2])
+                img = cv2.resize(img, (max(1, round(img.shape[1] * s)), max(1, round(img.shape[0] * s))),
+                                 interpolation=cv2.INTER_AREA)
+            self._last_path = path
+            self._last_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return self._last_img
 
     def __getitem__(self, i):
-        crop, cls, _, _ = self.samples[i]
+        path, (c, cx, cy, w, h), pad = self.index[i]
+        img = self._load(path)
+        H, W = img.shape[:2]
+        bw, bh = w * W, h * H
+        x1 = max(0, int((cx - w / 2) * W - bw * pad))
+        y1 = max(0, int((cy - h / 2) * H - bh * pad))
+        x2 = min(W, int(np.ceil((cx + w / 2) * W + bw * pad)))
+        y2 = min(H, int(np.ceil((cy + h / 2) * H + bh * pad)))
+        if x2 - x1 < 8:
+            x2 = min(W, x1 + 8)
+        if y2 - y1 < 8:
+            y2 = min(H, y1 + 8)
+        crop = img[y1:y2, x1:x2]
         x = pil_to_tensor_batch([crop], self.crop_size, augment=self.augment)[0]
-        return x, cls
+        return x, c
 
 
 class RegionClassifier:
@@ -180,21 +212,22 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
     np.random.seed(seed)
     os.makedirs(out_dir, exist_ok=True)
 
-    log(f'收集训练裁剪: {train_images}')
-    samples = build_crop_samples(train_images, train_labels, pad=crop_pad)
-    log(f'训练样本(缺陷裁剪)数: {len(samples)}')
+    log(f'收集训练裁剪索引: {train_images}')
+    train_index, bad = build_crop_index(train_images, train_labels, pad=crop_pad)
+    if bad:
+        log(f'警告: 跳过 {len(bad)} 个无法解码的图片, 如: {bad[0]}')
+    log(f'训练样本(缺陷裁剪)数: {len(train_index)}')
     if val_images and os.path.isdir(val_images):
-        val_samples = build_crop_samples(val_images, val_labels, pad=crop_pad)
-        train_samples = samples
-        log(f'val 样本数: {len(val_samples)}')
+        val_index, _ = build_crop_index(val_images, val_labels, pad=crop_pad)
+        log(f'val 样本数: {len(val_index)}')
     else:
-        train_samples, val_samples = _split_samples(samples, val_ratio, seed)
-        log(f'未提供 val, 从 train 划分: train={len(train_samples)} val={len(val_samples)}')
-    if not val_samples:
-        val_samples = train_samples[:max(1, len(train_samples) // 10)]
+        train_index, val_index = _split_samples(train_index, val_ratio, seed)
+        log(f'未提供 val, 从 train 划分: train={len(train_index)} val={len(val_index)}')
+    if not val_index:
+        val_index = train_index[:max(1, len(train_index) // 10)]
 
-    train_ds = CropDataset(train_samples, crop_size, augment=True)
-    val_ds = CropDataset(val_samples, crop_size, augment=False)
+    train_ds = CropDataset(train_index, crop_size, augment=True)
+    val_ds = CropDataset(val_index, crop_size, augment=False)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                               drop_last=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
