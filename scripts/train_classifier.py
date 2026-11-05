@@ -21,10 +21,12 @@ def main():
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))
     p.add_argument('--root', default=None)
     p.add_argument('--arch', default='mobilenet_v3_small',
-                   choices=['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34'])
-    p.add_argument('--crop-size', type=int, default=224)
+                   choices=['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34',
+                            'efficientnet_b0'],
+                   help='精度优先可选 resnet18/efficientnet_b0 (1660 上仍实时); 速度优先 mobilenet_v3_small')
+    p.add_argument('--crop-size', type=int, default=224, help='224 速度快; 288/320 更准(letterbox 保宽高比)')
     p.add_argument('--crop-pad', type=float, default=0.3, help='裁剪时四周扩展比例')
-    p.add_argument('--epochs', type=int, default=30)
+    p.add_argument('--epochs', type=int, default=50, help='默认 50, 配合早停(patience=15)')
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--val-ratio', type=float, default=0.1, help='未提供 val 时从 train 划分比例')

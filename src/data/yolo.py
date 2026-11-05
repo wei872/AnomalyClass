@@ -159,24 +159,45 @@ def build_crop_samples(images_dir: str, labels_dir: Optional[str], pad: float = 
     return samples
 
 
+def _letterbox_pil(img_rgb: np.ndarray, size: int):
+    """保持宽高比缩放到 size×size 画布中央 (灰边填充), 不压扁图像.
+
+    布匹缺陷多为长条形 (断纬/纬斜/油点线), 直接 Resize 成正方形会破坏方向信息, letterbox 保留全貌.
+    """
+    from PIL import Image
+    im = Image.fromarray(img_rgb)
+    w, h = im.size
+    if max(w, h) == 0:
+        return Image.new('RGB', (size, size), (114, 114, 114))
+    s = size / max(w, h)
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    im = im.resize((nw, nh), Image.BILINEAR)
+    canvas = Image.new('RGB', (size, size), (114, 114, 114))
+    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
+
+
 def pil_to_tensor_batch(crops: List[np.ndarray], crop_size: int = 224, augment: bool = False):
-    """把一批 RGB 裁剪转成 (N,3,crop_size,crop_size) tensor (ImageNet 归一化)."""
+    """把一批 RGB 裁剪转成 (N,3,crop_size,crop_size) tensor (letterbox 保宽高比 + ImageNet 归一化).
+
+    训练(augment=True)额外: 翻转/旋转90/颜色抖动/RandomErasing; 推理保持确定性.
+    """
     from torchvision import transforms as T
+    norm = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     if augment:
-        tf = T.Compose([
-            T.ToPILImage(),
-            T.RandomResizedCrop((crop_size, crop_size), scale=(0.7, 1.0), ratio=(0.8, 1.25)),
-            T.RandomHorizontalFlip(),
-            T.RandomVerticalFlip(),
-            T.RandomApply([T.ColorJitter(0.3, 0.3, 0.3, 0.1)], p=0.6),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        def tf(c):
+            im = _letterbox_pil(c, crop_size)
+            im = T.RandomHorizontalFlip()(im)
+            im = T.RandomVerticalFlip()(im)
+            im = T.functional.rotate(im, int(np.random.choice([0, 90, 180, 270])))
+            if np.random.rand() < 0.6:
+                im = T.ColorJitter(0.3, 0.3, 0.3, 0.1)(im)
+            x = T.ToTensor()(im)
+            x = norm(x)
+            if np.random.rand() < 0.3:
+                x = T.RandomErasing(p=1.0, scale=(0.02, 0.15), ratio=(0.3, 3.3))(x)
+            return x
     else:
-        tf = T.Compose([
-            T.ToPILImage(),
-            T.Resize((crop_size, crop_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        def tf(c):
+            return norm(T.ToTensor()(_letterbox_pil(c, crop_size)))
     return torch.stack([tf(c) for c in crops])

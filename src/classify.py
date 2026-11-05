@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from .data.yolo import build_crop_index, pil_to_tensor_batch
 from .util import get_logger, torch_load, imread_unicode, image_diag
 
-ARCHS = ['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34']
+ARCHS = ['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34', 'efficientnet_b0']
 
 
 def build_classifier(arch: str = 'mobilenet_v3_small', num_classes: int = 19, pretrained: bool = True,
@@ -104,17 +104,25 @@ class RegionClassifier:
         self.batch_size = batch_size
 
     @torch.no_grad()
-    def predict_probs(self, crops: Sequence[np.ndarray]) -> np.ndarray:
-        """crops: list of RGB ndarray -> (N, nc+1) 概率, 最后一列为未知类概率."""
+    def predict_probs(self, crops: Sequence[np.ndarray], tta: bool = True) -> np.ndarray:
+        """crops: list of RGB ndarray -> (N, nc+1) 概率, 最后一列为未知类概率.
+
+        tta=True 时对每张裁剪再做一次水平翻转, 两次 softmax 平均 (提升细粒度纹理分类稳定性).
+        """
         n = len(crops)
         out = np.zeros((n, self.nc + 1), dtype=np.float32)
         for s in range(0, n, self.batch_size):
             batch = crops[s:s + self.batch_size]
             if not batch:
                 continue
-            x = pil_to_tensor_batch(list(batch), self.crop_size, augment=False).to(self.device)
+            xs = [pil_to_tensor_batch(list(batch), self.crop_size, augment=False)]
+            if tta:
+                xs.append(pil_to_tensor_batch([c[:, ::-1].copy() for c in batch], self.crop_size, augment=False))
+            x = torch.cat(xs).to(self.device)
             logits = self.model(x) / self.temperature
             probs = torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32)
+            if tta:
+                probs = 0.5 * (probs[:len(batch)] + probs[len(batch):])
             m = probs.max(axis=1)
             u = (1.0 - m) * (m < self.unknown_thr)          # 未知概率
             probs = probs * (1.0 - u)[:, None]
@@ -228,7 +236,24 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
 
     train_ds = CropDataset(train_index, crop_size, augment=True)
     val_ds = CropDataset(val_index, crop_size, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+
+    # 每类样本数统计 + 类别权重 (19 类样本不均时, 少数类权重更大) + 加权随机采样
+    from collections import Counter
+    cnt = Counter(item[1][0] for item in train_index)
+    names_all = (names or []) + ['未知类型']
+    log('每类训练样本数: ' + ', '.join(f'{names_all[c] if c < len(names_all) else c}:{cnt.get(c, 0)}'
+                                        for c in sorted(cnt)))
+    class_weight = torch.zeros(nc, dtype=torch.float32)
+    total_n = max(sum(cnt.values()), 1)
+    for c in range(nc):
+        class_weight[c] = total_n / (nc * max(cnt.get(c, 0), 1))     # 逆频率权重
+    class_weight = (class_weight / class_weight.mean()).clamp(0.2, 10.0)
+    class_weight = class_weight.to(device)
+    sample_weights = torch.tensor([float(class_weight[item[1][0]]) for item in train_index],
+                                  dtype=torch.float32)
+    sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(train_index),
+                                                     replacement=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
                               drop_last=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -238,13 +263,26 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
 
     best_path = os.path.join(out_dir, 'best.pt')
     best_acc = -1.0
+    bad_epochs = 0
+    patience = 15
+    mixup_p = 0.5          # MixUp 概率
     for ep in range(1, epochs + 1):
         model.train()
         losses, correct, total = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = nn.functional.cross_entropy(logits, y, label_smoothing=0.05)
+            # MixUp 增强 (细粒度纹理分类常用, 提升泛化)
+            if np.random.rand() < mixup_p:
+                lam = float(np.random.beta(0.2, 0.2))
+                perm = torch.randperm(x.size(0), device=x.device)
+                x = lam * x + (1 - lam) * x[perm]
+                logits = model(x)
+                loss = lam * nn.functional.cross_entropy(logits, y, weight=class_weight, label_smoothing=0.05) + \
+                       (1 - lam) * nn.functional.cross_entropy(logits, y[perm], weight=class_weight,
+                                                              label_smoothing=0.05)
+            else:
+                logits = model(x)
+                loss = nn.functional.cross_entropy(logits, y, weight=class_weight, label_smoothing=0.05)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -265,9 +303,15 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
             f'train_acc={correct / max(total, 1):.4f} val_acc={acc:.4f}')
         if acc > best_acc:
             best_acc = acc
+            bad_epochs = 0
             torch.save({'model': model.state_dict(), 'meta': {'arch': arch, 'nc': nc, 'crop_size': crop_size,
                                                               'val_acc': acc}}, best_path)
             log(f'  *** 新最优 val_acc={acc:.4f}, 保存 {best_path}')
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                log(f'早停: {patience} 个 epoch val_acc 未提升')
+                break
 
     # 校准 temperature 和 unknown_thr
     ckpt = torch_load(best_path, map_location='cpu')

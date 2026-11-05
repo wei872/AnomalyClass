@@ -63,6 +63,15 @@ python scripts/benchmark.py --device cuda:0
 python scripts/benchmark.py --device cuda:0 --half --image-size 336   # 快速档
 ```
 
+## 3.4 分类器精度优化要点
+
+- **letterbox 保宽高比**：训练/推理统一把疵点框裁剪缩放到 `crop_size×crop_size` 画布中央（灰边填充），**不压扁**——布匹的断纬/纬斜/油点线是长条形，压扁会破坏方向特征。
+- **类别不平衡**：自动统计每类样本数并打印；训练用逆频率 `class_weight` 加权 CE + `WeightedRandomSampler` 加权采样。
+- **MixUp**（p=0.5, Beta(0.2,0.2)）+ 翻转/旋转90/颜色抖动/RandomErasing 增强；早停 patience=15，按 val_acc 保存 best。
+- **推理 TTA**：每张区域裁剪做原图+水平翻转两次推理取平均概率（`RegionClassifier.predict_probs(tta=True)`)。
+- **架构/尺寸**：精度优先 `--arch resnet18` 或 `efficientnet_b0`（1660 上仍实时），`--crop-size 288/320` 比 224 更准；速度优先 `mobilenet_v3_small` @224。
+- **定位瓶颈**：`evaluate.py --mode gt`（只测分类器，用 GT 疵点框）vs `--mode pipeline`（端到端）——gt 低则是分类器问题，pipeline 低而 gt 高则是检测定位问题。
+
 ## 3.5 只对最异常区域分类 + 效果验证
 
 - **只对最热区域分类**：`--top-k`（默认 **1**）只把异常分最高的 top_k 个热力区域送分类器，其余区域仍输出但标 `未知类型`（`classified=false`）；`--region-score-ratio`（默认 0.5）让掩码阈值取 `max(全局阈值, 图内最高分×0.5)`，只圈最热的连通域，避免噪声大区域污染分类。`--top-k 0` 表示全部分类。
