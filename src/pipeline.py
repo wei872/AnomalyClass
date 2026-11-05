@@ -28,6 +28,7 @@ class RegionResult:
     class_id: int
     class_name: str
     class_conf: float             # 分类置信度
+    classified: bool = True       # 是否真正过了分类器 (top_k 之外的区域为 False, 标未知类型)
     probs: List[float] = field(default_factory=list)
 
     def to_dict(self):
@@ -68,7 +69,8 @@ class FabricAnomalyPipeline:
     def __init__(self, detector: AnomalyDetector, classifier: Optional[RegionClassifier],
                  class_names: List[str], img_thr: float, pix_thr: Optional[float] = None,
                  mask_ratio: float = 0.5, min_area_ratio: float = 2e-4, dilate: int = 7, box_pad: float = 0.2,
-                 device: str = 'cuda', logger=None, max_map_side: int = 1024, max_vis_side: int = 1600):
+                 device: str = 'cuda', logger=None, max_map_side: int = 1024, max_vis_side: int = 1600,
+                 top_k: int = 1, region_score_ratio: float = 0.5):
         self.det = detector
         self.cls = classifier
         self.class_names = class_names          # 长度 nc+1, 末尾为 '未知类型'
@@ -83,6 +85,10 @@ class FabricAnomalyPipeline:
         self.device = device
         self.max_map_side = max_map_side
         self.max_vis_side = max_vis_side
+        # 只对最异常的 top_k 个热力区域做分类 (top_k<=0 表示全部分类);
+        # 掩码阈值同时跟随图内最高分, 只圈最热的区域
+        self.top_k = int(top_k)
+        self.region_score_ratio = float(region_score_ratio)
         self.log = logger or get_logger('pipeline')
 
     # ---------------- 核心推理 ----------------
@@ -99,28 +105,44 @@ class FabricAnomalyPipeline:
         result = ImageResult(image=image_name, width=w0, height=h0, is_anomaly=bool(is_anom),
                              anomaly_score=score, anomaly_conf=conf, img_thr=self.img_thr)
         if is_anom:
-            regions = self.det.segment(full_map, self.mask_thr, self.min_area_ratio, self.dilate, self.box_pad)
+            # 掩码阈值 = max(全局阈值, 图内最高分 * region_score_ratio): 只圈最热的异常区域
+            mask_thr_eff = max(self.mask_thr, score * self.region_score_ratio)
+            regions = self.det.segment(full_map, mask_thr_eff, self.min_area_ratio, self.dilate, self.box_pad)
+            # segment 已按 mean_score 降序; 只对最异常的 top_k 个区域送分类器
+            k = len(regions) if self.top_k <= 0 else min(self.top_k, len(regions))
+            items = []
             for r in regions:
                 x1, y1, x2, y2 = r['box']
                 box = (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy)))
+                items.append((r, box))
+            cls_map = {}
+            if self.cls is not None and k > 0:
+                crops, idxs = [], []
+                for i in range(k):
+                    r, box = items[i]
+                    bx1, by1 = max(0, box[0]), max(0, box[1])
+                    bx2, by2 = min(w0, box[2]), min(h0, box[3])
+                    if bx2 > bx1 and by2 > by1:
+                        crops.append(img_rgb[by1:by2, bx1:bx2])
+                        idxs.append(i)
+                if crops:
+                    for j, cr in enumerate(self.cls.predict(crops)):   # 一次 batch 推理
+                        cls_map[idxs[j]] = cr
+            for i, (r, box) in enumerate(items):
                 r_conf = deviation_confidence(r['mean_score'], self.img_thr)
-                if self.cls is not None:
-                    bx1, by1, bx2, by2 = box
-                    bx1, by1 = max(0, bx1), max(0, by1)
-                    bx2, by2 = min(w0, bx2), min(h0, by2)
-                    crop = img_rgb[by1:by2, bx1:bx2]
-                    cr = self.cls.predict([crop])[0] if crop.size else None
-                    if cr is None:
-                        cr = {'class_id': self.nc, 'class_conf': 0.0, 'probs': []}
+                cr = cls_map.get(i)
+                if cr is None:
+                    # 未送分类器 (top_k 之外) 或分类器为空 -> 未知类型
+                    result.regions.append(RegionResult(
+                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
+                        class_id=self.nc, class_name='未知类型', class_conf=0.0, classified=False, probs=[]))
+                else:
                     cid = cr['class_id']
                     result.regions.append(RegionResult(
                         box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
-                        class_id=cid, class_name=self.class_names[cid] if cid < len(self.class_names) else '未知类型',
-                        class_conf=cr['class_conf'], probs=cr['probs']))
-                else:
-                    result.regions.append(RegionResult(
-                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
-                        class_id=self.nc, class_name='未知类型', class_conf=0.0, probs=[]))
+                        class_id=cid,
+                        class_name=self.class_names[cid] if cid < len(self.class_names) else '未知类型',
+                        class_conf=cr['class_conf'], classified=True, probs=cr['probs']))
         result.latency_ms = (time.perf_counter() - t0) * 1000
         return result
 
@@ -180,7 +202,8 @@ class FabricAnomalyPipeline:
 
 def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
                    class_names: List[str], device: str = 'cuda', half: bool = False,
-                   image_size: Optional[int] = None, logger=None) -> FabricAnomalyPipeline:
+                   image_size: Optional[int] = None, logger=None, top_k: int = 1,
+                   region_score_ratio: float = 0.5) -> FabricAnomalyPipeline:
     """从 checkpoint 路径构建完整流水线."""
     from .detect import load_json
     log = logger or get_logger('pipeline')
@@ -198,4 +221,5 @@ def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
     else:
         log('[pipeline] 未提供分类器权重, 只做异常检测 (区域标为未知类型)')
     return FabricAnomalyPipeline(det, cls, class_names, img_thr=thr['img_thr'], pix_thr=thr.get('pix_thr'),
-                                  device=device, logger=log)
+                                  device=device, logger=log, top_k=top_k,
+                                  region_score_ratio=region_score_ratio)

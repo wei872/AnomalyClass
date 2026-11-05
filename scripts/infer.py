@@ -42,6 +42,10 @@ def main():
     p.add_argument('--camera', type=int, default=None)
     p.add_argument('--out', default='runs/infer')
     p.add_argument('--image-size', type=int, default=None, help='覆盖检测输入尺寸 (如 336 更快)')
+    p.add_argument('--top-k', type=int, default=1,
+                   help='只对最异常的 top_k 个热力区域做分类 (0=全部分类), 默认 1')
+    p.add_argument('--region-score-ratio', type=float, default=0.5,
+                   help='区域掩码阈值 = max(全局阈值, 图内最高分*该比例), 只圈最热区域')
     p.add_argument('--half', action='store_true', help='FP16 推理 (GTX 1660 上约 2x 加速)')
     p.add_argument('--show', action='store_true', help='弹出窗口显示 (视频/摄像头)')
     p.add_argument('--font', default=None, help='中文字体文件路径 (可选)')
@@ -55,7 +59,8 @@ def main():
     class_names = cfg.class_names
     log(f'类别({len(class_names)}): {class_names}')
     pipe = build_pipeline(args.det_ckpt, args.cls_ckpt, args.thresholds, class_names,
-                          device=args.device, half=args.half, image_size=args.image_size, logger=log)
+                          device=args.device, half=args.half, image_size=args.image_size, logger=log,
+                          top_k=args.top_k, region_score_ratio=args.region_score_ratio)
     log(f'img_thr={pipe.img_thr:.4f} mask_thr={pipe.mask_thr:.4f} device={args.device} half={args.half}')
     os.makedirs(args.out, exist_ok=True)
 

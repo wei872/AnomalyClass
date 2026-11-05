@@ -17,6 +17,8 @@ calibration:                         # 在 normalval 纯正常样本上校准
 
 segmentation:                        # 异常图 -> 区域框
   mask_ratio: 0.5                    # 掩码阈值 = mask_ratio * pix_thr
+  region_score_ratio: 0.5            # 掩码阈值还会取 max(全局阈值, 图内最高分*该比例), 只圈最热区域
+  top_k: 1                           # 只对最异常的 top_k 个区域做分类 (0=全部); 其余标未知类型
   min_area_ratio: 0.0002             # 最小区域面积 (占图像比例)
   dilate: 7                          # 连通域前膨胀核大小 (合并邻近区域)
   box_pad: 0.2                       # 框向外扩展比例 (给分类器更多上下文)

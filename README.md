@@ -63,6 +63,15 @@ python scripts/benchmark.py --device cuda:0
 python scripts/benchmark.py --device cuda:0 --half --image-size 336   # 快速档
 ```
 
+## 3.5 只对最异常区域分类 + 效果验证
+
+- **只对最热区域分类**：`--top-k`（默认 **1**）只把异常分最高的 top_k 个热力区域送分类器，其余区域仍输出但标 `未知类型`（`classified=false`）；`--region-score-ratio`（默认 0.5）让掩码阈值取 `max(全局阈值, 图内最高分×0.5)`，只圈最热的连通域，避免噪声大区域污染分类。`--top-k 0` 表示全部分类。
+- **用 YOLO 标注验证分类对不对**（疵点框就是 GT)：
+  ```bash
+  python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode gt        # 直接拿 GT 疵点框测分类器: 准确率/每类准确率/混淆矩阵/未知率
+  python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode pipeline --top-k 0   # 端到端: 图级准确率 + 检测框召回(IoU匹配) + 匹配区域分类准确率
+  ```
+
 ## 4. 输出格式
 
 `runs/infer/results.json`（每张图一个条目）：

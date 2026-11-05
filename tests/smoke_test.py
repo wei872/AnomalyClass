@@ -165,6 +165,26 @@ def main():
         log(f'deviation_confidence(0)={deviation_confidence(0.0, thr["img_thr"]):.3f}, '
             f'({thr["img_thr"]})={deviation_confidence(thr["img_thr"], thr["img_thr"]):.3f} (应为0.5)')
         assert abs(deviation_confidence(thr['img_thr'], thr['img_thr']) - 0.5) < 1e-6
+
+        # top_k 行为: 伪造 2 个区域, top_k=1 时只应有 1 个真正分类, 另 1 个为未知类型
+        import numpy as _np
+        pipe.top_k = 1
+        fake_map = _np.zeros((160, 160), dtype=_np.float32)
+        pipe.det.predict = lambda img, max_map_side=1024: (fake_map, 0.9, (1.0, 1.0))
+        pipe.det.segment = lambda *a, **k: [
+            {'box': (10, 10, 40, 40), 'area': 900, 'mean_score': 0.9},
+            {'box': (100, 100, 130, 130), 'area': 800, 'mean_score': 0.5},
+        ]
+        res_top1 = pipe.process(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), 'topk.png')
+        assert len(res_top1.regions) == 2
+        n_classified = sum(1 for r in res_top1.regions if r.classified)
+        assert n_classified == 1, f'top_k=1 应只分类 1 个区域, 实际 {n_classified}'
+        assert res_top1.regions[0].classified and not res_top1.regions[1].classified
+        assert res_top1.regions[1].class_id == pipe.nc and res_top1.regions[1].class_name == '未知类型'
+        pipe.top_k = 0   # 全部分类
+        res_all = pipe.process(cv2.cvtColor(img_def, cv2.COLOR_BGR2RGB), 'all.png')
+        assert all(r.classified for r in res_all.regions)
+        log(f'top_k 行为正常: top_k=1 分类 {n_classified}/2 个区域, top_k=0 全部分类')
         log('SMOKE TEST PASSED ✅')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
