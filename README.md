@@ -13,6 +13,18 @@
 - **YOLO 标注一鱼三吃**：缺陷侧监督信号、分类器训练样本、验证标准。
 - 目标硬件 GTX 1660 实时（448 + ViT-S，纯 Dinomaly 约 30~60 FPS，未在 1660 实测，请用 `benchmark.py` 验证）。
 
+## 命令总览
+
+训练 3 条 + 预测 1 条（预测有「完整」和「纯正异常检测」两种模式，**同一个脚本，加 `--no-classify` 就是纯检测**）：
+
+```bash
+python scripts/train_detector.py                  # ① 训练正/异常检测器
+python scripts/calibrate.py                       # ② 校准阈值
+python scripts/train_classifier.py                # ③ 训练缺陷分类器 (只做纯检测可跳过)
+python scripts/infer.py --input <图/目录/视频>                 # ④ 完整预测: 正/异常检测 + 缺陷分类
+python scripts/infer.py --input <图/目录/视频> --no-classify   # ④ 纯正异常检测 (只要 ①② 的权重)
+```
+
 ## 目录
 
 1. [安装](#1-安装)
@@ -81,6 +93,7 @@ python scripts/check_leakage.py --data-yaml dataset/fabric19.yaml --show 10   # 
  ② python scripts/calibrate.py           在 val 上扫参 + 校准正/异常阈值 ──────────────────────► checkpoints/detector/thresholds.json
  ③ python scripts/train_classifier.py    按 YOLO 缺陷框裁剪, 训练 19 类分类 ─────────────────► checkpoints/classifier/best.pt
  ④ python scripts/infer.py --input ...   原始图 → 正/异常检测 → 区域分类 ─────────────────────► runs/infer/{<图名>_vis.png, results.json}
+   └ 加 --no-classify = 纯正异常检测 (不分类, 不需要 ③)
 ```
 
 ① → ② 必须按顺序（② 用 ① 的权重）；③ 与 ①② 互相独立，顺序随意（可在两台机器上同时训）；④ 需要 ①② 的产物，缺少 ③ 时只检测、不分类。
@@ -152,10 +165,13 @@ python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out check
 验证分类器本身（GT 框直接喂分类器，得总准确率、每类准确率、混淆矩阵、混淆对、macro 平均）：
 `python scripts/evaluate.py --mode gt`
 
-### ④ 预测
+### ④ 预测（完整预测 / 纯正异常检测）
 
 ```bash
+# 完整预测: 正/异常检测 + 区域分类
 python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像头编号> --out runs/infer
+# 纯正异常检测: 只判正常/异常并框出区域, 不分类 (不需要 ③ 的分类器)
+python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像头编号> --no-classify --out runs/det
 ```
 
 - `--input` 自动识别：文件夹 · 图片文件 · 视频（mp4/avi/mov/mkv）· 数字（摄像头编号，配合 `--show` 实时显示）。也可分别用 `--image / --dir / --video / --camera`。
