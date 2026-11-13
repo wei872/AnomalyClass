@@ -46,7 +46,7 @@ def main():
     p.add_argument('--image-size', type=int, default=None, help='覆盖检测输入尺寸 (必须与训练一致, 默认 448, 慎用)')
     p.add_argument('--top-k', type=int, default=1,
                    help='只对最异常的 top_k 个热力区域做分类 (0=全部分类), 默认 1')
-    p.add_argument('--smooth-sigma', type=float, default=0, help='覆盖异常图平滑核(须与训练/校准一致, 0=用权重自带的)')
+    p.add_argument('--smooth-sigma', type=float, default=0, help='覆盖异常图平滑核 (默认 0 = 自动沿用 thresholds.json 里校准时的值, 一般不用设)')
     p.add_argument('--region-score-ratio', type=float, default=0.5,
                    help='区域掩码阈值 = max(全局阈值, 图内最高分*该比例), 只圈最热区域')
     p.add_argument('--half', action='store_true', help='FP16 推理 (GTX 1660 上约 2x 加速)')
@@ -69,9 +69,9 @@ def main():
                           device=args.device, half=args.half, image_size=args.image_size, logger=log,
                           top_k=args.top_k, region_score_ratio=args.region_score_ratio,
                           heat_floor_ratio=args.heat_floor_ratio, heat_region_only=args.heat_region_only)
-    if args.smooth_sigma:
+    if args.smooth_sigma and abs(args.smooth_sigma - pipe.det.smooth_sigma) > 1e-6:
         pipe.det.set_smooth_sigma(args.smooth_sigma)
-        log(f'[infer] 平滑核 sigma={args.smooth_sigma} (须与 calibrate 一致)')
+        log(f'[infer] ⚠️ 手工覆盖平滑核 sigma={args.smooth_sigma} (阈值是在别的 sigma 下校准的, 须重新 calibrate)')
     log(f'img_thr={pipe.img_thr:.4f} mask_thr={pipe.mask_thr:.4f} device={args.device} half={args.half}')
     os.makedirs(args.out, exist_ok=True)
 

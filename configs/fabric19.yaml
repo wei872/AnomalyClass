@@ -17,10 +17,20 @@ detector:                      # 正异常检测器 (Dinomaly2): 正常图 + 带
   margin: 0.05                 # margin 目标间隙 (cos距离量级)
   box_margin_w: 1.0            # 缺陷监督-框级hinge: 框内token平均距离 >= margin, 抬高 min_defect
   hard_normal_w: 0.0           # 困难正常重加权 (如 0.5): 压 max_normal
+  optimizer: stableadamw      # 官方配方 (RMS限幅+NaN跳步); adamw=旧行为
+  lr_final_ratio: 0.0          # 余弦退火终点=lr*该值: 0=退火到0(默认) / 1=恒定(官方默认)
+  flip: true                   # 随机翻转增强 (--no-flip 关); 官方2D配方=无增强 (rot90/flip 都关)
+  rot90: true                  # 训练增强含随机90°旋转 (--no-rot90 关). 布匹经纬方向固定时建议关, 细长经/纬线缺陷更敏感
+  margin_score: smooth         # 图级hinge用的分数: smooth=与推理/校准同款(上采样+高斯平滑后取最大) / token=旧做法
+  defect_bg_w: 0.0             # >0: 缺陷图框外token(正常纹理)也参与重建 (建议 0.5)
+  smooth_sigma: 4.0            # 异常图平滑; >4 时核宽随sigma增长. 改后须重训/重校准, thresholds.json 会记录供推理沿用
+  eval_interval: 5000          # 训练中评估间隔: val缺陷图 + normalval正常图, 按 (I-AUROC, 相对间隙) 选 model_best
   half: false                  # GTX 1660 上可开 true (FP16, 约 2x 加速)
   # 推理顺序: 先检测区域 -> 再分类 (见 segmentation/classifier); --no-defect-sup 仅消融对照
 
 calibration:                   # 阈值校准: normalval 正常分数 vs val 缺陷分数, 可分时取间隙中点
+  sweep: true                  # 推荐: calibrate --sweep 自动扫 smooth_sigma×score_ratio, 取正常/缺陷间隙最大者
+  score_ratio: 0.0             # 图级分数: 0=最大值; 0.01=最高1%像素均值(官方评估); sweep/--score-ratio 会写入 thresholds.json
   pix_quantile: 0.9999         # 正常图异常像素分位数 -> 区域分割阈值 pix_thr
   # 若正常/缺陷分数重叠 (无法同时 100%), 会告警并取 max_normal; 那时需要重训检测器让分布分开
 

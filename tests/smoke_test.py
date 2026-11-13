@@ -117,7 +117,9 @@ def main():
                               device=device, num_workers=0, allow_random_init=True, logger=log,
                               defect_dir=cfg.train_images, defect_labels_dir=cfg.train_labels,
                               margin_w=1.0, margin=0.05, box_margin_w=1.0, hard_normal_w=0.5,
-                              local_loss_w=1.0, hard_pos_ratio=0.2, local_loss_warmup=3)
+                              local_loss_w=1.0, hard_pos_ratio=0.2, local_loss_warmup=3,
+                              rot90=False, margin_score='smooth', defect_bg_w=0.5,
+                              eval_normal_dir=cfg.normalval_images, smooth_sigma=6.0)
         assert os.path.exists(best)
 
         # 2) 校准阈值

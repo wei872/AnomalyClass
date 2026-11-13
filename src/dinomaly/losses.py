@@ -105,3 +105,18 @@ def box_margin(dmap, mask, margin):
     denom = m.sum(dim=(1, 2)).clamp(min=1.0)
     box_mean = (d * m).sum(dim=(1, 2)) / denom
     return F.relu(margin - box_mean).mean()
+
+
+def masked_recon(dmap, fg_mask, dilate: int = 1):
+    """缺陷图框外 token 的重建损失: 这些 token 是正常纹理, 应当像正常图一样被重建好 (距离越小越好).
+
+    dmap: (B,1,H,W) token 距离图; fg_mask: (B,H,W) 缺陷框 token 掩码. 框向外膨胀 dilate 个 token 避开边界标注误差.
+    没有框外 token 时返回 0 (保持计算图连通).
+    """
+    if dmap.numel() == 0:
+        return dmap.sum() * 0.0
+    fg = fg_mask.to(dmap.dtype).unsqueeze(1)
+    if dilate > 0:
+        fg = F.max_pool2d(fg, kernel_size=2 * dilate + 1, stride=1, padding=dilate)
+    bg = 1.0 - fg
+    return (dmap * bg).sum() / bg.sum().clamp(min=1.0)

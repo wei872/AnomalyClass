@@ -148,6 +148,50 @@ def get_gaussian_kernel(kernel_size: int = 5, sigma: float = 4, channels: int = 
     return gaussian_filter
 
 
+class GaussianSmoother(torch.nn.Module):
+    """可分离高斯平滑 (两次 1D 卷积), 与 get_gaussian_kernel 的 2D 高斯数学等价, 但大核 (如 49×49) 快 ~25 倍.
+
+    输入/输出 (B,1,H,W). padding: 'zeros' (与 Dinomaly2 原版一致) / 'replicate' (大核用, 不压暗边缘).
+    """
+
+    def __init__(self, kernel_size: int = 5, sigma: float = 4.0, padding: str = 'zeros'):
+        super().__init__()
+        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.
+        k = torch.exp(-x ** 2 / (2. * float(sigma) ** 2))
+        k = k / k.sum()
+        self.register_buffer('k', k.view(1, 1, 1, -1))
+        self.pad = kernel_size // 2
+        self.padding = padding
+
+    def forward(self, x):
+        p = self.pad
+        if self.padding == 'replicate':
+            x = F.pad(x, (p, p, p, p), mode='replicate')
+            x = F.conv2d(x, self.k)
+            return F.conv2d(x, self.k.transpose(2, 3))
+        x = F.conv2d(x, self.k, padding=(0, p))
+        return F.conv2d(x, self.k.transpose(2, 3), padding=(p, 0))
+
+
+def score_from_map(amap, ratio: float = 0.0) -> float:
+    """图级异常分数. ratio<=0: 异常图最大值; ratio>0: 最高的 ratio 比例像素的均值 (官方 Dinomaly2 评估用 ratio=0.01).
+    top-ratio 均值对单点噪声峰值更稳, 但太大会稀释细长缺陷 (线状疵点只占很少像素)."""
+    a = np.asarray(amap, dtype=np.float32).ravel()
+    if ratio <= 0:
+        return float(a.max())
+    k = max(1, int(a.size * ratio))
+    return float(np.partition(a, -k)[-k:].mean())
+
+
+def make_smoother(sigma: float = 4.0, kernel_size: int = 0, device='cpu') -> 'GaussianSmoother':
+    """sigma<=4 -> 原版 5×5 (与已有 checkpoint/阈值兼容); sigma>4 -> 核宽 2*ceil(3σ)+1 (否则 5×5 里 σ=8 与 σ=4 几乎无差别)."""
+    sigma = float(sigma)
+    k = int(kernel_size)
+    if k <= 0:
+        k = 5 if sigma <= 4.0 else 2 * math.ceil(3 * sigma) + 1
+    return GaussianSmoother(k, sigma, padding='zeros' if k <= 5 else 'replicate').to(device)
+
+
 # ------------------------- 评估指标 (CPU, 不依赖 adeval) -------------------------
 def _to_numpy(x):
     if isinstance(x, torch.Tensor):

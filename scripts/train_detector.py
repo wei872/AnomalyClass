@@ -36,7 +36,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=2e-3)
     p.add_argument('--warmup', type=int, default=100)
-    p.add_argument('--eval-interval', type=int, default=5000)
+    p.add_argument('--eval-interval', type=int, default=5000,
+                   help='每 N 个 iter 在 val(缺陷图 + normalval 正常图) 上评估并按 (I-AUROC, 相对间隙) 更新 model_best')
     p.add_argument('--save-interval', type=int, default=1000,
                    help='每 N 个 iter 无条件保存 model_last.pth (即使评估失败也不丢权重)')
     p.add_argument('--no-eval', action='store_true', help='训练期间跳过 val 评估 (只保存权重)')
@@ -57,6 +58,18 @@ def main():
                    help='局部损失线性预热 iters (0=不预热), 如 2000 避免初期不稳')
     p.add_argument('--no-defect-sup', action='store_true',
                    help='关闭缺陷监督 (margin/box 全关), 仅消融对照用; 正式训练保持正常+缺陷联合')
+    p.add_argument('--no-rot90', action='store_true',
+                   help='关闭训练增强里的随机 90° 旋转. 布匹经纬方向固定时建议关: 否则经线方向纹理也被当作正常, 细长经/纬线缺陷变钝')
+    p.add_argument('--no-flip', action='store_true', help='关闭训练增强里的随机翻转 (官方 2D 配方 = 无任何增强: --no-rot90 --no-flip)')
+    p.add_argument('--optimizer', choices=['stableadamw', 'adamw'], default='stableadamw',
+                   help='stableadamw=官方 Dinomaly2 配方 (默认, 抑制 loss 尖峰/坏梯度整步跳过); adamw=旧行为')
+    p.add_argument('--lr-final-ratio', type=float, default=0.0,
+                   help='余弦退火终点 = lr*该值. 0=退火到0 (默认); 1=warmup 后恒定 (官方默认)')
+    p.add_argument('--margin-score', choices=['smooth', 'token'], default='smooth',
+                   help="图级 hinge 用的分数: smooth=与推理/校准同款 (上采样+高斯平滑后取最大, 默认); token=旧做法(token网格未平滑)")
+    p.add_argument('--defect-bg-w', type=float, default=0.0,
+                   help='>0: 缺陷图框外 token(正常纹理) 也参与重建损失, 多用一份正常数据 (如 0.5); 默认关')
+    p.add_argument('--eval-max-images', type=int, default=0, help='训练中评估每类最多用多少张 (0=全部)')
     p.add_argument('--out', default='checkpoints/detector')
     p.add_argument('--weights-dir', default=None, help='backbone 预训练权重目录 (默认 backbones/weights)')
     p.add_argument('--num-workers', type=int,
@@ -88,6 +101,9 @@ def main():
                    defect_dir=defect_dir, defect_labels_dir=defect_labels,
                    margin_w=args.margin_w, margin=args.margin, box_margin_w=args.box_margin_w,
                    hard_normal_w=args.hard_normal_w, local_loss_warmup=args.local_loss_warmup,
+                   rot90=not args.no_rot90, flip=not args.no_flip, optimizer=args.optimizer,
+                   lr_final_ratio=args.lr_final_ratio, margin_score=args.margin_score, defect_bg_w=args.defect_bg_w,
+                   eval_normal_dir=cfg.normalval_images, eval_max_images=args.eval_max_images,
                    weights_dir=args.weights_dir, allow_random_init=args.allow_random_init,
                    resume=args.resume, logger=log, save_interval=args.save_interval, no_eval=args.no_eval)
 

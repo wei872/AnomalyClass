@@ -185,7 +185,7 @@ class FabricAnomalyPipeline:
             if self.heat_region_only:
                 region_boxes = [tuple(int(round(v * vscale)) for v in r.box) for r in result.regions]
             vis = render_heatmap(vis, m, floor=self.pix_thr * self.heat_floor_ratio,
-                                 peak=result.anomaly_score, region_boxes=region_boxes)
+                                 peak=float(m.max()), region_boxes=region_boxes)   # 图级分数可能是 top-N% 均值, 峰值取图中真实最大值
         for r in result.regions:
             x1, y1, x2, y2 = [int(round(v * vscale)) for v in r.box]
             color = UNKNOWN_COLOR if r.class_id == self.nc else class_color(r.class_id)
@@ -258,6 +258,12 @@ def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
         det.tf = get_eval_transform(det.image_size, det.crop_size)
     thr = load_json(thresholds_json)
     warn_threshold_mismatch(thr, det, log)
+    # 阈值是在某个平滑 sigma 下校准的: 推理自动沿用, 不再依赖手工保持 训练/校准/推理 三处一致
+    if 'smooth_sigma' in thr and abs(float(thr['smooth_sigma']) - det.smooth_sigma) > 1e-6:
+        log(f'[pipeline] 阈值校准时 smooth_sigma={thr["smooth_sigma"]} (权重自带 {det.smooth_sigma}), 推理沿用校准值')
+        det.set_smooth_sigma(float(thr['smooth_sigma']))
+    if 'score_ratio' in thr:
+        det.set_score_ratio(float(thr['score_ratio']))      # 图级分数取法同样沿用校准时的设置
     cls = None
     if cls_ckpt and os.path.exists(cls_ckpt):
         cls = RegionClassifier.load(cls_ckpt, nc=len(class_names) - 1, names=class_names, device=device, logger=log)
