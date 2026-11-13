@@ -7,7 +7,7 @@
 """
 import json
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np

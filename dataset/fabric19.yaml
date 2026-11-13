@@ -1,12 +1,12 @@
 # =============================================================================
-# 布匹缺陷数据集 (19 类). 类别名与 dataset/dataset.yaml 完全一致。
-# TODO: 把下面四个路径改成你机器上的实际路径 (原 yaml 中是 Windows 路径:
-#   D:/tyhn/yolo/dataset/source5_augmented/... )
-# 推荐目录结构:
+# 布匹缺陷数据集配置 (19 类). 所有脚本通过 --data-yaml 读取本文件.
+# 把下面五个路径改成你机器上的实际路径 (也可以不改, 运行时加 --root <数据根目录> 或设环境变量 FABRIC19_ROOT 覆盖 path).
+#
+# 目录结构:
 #   DATASET_ROOT/
-#     images/train/  images/val/            <- YOLO 图片
-#     labels/train/  labels/val/            <- YOLO .txt (cls cx cy w h, 归一化)
-#     normal/images/train/  normal/images/val/  <- 纯正常图, 无标签
+#     images/train/  images/val/                <- 带疵点的图 (YOLO 图片)
+#     labels/train/  labels/val/                <- YOLO .txt (cls cx cy w h, 归一化)
+#     normal/images/train/  normal/images/val/  <- 纯正常图, 无标签 (normalval 必须配置)
 # =============================================================================
 path: D:/tyhn/yolo/dataset/source5_augmented/
 train: D:/tyhn/yolo/dataset/source5_augmented/images/train

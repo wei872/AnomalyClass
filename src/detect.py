@@ -23,7 +23,7 @@ from torchvision import transforms as T
 from .dinomaly import build_dinomaly, StableAdamW
 from .dinomaly.losses import (global_cosine, global_cosine_hm_percent, local_cosine,
                                token_dist_map, image_scores, per_image_mean_dist, margin_hinge, box_margin, masked_recon)
-from .util import (AverageMeter, cal_anomaly_maps, make_smoother, list_images, mask_to_boxes,
+from .util import (cal_anomaly_maps, make_smoother, mask_to_boxes,
                    rasterize_boxes, roc_auc, score_from_map, average_precision, f1_max, get_logger, torch_load)
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -360,7 +360,6 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
     lr_final_ratio: 余弦退火终点 = lr * 该值; 0 = 退火到 0 (默认), 1 = 恒定学习率 (官方默认).
     eval_normal_dir: 训练中评估时的纯正常 val 图目录. 没有它 val 只有缺陷图, I-AUROC 恒为 NaN, model_best 选不出来.
     """
-    from .data.yolo import YoloDefectDataset
     log = logger or get_logger('train_detector')
     torch.manual_seed(seed)
     np.random.seed(seed)

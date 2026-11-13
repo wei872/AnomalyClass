@@ -40,7 +40,7 @@ def main():
     from src.detect import AnomalyDetector, load_json
     from src.classify import load_classifier
     from src.pipeline import FabricAnomalyPipeline
-    from src.util import AverageMeter, get_logger
+    from src.util import get_logger
     p = argparse.ArgumentParser(description='推理速度 benchmark')
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))

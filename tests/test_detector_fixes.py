@@ -21,7 +21,7 @@ from src.detect import (CombinedTrainDataset, train_detector, TrainAug, calibrat
 from src.dinomaly import build_dinomaly
 from src.dinomaly.losses import masked_recon
 from src.dinomaly import StableAdamW
-from src.util import score_from_map, GaussianSmoother, get_gaussian_kernel, imwrite_unicode, make_smoother, xyxy_to_yolo
+from src.util import score_from_map, get_gaussian_kernel, imwrite_unicode, make_smoother, xyxy_to_yolo
 
 
 def _make_ds(d, size, box, crop):
@@ -256,7 +256,6 @@ def test_defect_frac_log():
 
 def test_sdpa_and_enc_amp():
     """encoder 注意力改用融合 SDPA: 与手写 softmax 数值等价; enc_fp16 在 CPU 上自动关闭, 不改变结果."""
-    import torch.nn.functional as F
     from src.dinomaly.vit_dinov2 import Attention
     torch.manual_seed(0)
     a = Attention(48, 3, True).eval()
@@ -358,7 +357,6 @@ def test_balanced_softmax_head():
     """类别极不均衡 + 两类重叠时, Balanced Softmax (tau=1) 的 balanced accuracy 应高于普通 CE (tau=0)."""
     import torch.nn.functional as F
     from src.embed_classify import train_head
-    import torch.nn.functional as F
     g = torch.Generator().manual_seed(0)
     D = 32                                                       # 像真实嵌入: 有一个大的公共分量, 类别只是其上的小偏移, 再 L2 归一化
     common = torch.randn(D, generator=g)
@@ -523,6 +521,17 @@ def test_tiny_head_and_calibrate_checkpoint():
     print('ok  少步数分类头不除零; calibrate_checkpoint 一步写出 thresholds.json; 训练后 kNN+融合产出 model_final.pth')
 
 
+def test_detect_only_cli():
+    """纯检测入口的参数存在 (--help 可解析)."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for script, flag in [('infer.py', '--input'), ('evaluate.py', '--no-classify'), ('infer.py', '--no-classify')]:
+        r = subprocess.run([sys.executable, os.path.join(root, 'scripts', script), '--help'], capture_output=True,
+                           text=True, cwd=root)
+        assert r.returncode == 0 and flag in r.stdout, (script, r.stderr[-300:])
+    print('ok  infer --input/--no-classify, evaluate --no-classify 参数存在')
+
+
 if __name__ == '__main__':
     test_mask_follows_image_aug()
     test_thin_box_not_lost()
@@ -543,4 +552,5 @@ if __name__ == '__main__':
     test_embed_classifier_pipeline()
     test_fusion_detector()
     test_tiny_head_and_calibrate_checkpoint()
+    test_detect_only_cli()
     print('ALL PASSED ✅')

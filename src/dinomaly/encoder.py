@@ -10,8 +10,6 @@
 """
 import os
 
-import torch
-
 from . import vit_dinov2
 
 _DINOV2_URLS = {

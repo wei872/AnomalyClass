@@ -4,7 +4,7 @@ import math
 import os
 import random
 import time
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -193,12 +193,6 @@ def make_smoother(sigma: float = 4.0, kernel_size: int = 0, device='cpu') -> 'Ga
 
 
 # ------------------------- 评估指标 (CPU, 不依赖 adeval) -------------------------
-def _to_numpy(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
 def roc_auc(y_true, y_score):
     from sklearn.metrics import roc_auc_score
     return float(roc_auc_score(np.asarray(y_true).ravel(), np.asarray(y_score).ravel()))
@@ -218,37 +212,7 @@ def f1_max(y_true, y_score):
     return float(np.nanmax(f1s[:-1])) if len(f1s) > 1 else float(np.nanmax(f1s))
 
 
-def best_threshold(y_true, y_score):
-    """按 F1 最大选阈值 (用于报告)."""
-    from sklearn.metrics import precision_recall_curve
-    y_true = np.asarray(y_true).ravel()
-    y_score = np.asarray(y_score).ravel()
-    precs, recs, thrs = precision_recall_curve(y_true, y_score)
-    f1s = 2 * precs * recs / (precs + recs + 1e-7)
-    f1s = f1s[:-1]
-    thrs = thrs[~np.isnan(f1s)]
-    f1s = f1s[~np.isnan(f1s)]
-    return float(thrs[np.argmax(f1s)]) if len(thrs) else float(np.max(y_score))
-
-
 # ------------------------- 计时 -------------------------
-class AverageMeter:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.sum = 0.0
-        self.n = 0
-
-    def update(self, v: float, n: int = 1):
-        self.sum += float(v) * n
-        self.n += n
-
-    @property
-    def avg(self) -> float:
-        return self.sum / max(self.n, 1)
-
-
 class FpsMeter:
     """指数滑动平均 FPS."""
 
@@ -264,10 +228,6 @@ class FpsMeter:
             self.fps = inst if self.fps == 0 else self.ema * self.fps + (1 - self.ema) * inst
         self._last = now
         return self.fps
-
-
-def count_parameters(model: torch.nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def torch_load(path: str, map_location='cpu'):
@@ -343,16 +303,6 @@ def rasterize_boxes(img_h: int, img_w: int, boxes_xyxy, fill: int = 1) -> np.nda
         if x2 > x1 and y2 > y1:
             mask[y1:y2, x1:x2] = fill
     return mask
-
-
-def expand_box(box, img_w: int, img_h: int, pad: float):
-    c, x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
-    x1 = max(0.0, x1 - w * pad)
-    y1 = max(0.0, y1 - h * pad)
-    x2 = min(float(img_w), x2 + w * pad)
-    y2 = min(float(img_h), y2 + h * pad)
-    return (c, x1, y1, x2, y2)
 
 
 def mask_to_boxes(mask: np.ndarray, min_area: int = 0, dilate: int = 0):

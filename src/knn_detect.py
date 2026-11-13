@@ -12,7 +12,7 @@ cal_anomaly_maps / calibrate / evaluate_detector / AnomalyDetector / pipeline / 
 """
 import math
 import os
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch

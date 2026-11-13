@@ -6,3 +6,4 @@ backbones/
 assets/fonts/*.ttc
 assets/fonts/*.otf
 .pytest_cache/
+.idea/

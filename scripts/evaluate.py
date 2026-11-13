@@ -6,8 +6,9 @@
                    图级判对率 + 检测框召回率 + 匹配区域上的分类准确率
 
 示例:
-  python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode gt
-  python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode pipeline --top-k 0
+  python scripts/evaluate.py --mode gt                          # 分类器验证: GT 框直接喂分类器 (不需要检测器)
+  python scripts/evaluate.py --mode pipeline --no-classify      # 纯检测: 只评正/异常 + 检测框召回 (不需要分类器)
+  python scripts/evaluate.py --mode pipeline --top-k 0          # 检测 + 分类端到端
 """
 import argparse
 import os
@@ -69,6 +70,7 @@ def main():
     p.add_argument('--mode', choices=['gt', 'pipeline'], default='gt',
                    help='gt=直接用YOLO疵点框评分类器; pipeline=端到端(检测框IoU匹配)')
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
+    p.add_argument('--no-classify', action='store_true', help='pipeline 模式: 纯检测评估, 不加载分类器')
     p.add_argument('--det-ckpt', default=None, help='默认 checkpoints/detector/model_final.pth (没有则 model_best.pth)')
     p.add_argument('--thresholds', default=None, help='默认取检测器权重同目录的 thresholds.json')
     p.add_argument('--split', default='val', choices=['train', 'val'])
@@ -130,7 +132,7 @@ def main():
         confusion_report(class_names, y_true, y_pred)
     else:
         from src.pipeline import build_pipeline
-        pipe = build_pipeline(args.det_ckpt, args.cls_ckpt, args.thresholds, class_names,
+        pipe = build_pipeline(args.det_ckpt, None if args.no_classify else args.cls_ckpt, args.thresholds, class_names,
                               device=args.device, half=args.half, image_size=args.image_size, logger=log,
                               top_k=args.top_k, region_score_ratio=args.region_score_ratio)
         ds = YoloDefectDataset(images_dir, labels_dir, max_side=2048)
@@ -142,12 +144,17 @@ def main():
         cls_total = 0
         y_true, y_pred = [], []
         fn_list, fp_list, pos_scores = [], [], []
+        tp = fp = fn = tn = 0
         for i in range(n):
             img, boxes, _, path = ds[i]
             import cv2
             res = pipe.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), os.path.basename(path))
             gt_anom = len(boxes) > 0
             img_ok += int(res.is_anomaly == gt_anom)
+            tp += int(gt_anom and res.is_anomaly)
+            fn += int(gt_anom and not res.is_anomaly)
+            fp += int((not gt_anom) and res.is_anomaly)
+            tn += int((not gt_anom) and not res.is_anomaly)
             if gt_anom:
                 pos_scores.append(res.anomaly_score)
                 if not res.is_anomaly:
@@ -170,9 +177,28 @@ def main():
                         cls_ok += int(best.class_id == int(c))
             if (i + 1) % 20 == 0:
                 log(f'  进度 {i + 1}/{n}')
+        # 正常图 (normalval) 也要算进图级指标, 否则误报永远统计不到
+        n_norm = 0
+        if args.split == 'val' and cfg.normalval_images and os.path.isdir(cfg.normalval_images):
+            from src.data.yolo import NormalImageDataset
+            dsn = NormalImageDataset(cfg.normalval_images, verify=True)
+            n_norm = len(dsn) if not args.max_images else min(args.max_images, len(dsn))
+            import cv2
+            for i in range(n_norm):
+                img, path = dsn[i]
+                res = pipe.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), os.path.basename(path))
+                img_ok += int(not res.is_anomaly)
+                tn += int(not res.is_anomaly)
+                fp += int(res.is_anomaly)
+                if res.is_anomaly:
+                    fp_list.append((res.anomaly_score, res.img_thr, len(res.regions), os.path.basename(path)))
+            log(f'[pipeline] 另评 normalval 正常图 {n_norm} 张')
+        n = n + n_norm
         log(f'[pipeline] 图级准确率={img_ok / n:.4f}  检测框召回(IoU>={args.iou_thr})='
             f'{det_matched}/{gt_total}={det_matched / max(gt_total, 1):.4f}  '
             f'匹配区域分类准确率={cls_ok}/{cls_total}={cls_ok / max(cls_total, 1):.4f}')
+        log(f'[检测] 缺陷图判异常 {tp}/{tp + fn} (漏检 {fn})  正常图判正常 {tn}/{tn + fp} (误报 {fp})  '
+            f'召回={tp / max(tp + fn, 1):.4f} 精确率={tp / max(tp + fp, 1):.4f}')
         if cls_total:
             confusion_report(class_names, np.array(y_true), np.array(y_pred))
         if pos_scores:

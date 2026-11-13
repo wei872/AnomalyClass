@@ -1,98 +1,92 @@
 # AnomalyClass — 布匹缺陷检测 + 分类流水线
 
-基于 **Dinomaly2** 的异常检测器 + 轻量 CNN 分类器，**先检测、后分类**：
+给一张原始布匹图，先判断**正常 / 异常**，异常再框出缺陷区域并分成 **19 类缺陷 / 未知类型**。
 
 ```
-整图 448×448 ──► Dinomaly2 检测器 ──► 异常图(热力图) ──► 连通域 ──► 缺陷区域框 ──► 轻量 CNN ──► 19 类 / 未知类型
-                (正常+缺陷联合训练)    1-cos(en,de)+高斯平滑   mask_thr      top_k 个区域     (letterbox 224)
+整图 448×448 ─► 检测器 ─► 异常图(热力图) ─► 连通域 ─► 缺陷区域框 ─► 分类器 ─► 19 类 / 未知类型
+              (Dinomaly2 + kNN 融合)  1-cos + 高斯平滑  mask_thr      最异常的 top_k 个     (DINOv2 嵌入 + 余弦头)
 ```
 
-- **联合训练**：正常图走重建损失，带框缺陷图走 margin / box 监督损失，**同一 batch 混合**（不是两个模型）。
-- **不裁边缘**：`crop_size = image_size = 448`，四周暗角属于正常外观，边缘疵点也不能丢。
+- **检测器**：Dinomaly2 重建式异常检测，**正常图 + 带框缺陷图联合训练**（同一 batch 混合，不是两个模型）；训练末尾自动再建一个免训练的 kNN 记忆库并与之融合，权重在 val 上自动选。
+- **分类器**：冻结 DINOv2 抽特征 + 余弦分类头 + Balanced Softmax，对类别不均衡、样本少友好，几分钟训完；最大概率过低判「未知类型」。
+- **不裁边**：训练/校准/推理统一 448，`crop_size = image_size`，四周暗角属于正常外观，边缘疵点也不会丢。
 - **YOLO 标注一鱼三吃**：缺陷侧监督信号、分类器训练样本、验证标准。
-- 目标硬件 GTX 1660 实时（448 + ViT-S 约 30~60 FPS，`--half` 再翻倍）。
-
----
+- 目标硬件 GTX 1660 实时（448 + ViT-S，纯 Dinomaly 约 30~60 FPS，未在 1660 实测，请用 `benchmark.py` 验证）。
 
 ## 目录
 
-1. [目录结构](#目录结构)
-2. [安装](#安装)
-3. [数据准备](#数据准备)
-4. [快速开始：四条命令](#快速开始四条命令)
-5. [各步骤详解](#各步骤详解)
-6. [输出格式](#输出格式)
-7. [调参与排障](#调参与排障)
-8. [检测器优化清单（v2）](#检测器优化清单v2)
-9. [与官方 Dinomaly2 对照（v3）](#与官方-dinomaly2-对照v3)
-10. [分类器与训练采样改进（v4）](#分类器与训练采样改进v4)
-11. [训练提速与数据泄漏检查（v5）](#训练提速与数据泄漏检查v5)
-12. [开源方案调研与新增模块（v6）](#开源方案调研与新增模块v6)
-13. [精度再优化：检测融合与误差分析（v7）](#精度再优化检测融合与误差分析v7)
-14. [测试与性能](#测试与性能)
+1. [安装](#1-安装)
+2. [数据准备](#2-数据准备)
+3. [四条命令](#3-四条命令)
+4. [两种预测方式：完整预测 / 纯正异常检测](#4-两种预测方式完整预测--纯正异常检测)
+5. [输出格式](#5-输出格式)
+6. [验证与辅助命令](#6-验证与辅助命令)
+7. [原理简述](#7-原理简述)
+8. [调参与排障](#8-调参与排障)
+9. [项目结构](#9-项目结构)
+10. [测试](#10-测试)
 
 ---
 
-## 目录结构
-
-```
-src/detect.py          Dinomaly2 检测器: 训练 / 评估 / 校准(间隙中点) / 推理 / 区域分割
-src/dinomaly/          Dinomaly2 模型与损失 (含 local_cosine / margin / box_margin / masked_recon)
-src/knn_detect.py      免训练 kNN 记忆库检测器 (DINOv2 中层 patch + coreset), 与 Dinomaly 同接口
-src/embed_classify.py  DINOv2 冻结嵌入分类器 (余弦头 + Balanced Softmax + 特征级过采样)
-src/classify.py        缺陷分类器: YOLO 框裁剪训练 (letterbox 保宽高比), 未知类型校准, TTA 推理
-src/pipeline.py        端到端流水线: 检测 -> 区域 -> top_k 分类 -> 热力图可视化
-src/data/              YOLO 数据集读取 (Unicode 安全, 坏图跳过), 配置解析
-src/util.py            日志 / 指标 / 可分离高斯平滑 / 框与掩码工具 / 中文字体
-scripts/               train_detector (含训练后 kNN+融合) / calibrate / train_classifier / infer 四条主命令; evaluate / benchmark / check_images / check_leakage / fit_knn / fuse_detectors 为辅助
-configs/fabric19.yaml  推荐参数一览 (脚本默认值已与之一致, 四条命令直接用默认值即可)
-dataset/fabric19.yaml  数据集路径与 19 类类名 (改成你的实际路径)
-tests/                 smoke_test.py (全链路冒烟) + test_detector_fixes.py (检测器关键修复的回归测试)
-```
-
-## 安装
+## 1. 安装
 
 ```bash
 pip install -r requirements.txt
 # GPU: 先装对应 CUDA 版本的 torch/torchvision, 再装其余依赖
-# DINOv2 backbone 预训练权重放到 backbones/weights/ (如 dinov2_vits14_reg4_pretrain.pth)
-# 下载: https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth
 ```
 
-## 数据准备
+DINOv2（带 register）预训练权重**首次运行会自动下载**到 `backbones/weights/`（检测器、kNN、分类器共用同一份）。
+机器不能联网时，手动下载后放到该目录即可：
 
-编辑 `dataset/fabric19.yaml`（Windows 路径示例见文件注释）。目录结构：
+```
+backbones/weights/dinov2_vits14_reg4_pretrain.pth
+# 下载: https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth
+# base 版: dinov2_vitb14_reg4_pretrain.pth (对应 --backbone dinov2reg_vit_base_14)
+```
+
+`--weights-dir` 可指定其它目录；`--allow-random-init` 只用于冒烟测试，不要用于真实训练。
+
+## 2. 数据准备
+
+编辑 `dataset/fabric19.yaml`（五个路径 + 19 个类名），或不改文件、运行时加 `--root <数据根目录>`（也可设环境变量 `FABRIC19_ROOT`）。目录结构：
 
 ```
 DATASET_ROOT/
-  images/train/  images/val/     # 带疵点的图
-  labels/train/  labels/val/     # YOLO txt: cls cx cy w h (归一化)
-  normal/images/train/           # 纯正常图: 与 images/train 缺陷图一起参与联合训练
-  normal/images/val/             # 纯正常图: 训练中评估选 model_best + 阈值校准 (必须配置!)
+  images/train/   images/val/      # 带疵点的图
+  labels/train/   labels/val/      # YOLO txt: cls cx cy w h (归一化)
+  normal/images/train/             # 纯正常图 (无标签): 与缺陷图一起参与联合训练
+  normal/images/val/               # 纯正常图: 训练中选最优权重 + 校准阈值 (必须配置!)
 ```
 
-> ⚠️ `normalval` 现在同时用于**训练中选 model_best** 和**校准**。`images/val` 通常全是缺陷图，
-> 没有 `normalval` 就算不出图级 AUROC，训练无法正确挑选最优权重（见 [优化清单](#检测器优化清单v2) 第 2 条）。
+> ⚠️ `normalval`（正常验证图）同时用于**选最优权重**、**选融合权重**和**校准阈值**。`images/val` 通常全是缺陷图，没有 `normalval` 就算不出图级 AUROC，也校准不了阈值。
+> 建议再单独留一份从不参与上述过程的测试图做最终验证。
 
-坏图 / 截断图在构建数据集时自动跳过（日志有计数）。可先跑 `python scripts/check_images.py` 体检。
+训练前建议先体检一次（只报告，不改数据）：
+
+```bash
+python scripts/check_images.py --data-yaml dataset/fabric19.yaml    # 坏图/截断图
+python scripts/check_leakage.py --data-yaml dataset/fabric19.yaml --show 10   # train/val 近重复
+```
+
+> 数据集目录名叫 `source5_augmented`：如果是**先离线增强、后划分 train/val**，同一张原图的翻转/旋转/调亮副本会同时落在 train 和 val，
+> val 指标虚高、阈值偏松、上线后表现变差。`check_leakage` 报告近重复比例 > 10% 时，请按**原图**分组重新划分 train/val。
+> （布匹纹理均匀，dHash 区分度有限，结果当线索，需要人工抽看。）
 
 ---
 
-## 快速开始：四条命令
-
-整个流程只有四条命令：**① 正/异常检测器训练 → ② 校准阈值 → ③ 缺陷分类器训练 → ④ 图片预测**。
-数据路径写在 `dataset/fabric19.yaml`（见[数据准备](#数据准备)），四条命令的默认参数已是推荐配置，**直接运行即可，不用再加一长串开关**。
+## 3. 四条命令
 
 ```
- ① python scripts/train_detector.py      Dinomaly 联合训练 → 自动 kNN 库 + 融合(val 选权重) ► checkpoints/detector/model_final.pth
- ② python scripts/calibrate.py           在 val 上扫参 + 校准正/异常阈值 ───────► checkpoints/detector/thresholds.json
- ③ python scripts/train_classifier.py    YOLO 缺陷框裁剪训练 19 类分类 ─────────► checkpoints/classifier/best.pt
- ④ python scripts/infer.py --input ...   先检测异常区域，再对区域分类 ─────────► runs/infer/{<图名>_vis.png, results.json}
+ ① python scripts/train_detector.py      Dinomaly 联合训练 → 自动 kNN 库 + 融合 (val 选权重) ─► checkpoints/detector/model_final.pth
+ ② python scripts/calibrate.py           在 val 上扫参 + 校准正/异常阈值 ──────────────────────► checkpoints/detector/thresholds.json
+ ③ python scripts/train_classifier.py    按 YOLO 缺陷框裁剪, 训练 19 类分类 ─────────────────► checkpoints/classifier/best.pt
+ ④ python scripts/infer.py --input ...   原始图 → 正/异常检测 → 区域分类 ─────────────────────► runs/infer/{<图名>_vis.png, results.json}
 ```
 
 ① → ② 必须按顺序（② 用 ① 的权重）；③ 与 ①② 互相独立，顺序随意（可在两台机器上同时训）；④ 需要 ①② 的产物，缺少 ③ 时只检测、不分类。
+所有脚本的默认参数已是推荐配置，**直接运行即可，不用加一长串开关**；`--data-yaml` 默认就是 `dataset/fabric19.yaml`。
 
-### ① 正/异常检测器训练
+### ① 训练检测器
 
 ```bash
 python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpoints/detector
@@ -100,26 +94,29 @@ python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpo
 
 | 项目 | 说明 |
 |---|---|
-| 做什么 | ① Dinomaly2 联合训练：正常图走重建损失，带框缺陷图走图级/框级 margin 损失（同一 batch 混合），每 `--eval-interval` 在 val 上评估并保存最优权重；② **训练结束自动**建 kNN 记忆库（DINOv2 中层 patch + coreset，几分钟）并与 Dinomaly 融合，权重 `w` 在 val 上按 (I-AUROC, 间隙) 选，**`w=1`（纯 Dinomaly）和 `w=0`（纯 kNN）也是候选，所以在 val 上不会比单个检测器差**；融合没带来提升时 `model_final.pth` 就是纯 Dinomaly，推理没有额外开销 |
-| 默认配方 | 448 · `dinov2reg_vit_small_14` · 10000 iters · bs16 · 关 rot90 · 局部损失 1.0（hard 20%，预热 2000）· 困难正常重加权 0.5 · 缺陷图框外重建 0.5 · 每 2500 iter 评估选 `model_best` |
-| 输入 | `dataset/fabric19.yaml` 里的 `normaltrain`（纯正常）+ `train`（缺陷图+YOLO 标注）；`val` + `normalval` 用来选最优权重和校准（**normalval 必须配**） |
-| 输出 | `checkpoints/detector/model_final.pth`（**最终检测器**，② ④ 默认用它；可能是纯 Dinomaly / 融合 / 纯 kNN）· `model_best.pth`（Dinomaly 最优）· `model_last.pth`（最新，随时可续训）· `knn_best.pth` · `model_fused.pth`（中间产物） |
-| 耗时 | GTX 1660 bs16 约 2 s/iter，10000 iter 约 5.5 h（未在 1660 实测，以你机器日志为准） |
-| 怎么看成功 | 训练日志 `I-AUROC` 上升、`gap_rel` 为正；末尾 `w_dinomaly=… I-AUROC=… 相对间隙=…` 表和 `最终检测器: …` 行告诉你选了谁；最终能否分开看 ② |
+| 做什么 | ① Dinomaly2 联合训练：正常图走重建损失，带框缺陷图走图级/框级 margin 损失；每 2500 iter 在 val 上评估并保存最优权重。② **训练结束自动**建 kNN 记忆库（DINOv2 中层 patch + coreset，几分钟）并与 Dinomaly 融合，权重 `w` 在 val 上按 (I-AUROC, 间隙) 选，**`w=1`（纯 Dinomaly）和 `w=0`（纯 kNN）也是候选，所以在 val 上不会比单个检测器差**；融合没带来提升时 `model_final.pth` 就是纯 Dinomaly，推理没有额外开销 |
+| 默认配方 | 448 · `dinov2reg_vit_small_14` · 10000 iters · bs16 · 关 rot90 · 局部损失 1.0（hard 20%，预热 2000）· 困难正常重加权 0.5 · 缺陷图框外重建 0.5 · StableAdamW + 余弦退火 |
+| 输入 | `normaltrain`（纯正常）+ `train`（缺陷图 + YOLO 标注）；`val` + `normalval` 用于选权重 |
+| 输出 | `model_final.pth`（**最终检测器**，②④ 默认用它，可能是纯 Dinomaly / 融合 / 纯 kNN）· `model_best.pth`（Dinomaly 最优）· `model_last.pth`（最新，可续训）· `knn_best.pth` · `model_fused.pth`（中间产物） |
+| 耗时 | GTX 1660 bs16 约 2 s/iter，10000 iter 约 5.5 h；kNN + 融合几分钟（均未在 1660 实测，以日志为准） |
+| 怎么看成功 | 训练日志 `I-AUROC` 上升、`gap_rel` 为正；末尾 `w_dinomaly=… I-AUROC=… 相对间隙=…` 表和 `最终检测器: …` 行告诉你选了谁 |
 
 常用选项（都可不加）：
 
 | 想做的事 | 加什么 |
 |---|---|
-| 断点续训（中断后接着训） | `--resume checkpoints/detector/model_last.pth` |
-| 训得更久 / 更短 | `--total-iters 20000`；`--early-stop 2`（连续 2 次评估无提升就停） |
+| 断点续训 | `--resume checkpoints/detector/model_last.pth` |
+| 训得更久 / 提前停 | `--total-iters 20000` · `--early-stop 2`（连续 2 次评估无提升就停） |
 | 更准（更慢） | `--backbone dinov2reg_vit_base_14` |
-| 不要 kNN/融合（只用 Dinomaly，推理最快） | `--no-knn` |
-| 调 kNN | `--knn-layer-sets "5,7,9;3,5,7"`（层须在 2~9）· `--knn-bank-size 20000`（越大越准、推理越慢）· `--knn-max-images 300` |
-| 更快 | `--enc-fp16`（冻结 encoder 用 fp16，CUDA；先跑几百 iter 对比 loss） |
-| 布匹方向不固定 | `--rot90`（默认关，方向固定的布匹关掉对细长经/纬线更敏感） |
+| 更快 | `--enc-fp16`（冻结 encoder 用 fp16，需 CUDA；先跑几百 iter 对比 loss） |
+| 不要 kNN/融合（推理最快） | `--no-knn` |
+| 调 kNN | `--knn-layer-sets "5,7,9;3,5,7"`（层须在 2~9，val 上择优）· `--knn-bank-size 20000`（越大越准、推理越慢）· `--knn-max-images 300` |
+| 布匹方向不固定 | `--rot90`（默认关：方向固定时关掉，细长经/纬线缺陷更敏感） |
 | 训练完顺带校准（省掉 ②） | `--auto-calibrate` |
 | 指定数据 / 显卡 | `--data-yaml xxx.yaml` · `--root <数据根目录>` · `--device cuda:0` |
+
+训练配方要点：官方 Dinomaly2 的 StableAdamW（抑制 loss 尖峰、坏梯度整步跳过）+ 余弦退火；缺陷图占比过低时自动抬到 25%，保证 margin/框损失每步都有正样本；
+图级 hinge 用与推理同款的分数（上采样 + 高斯平滑后取最大）。完整参数见 `python scripts/train_detector.py -h`。
 
 ### ② 校准阈值
 
@@ -132,13 +129,12 @@ python scripts/calibrate.py --data-yaml dataset/fabric19.yaml
 | 做什么 | 在 `normalval`（正常）与 `val`（缺陷）上各前向一次，**默认已开 `--sweep`**：扫 `smooth_sigma ∈ {4,6,8,12}` × `score_ratio ∈ {最大值, 0.1%, 0.5%, 1%}`，采用正常/缺陷间隙最大的组合；`img_thr` 取 `max_normal` 与 `min_defect` 的中点；`pix_thr` 取正常图像素分数 99.99% 分位数（区域分割用） |
 | 输入 | 默认 `checkpoints/detector/model_final.pth`（没有则 `model_best.pth`）；换权重用 `--det-ckpt` |
 | 输出 | 权重同目录的 `thresholds.json`（`img_thr / pix_thr / smooth_sigma / score_ratio / 训练分辨率`，推理自动沿用） |
-| 耗时 | 一两分钟量级（每张 val 图只前向一次；未实测） |
-| 怎么看成功 | 日志末尾 `阈值已保存 ... separable=True`：所有正常图分数 < `img_thr` < 所有缺陷图分数；`separable=False` 见[排障](#调参与排障) |
+| 怎么看成功 | 日志末尾 `阈值已保存 ... separable=True`：所有正常图分数 < `img_thr` < 所有缺陷图分数；`separable=False` 见[排障](#正常缺陷分数重叠separablefalse) |
 | 常用选项 | `--no-sweep` 不扫参 · `--score-ratio 0.01` 手工指定图级分数 · `--max-images 200` 限制每侧图数加快 · `--half` |
 
-> 重训检测器、换数据或换分辨率后，必须重新运行本步。
+> 重训检测器、换数据或换分辨率后，必须重新运行本步。`thresholds.json` 记录训练分辨率，推理时自动核对，不一致会告警。
 
-### ③ 缺陷分类器训练
+### ③ 训练分类器
 
 ```bash
 python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out checkpoints/classifier
@@ -146,137 +142,48 @@ python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out check
 
 | 项目 | 说明 |
 |---|---|
-| 做什么 | 按 YOLO 标注框裁剪缺陷（外扩 30%，letterbox 保宽高比）→ 冻结 DINOv2 抽特征 → 余弦头 + Balanced Softmax（类别不均衡友好，稀有类做特征级过采样） |
+| 做什么 | 按 YOLO 标注框裁剪缺陷（外扩 30%，letterbox 保宽高比）→ 冻结 DINOv2 抽特征 → 余弦头 + Balanced Softmax；稀有类做特征级过采样；按 val balanced accuracy 选最优 |
 | 输入 | `train` / `val` 的缺陷图与 YOLO 标注（没有 val 时自动从 train 划 10%） |
-| 输出 | `checkpoints/classifier/best.pt`（含类别名、`unknown_thr`——最大概率低于它判「未知类型」） |
+| 输出 | `checkpoints/classifier/best.pt`（含类别名与 `unknown_thr`：最大概率低于它判「未知类型」） |
 | 耗时 | 几分钟（特征只抽一次再训分类头） |
-| 怎么看成功 | 日志 `val_acc / val_bal_acc`（balanced acc 比 acc 更能反映稀有类） |
-| 常用选项 | `--kind cnn` 旧方案端到端微调（A/B 对照）· `--backbone dinov2reg_vit_base_14` 更大嵌入骨干 |
+| 怎么看成功 | 日志 `val_acc / val_bal_acc`（balanced acc 更能反映稀有类） |
+| 常用选项 | `--backbone dinov2reg_vit_base_14` 更大嵌入骨干（只对检出区域跑，开销小）· `--kind cnn` 旧方案端到端微调（A/B 对照） |
 
-验证分类器本身（GT 框直接喂分类器，得每类准确率与混淆矩阵）：
-`python scripts/evaluate.py --mode gt --cls-ckpt checkpoints/classifier/best.pt`
+验证分类器本身（GT 框直接喂分类器，得总准确率、每类准确率、混淆矩阵、混淆对、macro 平均）：
+`python scripts/evaluate.py --mode gt`
 
-### ④ 图片预测
+### ④ 预测
 
 ```bash
 python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像头编号> --out runs/infer
 ```
 
-- `--input` 自动识别：文件夹 · 图片文件 · 视频（mp4/avi/mov/mkv）· 数字（摄像头编号，配合 `--show` 实时显示）。
-- 默认读取 `checkpoints/detector/model_final.pth`（没有则 `model_best.pth`）、同目录的 `thresholds.json`、`checkpoints/classifier/best.pt`；路径不同时用 `--det-ckpt / --thresholds / --cls-ckpt` 指定。
-- 检测器/阈值缺失会直接提示该先跑哪条命令；分类器缺失则只检测不分类（也可 `--no-classify` 强制只检测）。
-- 输出：每张图一个 `<图名>_vis.png`（热力图 + 框 + 类名/置信度）和 `results.json`（格式见[输出格式](#输出格式)）。
-- 常用：`--half` FP16 · `--top-k 3` 对最异常的 3 个区域分类（默认 1，0=全部）· `--no-heatmap` · `--heat-region-only`。
-
-### 四条命令之后：验证（可选）
-
-| 目的 | 命令 |
-|---|---|
-| 正/异常二分类验证（图级准确率 + 漏检/误报逐张列表） | `python scripts/evaluate.py --mode pipeline --top-k 0` |
-| 分类 + 检测框端到端指标、混淆对 | `python scripts/evaluate.py --mode pipeline`（日志含 macro 平均与前 8 个混淆对） |
-| 体检数据（坏图、train/val 近重复泄漏） | `python scripts/check_images.py` · `python scripts/check_leakage.py --show 10` |
-| 速度测试 | `python scripts/benchmark.py --device cuda:0 --half` |
-
-> 所有 `scripts/*.py` 的 `--data-yaml` 默认都是 `dataset/fabric19.yaml`，`--root` 可覆盖数据根目录（或设环境变量 `FABRIC19_ROOT`）。
+- `--input` 自动识别：文件夹 · 图片文件 · 视频（mp4/avi/mov/mkv）· 数字（摄像头编号，配合 `--show` 实时显示）。也可分别用 `--image / --dir / --video / --camera`。
+- 默认读取 `checkpoints/detector/model_final.pth`（没有则 `model_best.pth`）、同目录的 `thresholds.json`、`checkpoints/classifier/best.pt`；路径不同时用 `--det-ckpt / --thresholds / --cls-ckpt`。
+- 检测器/阈值缺失会直接提示该先跑哪条命令；分类器缺失则只检测不分类。
+- 常用：`--half`（FP16，提速取决于显卡，1660 无 Tensor Core，请用 `benchmark.py` 实测）· `--top-k 3`（对最异常的 3 个区域分类，默认 1，0=全部）· `--no-heatmap` · `--heat-region-only` · `--heat-floor-ratio 1.3`（热力图噪点多时调大）。
 
 ---
 
-## 各步骤详解
+## 4. 两种预测方式：完整预测 / 纯正异常检测
 
-### 1) 联合训练检测器 `train_detector.py`
+输入都是**原始整图**（图片 / 目录 / 视频 / 摄像头）：
 
-默认 448 / `dinov2reg_vit_small_14` / 10000 iters / bs16（1660 约 5.5h）。断点续训：`--resume checkpoints/detector/model_last.pth`。
-
-损失构成：
-
-| 项 | 作用 | 开关 |
+| | 完整预测（默认，命令 ④） | 纯正异常检测 |
 |---|---|---|
-| 正常图重建（loose cosine） | 压低正常图分数 | 默认开（`--ll`） |
-| 局部逐位置 cosine | 细线类信号不被全局池化稀释 | 默认开：`--local-loss-w 1.0 --hard-pos-ratio 0.2`（`--local-loss-w 0` 关） |
-| 图级 margin hinge | 缺陷图分数须比同 batch 正常图高 `margin` | `--margin-w`（默认 1.0）`--margin`（默认 0.05） |
-| 框级 margin hinge | 缺陷框内 token 平均距离 ≥ `margin`，直接抬高 `min_defect` | `--box-margin-w`（默认 1.0） |
-| 困难正常重加权 | 当前分数偏高的正常图加大重建损失，压 `max_normal` | 默认 0.5（`--hard-normal-w 0` 关） |
-| 缺陷图框外重建 | 缺陷图框外是正常纹理，也参与重建 | 默认 0.5（`--defect-bg-w 0` 关） |
+| 做什么 | 先判正常/异常 → 异常图框出缺陷区域 → 对区域分类（19 类 / 未知类型） | 只判正常/异常并框出异常区域，不分类 |
+| 需要的权重 | 检测器（①②）+ 分类器（③） | 只要检测器（①②），不需要 ③ |
+| 预测 | `python scripts/infer.py --input <图片/目录/视频> --out runs/infer` | `python scripts/infer.py --input <图片/目录/视频> --no-classify` |
+| 输出 | 每图 `<名>_vis.png`（热力图 + 框 + 类名/置信度）+ `results.json` | 同上，区域类别统一标「未知类型」 |
+| 评估 | `python scripts/evaluate.py --mode pipeline --top-k 0` | `python scripts/evaluate.py --mode pipeline --no-classify` |
+| 评估输出 | 图级准确率 + 检测框召回 + 匹配区域分类准确率 + 混淆对 | 图级准确率、缺陷图漏检数、正常图误报数、召回/精确率、漏检/误报逐张列表 |
 
-训练期间每 `--eval-interval`（默认 2500）iter 在 **val 缺陷图 + normalval 正常图**上评估，
-按 `(I-AUROC, 相对间隙)` 字典序更新 `model_best.pth`（AUROC 饱和到 1.0 后，间隙更大的更优）；`model_last.pth` 每 `--save-interval` 无条件保存。
-`--no-defect-sup` 仅消融对照用（纯无监督），正式训练保持联合。
+评估同时评 `val` 缺陷图和 `normalval` 正常图（正常图用来统计误报）。期望图级准确率 = 1.0、漏检/误报列表为空；
+不达标看日志「缺陷图 score 分位数 vs img_thr」与「漏检图 margin」，重叠则回到 ①②。
 
-训练配方（对齐官方 Dinomaly2，详见 [对照表](#与官方-dinomaly2-对照v3)）：
+## 5. 输出格式
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--optimizer` | `stableadamw` | 官方优化器：更新量 RMS 超阈值时缩步长，坏梯度整步跳过；`adamw` 为旧行为 |
-| `--lr-final-ratio` | `0.0` | 余弦退火终点 = lr×该值；0 = 退火到 0，1 = warmup 后恒定（官方默认） |
-| `--defect-frac` | `-1`（自动） | 每个 batch 缺陷图期望占比；缺陷图太少时抬到 25%，保证 margin/box 损失每步都有正样本 |
-| `--rot90` / `--no-flip` | rot90 关、翻转开 | 官方 2D 配方无任何增强，即不加 `--rot90` 并加 `--no-flip`；方向不固定的布匹才开 `--rot90` |
-
-### 2) 校准阈值 `calibrate.py`
-
-即命令 ②。`--sweep` 已是默认（`--no-sweep` 关）；`train_detector.py --auto-calibrate` 可训练完顺带校准。
-
-目标：**所有正常图判正常、所有缺陷图判异常**，不靠调参跷跷板。
-
-- 在 `normalval` 上得 `max_normal`，在 `images/val` 缺陷图上得 `min_defect`；
-- `min_defect > max_normal`（可分）→ `img_thr = (max_normal + min_defect) / 2`（间隙中点，两侧 margin 最大）；
-- 重叠 → 日志告警 `separable=false`，取 `max_normal`（优先保证正常全对），并列出「各缺陷类最低图分数」定位拖后腿的类；
-- `pix_thr` = 正常图像素分数的 99.99% 分位数（直方图累积，不会随图片数涨内存），用于区域分割与热力图下限；
-- `thresholds.json` 同时记录训练分辨率与 `smooth_sigma`，**推理自动沿用**，不用再手工保持三处一致；
-- 异常置信度 `anomaly_conf = score / (score + img_thr)`，恰在阈值上为 0.5；
-- **图级分数取法** `score_ratio`：0 = 异常图最大值（默认）；>0 = 最高 ratio 比例像素的均值（官方评估用 0.01，对单点噪声峰值更稳，但会稀释很细的线状缺陷）；
-- **`--sweep`**（默认开）：每张 val 图只前向一次，对同一张原始异常图扫 `smooth_sigma ∈ {4,6,8,12}` × `score_ratio ∈ {0,0.1%,0.5%,1%}`，
-  按相对间隙 `gap_rel = (min_defect − max_normal)/max_normal` 排序打印整张表，自动采用最优组合并写入 `thresholds.json`，**不用重训**。
-  组合是在 val 上挑的，val 图太少时 min/max 本身有噪声，结果当参考；`--score-ratio 0.01` 可手工指定。
-
-### 3) 纯检测验证
-
-```bash
-python scripts/infer.py ... --no-classify --dir <目录> --out runs/det_val
-# 每图输出 <名>_vis.png (热力图+框); results.json 含 is_anomaly / anomaly_score / img_thr / regions
-```
-
-验证正异常二分类（图级准确率 + 漏检/误报逐张列表）：
-
-```bash
-python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode pipeline \
-    --top-k 0                      # 默认读 model_final.pth 与同目录 thresholds.json
-```
-
-期望图级准确率 = 1.0、漏检/误报列表为空；不达标看日志「缺陷图 score 分位数 vs img_thr」与「漏检图 margin」，重叠则回到第 1/2 步。
-
-### 4) 训练分类器 `train_classifier.py`
-
-- 默认 `--kind embed`：冻结 DINOv2 嵌入 + 余弦头 + Balanced Softmax，稀有类特征级过采样（详见 [v6](#开源方案调研与新增模块v6)）；`--kind cnn` 为旧方案（`mobilenet_v3_small @224` 端到端微调，50 epochs 早停，加权采样 + MixUp + 框抖动），可做 A/B 对照；
-- 区域尺寸一致性：检测框按 `box_pad=0.3` 扩展（与训练裁剪 `crop_pad=0.3` 相同）再 letterbox；训练时再对 GT 框做随机缩放/平移，模拟检测器框与人工框的差异；
-- 最大 softmax 低于自动校准的 `unknown_thr` → 判「未知类型」；
-- `--kind cnn` 的预训练权重自动下载，慢/损坏时用 `--pretrained-path` 指向本地 `.pth`。
-
-验证分类器本身（GT 框直接喂分类器 → 准确率/混淆矩阵）：
-
-```bash
-python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode gt --cls-ckpt checkpoints/classifier/best.pt
-```
-
-### 5) 端到端推理 `infer.py`
-
-输入：`--dir` 目录 / `--image` 单图 / `--video` 视频 / `--camera 0 --show` 摄像头。常用开关：
-
-| 参数 | 说明 |
-|---|---|
-| `--half` | FP16（autocast；速度提升取决于显卡，GTX 1660 无 Tensor Core，请用 `benchmark.py` 实测） |
-| `--top-k 1` | 只对最异常的 1 个区域分类（默认；0=全部） |
-| `--no-heatmap` | 不叠热力图 |
-| `--heat-floor-ratio 1.0` | 热力图下限 = `pix_thr × 该值`，低于它的像素不上色；噪声多调大（1.3~1.6），太淡调小 |
-| `--heat-region-only` | 热力图只显示在检出的区域框内 |
-| `--smooth-sigma` | 一般不用设，自动沿用 `thresholds.json`；手工覆盖会提示须重校准 |
-
-热力图用**绝对阈值**渲染：低于正常图噪声上限的像素完全透明，高于它的部分颜色与透明度随强度增大——背景不会再被按每图分位数拉伸成满屏噪点。
-
----
-
-## 输出格式
-
-`results.json`：
+`results.json`（每张图一项）：
 
 ```json
 {"image": "001.png", "is_anomaly": true, "anomaly_score": 0.83, "anomaly_conf": 0.67, "img_thr": 0.41,
@@ -285,22 +192,64 @@ python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode gt --cls-ckp
               "class_id": 1, "class_name": "断纬", "class_conf": 0.91, "classified": true, "probs": [...]}]}
 ```
 
-- `class_id == 19` 为「未知类型」：分类器最大 softmax < `unknown_thr`，或该区域未送分类器（`classified=false`）；
-- 只对最异常的 `top_k` 个区域做分类，其余区域照常输出但标未知类型。
+- `anomaly_conf = score / (score + img_thr)`，恰在阈值上为 0.5；
+- `class_id == 19` 为「未知类型」：分类器最大概率 < `unknown_thr`，或该区域未送分类器（`classified=false`）；
+- 只对最异常的 `top_k` 个区域做分类，其余区域照常输出但标未知类型；
+- 热力图用**绝对阈值**渲染：低于正常图噪声上限的像素完全透明，高于它的部分颜色与透明度随强度增大，背景不会被拉伸成满屏噪点。
+
+## 6. 验证与辅助命令
+
+| 目的 | 命令 |
+|---|---|
+| 完整预测评估 | `python scripts/evaluate.py --mode pipeline --top-k 0` |
+| 纯检测评估 | `python scripts/evaluate.py --mode pipeline --no-classify` |
+| 分类器验证（GT 框直接喂分类器） | `python scripts/evaluate.py --mode gt` |
+| 体检数据（坏图、train/val 近重复） | `python scripts/check_images.py` · `python scripts/check_leakage.py --show 10` |
+| 速度测试（检测器/分类器/整体 ms 与 FPS） | `python scripts/benchmark.py --device cuda:0 --half` |
+| 单独重建 kNN 记忆库 / 重做融合（日常不用，① 已自动做） | `python scripts/fit_knn.py` → `python scripts/fuse_detectors.py` → 重新 `calibrate.py --det-ckpt checkpoints/detector/model_fused.pth` |
+
+所有脚本的 `--data-yaml` 默认都是 `dataset/fabric19.yaml`，`--root` 可覆盖数据根目录。
 
 ---
 
-## 调参与排障
+## 7. 原理简述
 
-### 正常/缺陷分数重叠（calibrate 告警 `separable=false`）
+**检测器（Dinomaly2）**：冻结的 DINOv2 encoder 抽多层特征，bottleneck + 线性注意力 decoder 学着把它重建回来。训练时：
+- 正常图：loose cosine 重建损失（只压最难的一部分 token，避免过拟合）+ 局部逐位置 cosine（细线类信号不被全局池化稀释，hard mining 取最难 20% 位置）；
+- 缺陷图：图级 margin（缺陷图分数须比同 batch 正常图高 `margin`）+ 框级 margin（框内 token 距离 ≥ `margin`，直接抬高最弱缺陷的分数）；框外正常纹理也参与重建；
+- 分数高的正常图重建损失加权（困难正常重加权），压低 `max_normal`。
 
-先看日志「各缺陷类最低图分数」定位是哪些类（常见是细长经线类），然后依次：
+推理：异常图 = 1 − cos(encoder 特征, decoder 重建) → 上采样到输入尺寸 → 高斯平滑；图级分数 = 异常图最大值（或最高 N% 像素均值，由 `calibrate` 选）；
+异常图高于 `mask_thr` 的连通域 → 缺陷区域框 → 交给分类器（先检测后分类）。
 
-1. 这些已是默认（局部损失 / 困难正常 / 框外重建），可加大 `--total-iters`、`--local-loss-w 2`；
+**kNN 记忆库与融合**：正常图的 DINOv2 中层 patch 特征经 coreset 压缩成记忆库，测试 patch 到最近正常 patch 的余弦距离就是异常分数（免训练，思路来自 AnomalyDINO / PatchCore）。
+重建式（对"能被重建出来的缺陷"会漏）和记忆库式（对"记忆库没覆盖的正常变化"会误报）误差模式不同，两张异常图按"正常图典型分数"归一化后加权：
+`fused = w · dino_map / ref_d + (1 − w) · knn_map / ref_k`。两者共用同一个冻结 encoder，kNN 特征直接取 Dinomaly 前向里已算好的目标层，只多一次最近邻搜索。
+
+**分类器**：裁剪框 → letterbox → 冻结 DINOv2 嵌入 → 余弦头。训练用 Balanced Softmax（logit 加 log 类先验，对长尾友好），稀有类按目标数多抽增强视角（特征级过采样），训练时对 GT 框随机缩放/平移模拟检测框误差。
+推理时检测框按 `box_pad=0.3` 外扩（与训练裁剪一致）；最大概率 < 自动校准的 `unknown_thr` → 「未知类型」。
+
+## 8. 调参与排障
+
+### 正常/缺陷分数重叠（`separable=false`）
+
+先看 calibrate 日志的「各缺陷类最低图分数」定位是哪些类（常见是细长经线类），然后依次：
+
+1. 加大 `--total-iters`、`--local-loss-w 2`（局部损失 / 困难正常 / 框外重建已是默认）；
 2. 确认没有开 `--rot90`（方向固定的布匹应保持默认关）；
-3. **先试 `calibrate`**：不重训，自动在 `smooth_sigma × score_ratio` 里挑间隙最大的组合；仍重叠再考虑训练时 `--smooth-sigma 8~12`；
+3. 先重新 `calibrate.py`（自动在 `smooth_sigma × score_ratio` 里挑间隙最大的组合）；仍重叠再考虑训练时 `--smooth-sigma 8~12`；
 4. 确认 `normaltrain` 覆盖全部正常变化（暗角/光照/品种）；
-5. 仍只差一点：`image_size` 提到 560（14×40，合法尺寸），需重训+重校准。
+5. 仍只差一点：`--image-size 560`（14×40，合法尺寸），需重训 + 重校准。
+
+### 按症状选下一步
+
+| 症状 | 手段 | 代价 |
+|---|---|---|
+| 检测**漏报**（`min_defect` 低） | 细长缺陷保持局部损失；更大 backbone `dinov2reg_vit_base_14`；更高分辨率（`--image-size 560/672`，公开结果里边际收益小） | 后两者在 1660 上明显变慢 |
+| 检测**误报**（`max_normal` 高） | 跑 `check_leakage.py`（val 虚高会让阈值偏松，上线反而误报）；补更多、更多样的正常图；`--hard-normal-w` 加大 | 基本无推理代价 |
+| **分类**准确率低 | 看 `evaluate --mode gt` 的混淆对；分类器换 `--backbone dinov2reg_vit_base_14`；`--kind cnn` 做 A/B；补稀有类数据 | 更大骨干每个裁剪约 3× 计算 |
+| 端到端低但 gt 分类高 | 检测框质量问题：用 `evaluate --mode pipeline` 看框召回；调 `--region-score-ratio` / `box_pad` | 无 |
+| 推理太慢 | `--half`；训练时 `--no-knn` 去掉 kNN 融合（再 `calibrate`）；`--image-size 336` | 精度可能下降 |
 
 ### 热力图噪点多
 
@@ -312,218 +261,53 @@ python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode gt --cls-ckp
 
 | 现象 | 处理 |
 |---|---|
-| 训练/校准/推理分辨率不一致 | `calibrate` 把分辨率写进 `thresholds.json`，`infer` 加载时自动核对并告警 ⚠️；默认 448 勿改 |
+| 训练/校准/推理分辨率不一致 | `thresholds.json` 记录分辨率，`infer` 加载时自动核对并告警；默认 448 勿改 |
 | Windows 训练卡住 | 已默认 `--num-workers 0`，可手动调大 |
 | 中文路径/文件名 | 全部走 Unicode 安全读写，无碍 |
 | 校准太慢 | `--max-images 200` 先抽样 |
-| backbone 权重下载失败 | 放到 `backbones/weights/`；`--allow-random-init` 仅冒烟测试用 |
-| 分类器预训练下载损坏 | 自动删缓存重试一次；仍失败用 `--pretrained-path` |
+| backbone 权重下载失败 | 手动下载放到 `backbones/weights/`，或 `--weights-dir` 指定 |
+| kNN/融合那步报错 | 训练会自动退回纯 Dinomaly（`model_final.pth` = `model_best.pth`）；之后可单独跑 `fit_knn.py` + `fuse_detectors.py` |
+| 想恢复旧默认训练参数 | `--local-loss-w 0 --hard-pos-ratio 0 --hard-normal-w 0 --local-loss-warmup 0 --defect-bg-w 0 --rot90 --total-iters 20000 --eval-interval 5000 --no-knn` |
 
----
+> ⚠️ kNN/融合的收益来自 AnomalyDINO 等公开结果与"融合在 val 上不会比单个差"的构造，**在你的布匹数据上的实际提升没有实测**；
+> 融合会让推理多一次最近邻搜索，请用 `benchmark.py --half` 在 1660 上看延迟。嫌慢就 `--no-knn` 重训，
+> 或 `cp checkpoints/detector/model_best.pth checkpoints/detector/model_final.pth` 后重新 `calibrate.py`。
+> 选融合权重、选层组和校准阈值用的是同一份 val，val 图少时间隙会偏乐观，务必用独立测试图做最终验证。
 
-## 检测器优化清单（v2）
-
-本版对检测器做了一轮审查，修复/优化如下。**前 4 项会改变训练行为，旧 checkpoint 仍可加载使用，但建议重训 + 重校准。**
-
-| # | 问题 | 影响 | 处理 |
-|---|---|---|---|
-| 1 | **缺陷框掩码与图像增强不同步**：图像随机 rot90/翻转，框掩码没动 | 约 3/4 的缺陷样本框级监督落在错误位置（回归测试复现：旧代码 155/200 不重合） | 新增 `TrainAug`，同一组随机参数同时作用于图像和掩码；`crop<image` 时 RandomResizedCrop 也同步 |
-| 2 | **`model_best` 选不出来**：`images/val` 全是缺陷图时 I-AUROC 恒为 NaN→0，`model_best` 停在第一次评估；且 `--eval-interval` 实际没生效（按 save_interval 评估） | 拿到的可能是 iter 1000 的权重 | 评估集加入 `normalval`；按 `(I-AUROC, 相对间隙)` 选优；`--eval-interval` 生效；缺正常图时跟随最新权重并告警 |
-| 3 | **细长框 token 掩码被丢**：框下采样用 INTER_NEAREST，每 14×14 只采 1 像素 | 2px 宽的经线缺陷 token 掩码全 0，框级监督失效 | 改 INTER_AREA，只要框与 token 有重叠就算缺陷 token |
-| 4 | **训练分数与推理分数不一致**：图级 hinge 用 token 网格未平滑最大值，推理/校准是上采样+高斯平滑后最大值 | 训练的 margin 并不等于校准时能拿到的间隙 | `--margin-score smooth`（默认）用与推理同款分数；`token` 为旧行为 |
-| 5 | **`--smooth-sigma` 调大无效**：平滑核固定 5×5，σ=4 与 σ=8 几乎都是均值滤波 | README 旧建议的「sigma 8」实际没效果 | σ≤4 保持原版 5×5（兼容旧阈值）；σ>4 核宽 `2⌈3σ⌉+1`，大核 replicate 填充（不压暗边缘）；改用可分离高斯，大核快 ~25× |
-| 6 | **sigma 需手工三处一致** | 漏改任一处阈值失效 | `thresholds.json` 记录 `smooth_sigma`，推理自动沿用；`calibrate --smooth-sigma 4` 不再被忽略 |
-| 7 | **校准内存**：`pix_thr` 把所有正常图全分辨率异常图拼成一个大数组 | 千张图约数 GB，OOM | 直方图累积求 99.99% 分位数（分辨率 1e-5） |
-| 8 | 方向固定的布匹被 rot90 增强削弱经/纬线敏感度 | 细长缺陷变钝 | 新增 `--no-rot90`（v8 起**默认已关**，改为 `--rot90` 才开；旧命令里的 `--no-rot90` 仍可用） |
-| 9 | 缺陷图只用了框内监督，框外正常纹理没用上 | 少一份正常数据 | 新增 `--defect-bg-w`（v8 起默认 0.5）：框外 token（外扩 1 token）参与重建 |
-| 10 | 热力图按每图分位数拉伸 + 重复推理一次 | 满屏噪点、可视化多耗一次前向 | 绝对阈值渲染；`ImageResult` 复用推理时的异常图 |
-
-回归测试 `tests/test_detector_fixes.py` 覆盖 1/3/5/7/8/9 及评估逻辑；官方对照新增的 11~16 见下一节。
-
-> 未做、可后续评估的方向：换 `dinov2reg_vit_base_14`（更准但 1660 上变慢）、flip-TTA 平均异常图（压噪但延迟翻倍）、优化器换 StableAdamW（与官方一致）。这些需要真实数据上的对比实验，没有盲改。
-
----
-
-## 与官方 Dinomaly2 对照（v3）
-
-逐文件对照了官方仓库（`dinomaly_2D.py` / `models/uad.py` / `utils.py` / `optimizers/StableAdamW.py` / `dinov2/`）。
-
-**已经一致（无需改）**：Dinomaly 前向（encoder 取 2~9 层 → noisy bottleneck → 8 层 decoder → 两组 loose constraint → context-aware recenter）、
-LinearAttention2 / Block / DINOv2 位置编码插值、loose loss（`p` 在 1000 iter 内线性升到 0.9，被丢弃区域梯度×0.1）、bottleneck 第一层小学习率（2e-4）、梯度裁剪 0.1、`1-cos` 异常图 + 5×5 σ=4 高斯。
-
-**本版差异与处理**：
-
-| # | 官方做法 | 本项目此前 | 处理 |
-|---|---|---|---|
-| 11 | **StableAdamW**（RMS 限幅 + NaN/Inf 跳步） | 普通 AdamW，且新增了 margin/box 等多项损失，更容易出尖峰 | 移植为 `src/dinomaly/optim.py`，默认 `--optimizer stableadamw`（与官方实现数值对照：同样的数据/种子下参数最大差 3e-8）；NaN 梯度改为整步跳过 |
-| 12 | 评估图级分数 = **最高 1% 像素均值**（`max_ratio=0.01`） | 只用最大值，单个噪声像素就能抬高 `max_normal` | 新增 `score_ratio`，`calibrate` 数据驱动选取；`thresholds.json` 记录，推理自动沿用 |
-| 13 | 评估时异常图先缩到 256 再平滑（σ=4，等效在 448 上的平滑强度约为我们的 1.7 倍） | 在 448 上直接用 5×5 核，平滑偏弱 → 噪点偏多 | `calibrate` 同时扫 `smooth_sigma`（4/6/8/12），不再靠猜 |
-| 14 | `--lr_decay_ratio` 默认 1 → warmup 后 **恒定学习率** | 余弦退火到 0（旧实现把 `final_ratio` 当成乘数，语义和官方相反） | 调度器改为官方语义；新增 `--lr-final-ratio`，默认 0（行为不变），想完全对齐官方设 1 |
-| 15 | 2D 配方 **无任何训练增强** | 固定开 rot90 + 翻转 | 新增 `--no-flip`；官方配方 = 不加 `--rot90` 且加 `--no-flip`；布匹方向固定至少关 rot90 |
-| 16 | — | **`--half` 在 CUDA 上不可用**：只把输入转成 fp16，模型权重仍是 fp32 → dtype 不匹配报错 | 改用 `torch.autocast`（权重保持 fp32，LayerNorm/softmax 自动留在 fp32）；`cudnn.benchmark` 打开（输入尺寸固定）。⚠️ 本环境无 GPU，该路径只在 CPU/bfloat16 下做了等价性测试，请在 1660 上用 `benchmark.py --half` 实测 |
-
-**有意不跟官方的地方**：官方默认 `crop_size=392`（448 缩放后中心裁剪），本项目 `crop_size=image_size=448` 不裁边缘（四周暗角属于正常外观、边缘疵点不能丢）；
-官方是纯无监督，本项目额外有缺陷监督（margin / box / 框外重建）。
-
-**没改、需要真实数据实验再决定**：换 `dinov2reg_vit_base_14`（官方 base/large 更准，1660 上会变慢）、flip-TTA、官方的 DINOv3 backbone 路径、训练到 4 万 iter（官方 MVTec/VisA 用 40000，这里默认 20000 是按 1660 的耗时折中）。
-
----
-
-## 分类器与训练采样改进（v4）
-
-| # | 问题 | 影响 | 处理 |
-|---|---|---|---|
-| 17 | **分类器训练框 ≠ 推理框**：训练用人工 GT 框，推理用检测器热力图连通域出的框（大小/位置都不同），README 里「训练与推理同一套裁剪」只对 pad 成立 | 端到端分类准确率低于 `--mode gt` 的准确率 | 训练裁剪对 GT 框随机缩放（×0.74~1.35）+ 平移，`--box-jitter 0.3`，评估不抖 |
-| 18 | **分类器的 90° 旋转增强会制造错标签**：19 类里有大量经线/纬线类（纬线杂质/断纬/纬斜 vs 经线毛球…），方向就是类别信息 | 纬向缺陷旋转后变成经向，标签噪声 | 默认关；需要时 `--rot90` 打开（翻转保留） |
-| 19 | **类别均衡补偿了两次**：既用逆频率加权采样，损失里又乘了逆频率权重 | 少数类有效权重 ∝ 1/n_c²，过度补偿，多数类被压、概率校准变差 | 只保留加权采样，损失不加权；`--balance-power`（默认 1=完全均衡，0.5 折中，0=自然分布） |
-| 20 | **按总体准确率选 best**：类别不均衡时多数类掩盖少数类 | 选出的 checkpoint 对稀有缺陷召回差 | 按 balanced accuracy（各类召回均值）选 best，日志同时打印 `val_acc` 和 `val_bal_acc` |
-| 21 | **检测器训练 batch 里可能没有缺陷图**：均匀打乱时缺陷图占比低（如 5%，bs=16）约 44% 的 batch 一张缺陷图都没有 | 那一步 margin / box 损失等于没开 | `--defect-frac`：默认 -1=自动（自然占比 <20% 时抬到 25%，否则自然）；日志会打印自然占比和「batch 无缺陷图概率」 |
-
-**没做（需要真实数据 / 更大改动）**：
-- **难负样本挖掘**：分类器只见过真缺陷裁剪，检测器的误报区域（正常图上的热点）会被分到某一类或「未知类型」。
-  更稳的做法是用训练好的检测器在 normaltrain 上跑一遍，把误报区域裁剪当作「未知类型」负样本加入分类器训练。
-- 检测器 encoder 的 fp16（`autocast`）训练加速：1660 没有 Tensor Core，收益不确定，需要实测。
-
----
-
-## 训练提速与数据泄漏检查（v5）
-
-在 CPU 上对 `dinov2reg_vit_small_14 @448` 做了分段计时（bs=2）：**冻结 encoder 的前向约占一次迭代的一半**，decoder 的前向+反传约占另一半，且都以矩阵乘为主（不是胡乱的小算子）。所以真正能省时间的只有：少算（分辨率/迭代数）、算得快（融合注意力、fp16）、别让 GPU 等（数据加载）。
-
-| # | 改动 | 预期收益 | 说明 |
-|---|---|---|---|
-| 22 | encoder 注意力改用 `F.scaled_dot_product_attention`（默认生效） | CPU 上 encoder 前向 **-33%**；GPU 上更明显（448 输入 N=1029，bs16 时手写版每层要物化约 400MB 的注意力矩阵） | 数值与手写 softmax 一致（最大误差 7e-8），推理也同步受益，无需任何参数 |
-| 23 | `--enc-fp16`（可选）：冻结的 encoder 用 fp16 autocast | 省 encoder 耗时的约一半，并降低显存；**需要在 1660 上实测** | decoder 仍是 fp32（LinearAttention 的 eps=1e-8 在 fp16 下会变 0）；只影响训练，推理默认 fp32。先跑几百 iter，对比 loss 与不加此项是否一致 |
-| 24 | DataLoader `persistent_workers=True, prefetch_factor=4` | Windows 上 spawn 启动 worker 每次都要重新 import torch/cv2（十几秒），旧版每个 epoch 结束都重启一遍，GPU 空等 | 仅 `num_workers>0` 时启用；同时 `pin_memory` 仅 CUDA 开、`non_blocking` 拷贝 |
-| 25 | 训练 loss 在设备上累加，不再每步 `loss.item()` | 去掉每步一次 GPU 同步 | 日志每 100 步才同步一次 |
-| 26 | `--early-stop N`（可选） | 连续 N 次评估 `model_best` 没提升就提前结束 | 配合 `--eval-interval 2000` 用；注意余弦调度按 `--total-iters` 排，提前停会少走完退火阶段 |
-| 27 | `scripts/check_images.py` 直接报 `NameError`（原仓库遗留 bug：函数里用到的 import 写在了 `main()` 内部） | 工具能用了 | 导入移到模块级 |
-
-**关于迭代数**：官方 40000 iter 是多类别（15 类混在一起）的设置；这里是单一布匹类型，decoder 要拟合的分布窄得多，通常 8000~12000 iter（配合余弦退火到 0）就接近收敛。建议先 `--total-iters 10000 --eval-interval 2500 --early-stop 2` 跑一次，看评估曲线再决定是否加长，而不是默认跑 20000（1660 约 11 小时）。
-
-### 数据泄漏检查（可能是「精度低」的根因之一）
-
-数据集目录叫 `source5_augmented`：如果是**先离线增强、后划分 train/val**，同一张原图的翻转/旋转/调亮副本会同时落在 train 和 val 里。后果：val 上的 AUROC、`model_best` 的选择、校准出的阈值、分类器的 `unknown_thr` 都是在「见过的图」上调的，指标虚高，换到真正没见过的新布样上就明显变差——看起来就是「精度低」。
-
-```bash
-python scripts/check_leakage.py --data-yaml dataset/fabric19.yaml --show 10
-```
-
-对每张 val 图取 8 种旋转/翻转版本的 dHash（对亮度缩放不敏感），与 train 的最近邻距离 ≤ 6（/64）判为近重复，并给出「无关图对」的距离中位数作参照。布匹纹理很均匀，dHash 区分度有限，**结果当线索用，请抽看 `--show` 打印的图对**。若比例很高（>10%），应按**原图**分组重新划分 train/val（增强只在 train 内做），再重新训练/校准。
-
----
-
-## 开源方案调研与新增模块（v6）
-
-目标：**训练快、检测准、分类准（含类别不均衡）、推理实时**。调研结论与取舍：
-
-| 方案 | 要点 | 本项目的取舍 |
-|---|---|---|
-| **AnomalyDINO**（WACV'25, arXiv 2405.14529） | 冻结 DINOv2，patch 特征 + 最近邻记忆库，**免训练**；MVTec-AD 上 448 分辨率图级 AUROC 99.3（全样本），VisA 97.2 | ✅ 采用其思路做 `src/knn_detect.py`：训练 = 抽特征 + coreset，几分钟；当快速基线 / 数据变了快速重建 |
-| **PatchCore**（CVPR'22） | 中层特征 + 贪心 k-center coreset | ✅ 记忆库压缩直接用 coreset（`kcenter_greedy`） |
-| **EfficientAD**（WACV'24, arXiv 2303.14535） | 蒸馏的轻量 PDN 特征提取器 + 学生-教师，2 ms 延迟、600 图/秒 | ⏸ 延迟最低，但要重新训练蒸馏网络 + 自编码器，且放弃了 DINOv2 特征；你现有 1660 的 Dinomaly 已满足实时，暂不引入，若后续要上更弱的设备再评估 |
-| **Dinomaly2**（现有主线） | 冻结 DINOv2 + 噪声瓶颈 + 线性注意力 decoder，重建式 | ✅ 保持为精度主线（已联合缺陷监督）|
-| **长尾识别**：decoupled training（Kang'20）、Balanced Softmax（Ren'20）、logit adjustment（Menon'21） | 表示学习用自然分布，分类头再做类别均衡；训练时给 logits 加 `tau·log(先验)`，推理不加 | ✅ 采用：`src/embed_classify.py`，冻结骨干 + 余弦头 + Balanced Softmax |
-
-### 1. 免训练 kNN 检测器（`scripts/fit_knn.py`）
-
-> **v8 起已并入 `train_detector.py`**：训练结束自动建库并与 Dinomaly 融合（见上文「快速开始 ①」），不用再手动跑。下面的命令只在想**单独重建记忆库**（换布样/加数据）时用，输出默认 `checkpoints/detector/knn_best.pth`；路径已改，`--out checkpoints/knn` 的旧写法可继续用但要自己 `--det-ckpt` 指过去。
-
-```bash
-python scripts/fit_knn.py --data-yaml dataset/fabric19.yaml --out checkpoints/knn --layer-sets "5,7,9;8,10;11"
-python scripts/calibrate.py --det-ckpt checkpoints/knn/model_best.pth --out checkpoints/knn/thresholds.json --sweep
-python scripts/infer.py --det-ckpt checkpoints/knn/model_best.pth --thresholds checkpoints/knn/thresholds.json ...
-```
-
-- **训练**：抽 ≤300 张正常图的 DINOv2 中层 patch 特征（多层各自归一化后平均）→ 贪心 coreset 压到 `--bank-size`（默认 2 万）→ 存成 `model_best.pth`。`--layer-sets` 可一次比较几组层，按 val 的 (I-AUROC, 相对间隙) 择优。
-- **零改动接入**：模型 `forward` 返回与 Dinomaly 同接口的 `(en, de)`（查询特征 / 最近邻特征），`1-cos` 就是 kNN 余弦距离，所以 `calibrate / --sweep / evaluate / infer / benchmark` 全部直接可用。
-- **取舍（实话）**：它的优势是**训练时间**（分钟 vs 数小时）和**换布样/加数据时几乎零成本**；推理延迟和 Dinomaly **差不多**（CPU 上 448 实测 391 ms vs 434 ms：省掉了 decoder，但多了最近邻搜索；`--bank-size` 越小越快）。精度要在你的数据上用 `fit_knn.py` 末尾打印的 I-AUROC / 间隙与 Dinomaly 比，**我没有你的数据，没法替你下结论**。它不使用缺陷标注，所以 Dinomaly 的联合监督（margin 损失）带来的增益它没有。
-
-### 2. DINOv2 嵌入分类器（`train_classifier.py --kind embed`，新默认）
-
-```bash
-python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out checkpoints/classifier        # embed (新默认)
-python scripts/train_classifier.py --kind cnn --out checkpoints/classifier_cnn                            # 旧方案, 用来 A/B
-python scripts/evaluate.py --mode gt --cls-ckpt checkpoints/classifier/best.pt                            # 两个 ckpt 各评一次
-```
-
-- **特征**：冻结 DINOv2 对裁剪（224 letterbox）取 `[CLS, 末层 patch 均值, 中层 patch 均值]`，各自 L2 归一化后拼接；骨干与检测器共用同一份权重文件，checkpoint 只存分类头（几十 KB）。
-- **不均衡**：①分类头 = 余弦头 + **Balanced Softmax**（`--tau 1`；单元测试里两类 1000:20 且重叠时 balanced accuracy 0.818 → 0.919）；②稀有类**特征级过采样**：按 `--min-per-class` 给稀有类多抽增强视角（框抖动/翻转/颜色），骨干只多前向几次；③按 val balanced accuracy 选最佳；④不再同时用加权采样 + 损失加权（v4 已修）。
-- **速度**：骨干只前向一次、特征缓存在内存，分类头训练秒级；旧方案每个 epoch 重读图 + 反传整个 CNN。
-- **代价**：每个裁剪比 MobileNetV3-Small 重（CPU 上 4 个 224 裁剪 241 ms vs 19 ms；GPU 上每裁剪个位数毫秒）。流水线默认 `top_k=1` 只分类最热的 1 个区域，影响很小；想再省可 `--crop-size 168`（12×12 patch，约 2 倍快）。
-- **分类准不准也是要在你的数据上比的**：先用 `--kind cnn` 和 `--kind embed` 各训一次，`evaluate.py --mode gt` 看每类准确率与混淆矩阵，保留更好的。
-
-### 3. 顺手修的老 bug
-
-- `scripts/evaluate.py` 的 `confusion_report` 用了函数里才 import 的 `np` → `--mode gt` 跑完直接 `NameError`（原仓库遗留）。
-- `scripts/benchmark.py` 的 `_flops` 用了未 import 的 `torch`，被 `except` 吞掉，FLOPs 永远显示不出来。
-
-### 没做 / 下一步
-
-- **检测器误报区域当「未知类型」负样本**（难负样本挖掘）：用训练好的检测器在 normal 图上跑一遍，把误报区域的嵌入加入分类头作为一个背景类，比现在的「最大概率分位数」更像真正的开集拒识；嵌入分类器已具备基础（特征可缓存），需要先有检测器。
-- **Dinomaly + kNN 分数融合**（两张异常图按正常分位数归一化后取加权）：没有数据没法定权重。
-- **TensorRT / ONNX 导出**：若 1660 上 fp16 `--half` 仍不够快再做。
-
----
-
-## 精度再优化：检测融合与误差分析（v7）
-
-### 1. Dinomaly + kNN 融合检测器（`scripts/fuse_detectors.py`）
-
-> **v8 起已并入 `train_detector.py`**，训练结束自动执行并写 `model_final.pth`。单独重做融合：`python scripts/fit_knn.py && python scripts/fuse_detectors.py && python scripts/calibrate.py --det-ckpt checkpoints/detector/model_fused.pth`。下面的命令是 v7 的手动写法，路径仅供参考。
-
-重建式（Dinomaly，带缺陷监督）与记忆库式（kNN）的误差模式不同：前者对「能被重建出来的缺陷」会漏，后者对「记忆库没覆盖到的正常变化」会误报。两张异常图各自按「正常图典型分数」归一化后加权：
+## 9. 项目结构
 
 ```
-fused = w · dino_map / ref_d + (1 − w) · knn_map / ref_k      # ref = 正常 val 图图级分数的均值, 使两者"正常水平"都≈1
+scripts/
+  train_detector.py     ① 检测器训练 (+ 训练末尾自动 kNN 建库与融合, 写 model_final.pth)
+  calibrate.py          ② 阈值校准 (默认扫参)
+  train_classifier.py   ③ 分类器训练
+  infer.py              ④ 预测: 图片 / 目录 / 视频 / 摄像头; 完整预测或 --no-classify 纯检测
+  evaluate.py           评估: --mode pipeline (完整 / --no-classify 纯检测) · --mode gt (分类器)
+  benchmark.py          速度测试
+  check_images.py       坏图体检
+  check_leakage.py      train/val 近重复(数据泄漏)检查
+  fit_knn.py            单独重建 kNN 记忆库 (日常不用)
+  fuse_detectors.py     单独重做 Dinomaly+kNN 融合 (日常不用)
+src/
+  detect.py             检测器: 训练 / 评估 / 校准 / 推理 / 区域分割
+  knn_detect.py         kNN 记忆库检测器 (DINOv2 中层 patch + coreset)
+  fusion.py             Dinomaly + kNN 融合, 训练后自动融合流程
+  classify.py           分类器公共部分: 裁剪数据集 / 未知类型校准 / TTA 推理 / CNN 方案
+  embed_classify.py     DINOv2 嵌入分类器 (余弦头 + Balanced Softmax + 特征级过采样)
+  pipeline.py           端到端流水线: 检测 → 区域 → top_k 分类 → 热力图可视化
+  dinomaly/             Dinomaly2 模型 / 损失 / 优化器 / DINOv2 encoder
+  data/                 YOLO 数据集读取 (Unicode 安全, 坏图跳过) 与配置解析
+  util.py               日志 / 指标 / 可分离高斯平滑 / 框与掩码工具 / 中文字体
+dataset/fabric19.yaml   数据集路径与 19 类类名 (改成你的实际路径)
+tests/                  smoke_test.py (全链路冒烟) + test_detector_fixes.py (回归测试)
 ```
 
-```bash
-python scripts/fit_knn.py --layer-sets "5,7,9" --out checkpoints/knn          # 层必须在 2~9 之间 (与 Dinomaly 目标层一致)
-python scripts/fuse_detectors.py --dino-ckpt checkpoints/detector/model_best.pth \
-    --knn-ckpt checkpoints/knn/model_best.pth --out checkpoints/fused/model_best.pth
-python scripts/calibrate.py --det-ckpt checkpoints/fused/model_best.pth --out checkpoints/fused/thresholds.json --sweep
-```
-
-- **共用 encoder**：kNN 特征直接取 Dinomaly 前向里已算好的目标层 token，只多一次最近邻搜索（耗时 ∝ `--bank-size`），不重复跑 encoder。
-- **w 自动选**：在 val 上扫 `0, .25, .5, .75, 1`，按 (I-AUROC, 相对间隙) 取最好。**w=1（纯 Dinomaly）和 w=0（纯 kNN）都是候选**，所以融合在 val 上不会比单个检测器差；若选出 w=1 会直接告诉你「融合无增益」。
-- **必须重新 calibrate**：融合分数尺度与单个检测器不同，不能沿用旧的 `thresholds.json`。
-- **代价**：推理 = Dinomaly + 一次最近邻搜索，延迟比纯 Dinomaly 高；在 1660 上用 `benchmark.py --half` 实测，若超出实时预算就用 `--bank-size` 调小。
-- **局限**：w 是在 val 上选的，样本少时有噪声；融合的真实收益取决于两个检测器各自错在哪里，需要你的数据验证。
-
-### 2. 误差分析输出
-
-`evaluate.py --mode gt` 现在额外打印 **macro 平均（各类召回均值）** 和 **最常见的混淆对**（真实→预测、次数、占比）。分类准确率上不去时先看这里：
-
-- 少数几对近义类互相混 → 考虑合并成一类、补那几类的数据，或检查标注一致性（这是精度天花板最常见的原因，换模型解决不了）；
-- 某类召回极低且样本很少 → 加 `--min-per-class`、换更大的嵌入骨干（见下）；
-- 很多真实类被判成「未知类型」→ 调低 `--unknown-quantile` / `--unknown-min`。
-
-### 3. 按症状选下一步（都需要你的评估数据来判断，我没有）
-
-| 症状 | 手段 | 代价 |
-|---|---|---|
-| 检测**漏报**（`min_defect` 低） | ① 融合 kNN；② 细长缺陷加 `--local-loss-w 1 --hard-pos-ratio 0.2`；③ 更大 backbone `dinov2reg_vit_base_14`；④ 更高分辨率（AnomalyDINO 的消融里 448→672：MVTec-AD 99.3→99.5，VisA 97.2→97.6，边际收益小）| ③④ 在 1660 上明显变慢 |
-| 检测**误报**（`max_normal` 高） | ① 融合 kNN；② `calibrate`；③ `--hard-normal-w 0.5`；④ 跑 `check_leakage.py`（val 虚高会让阈值偏松，上线反而误报）；⑤ 补更多/更多样的正常图 | 基本无推理代价 |
-| **分类**准确率低 | ① 看混淆对（上）；② 分类器换 `--backbone dinov2reg_vit_base_14`（只对 top-k 区域跑，开销小）；③ `--kind cnn` 做 A/B；④ 补稀有类数据 | ② 每个裁剪 ~3× 计算 |
-| 端到端低但 gt 分类高 | 检测框质量问题: 用 `evaluate.py --mode pipeline` 看框召回；调 `--region-score-ratio` / `box_pad` | 无 |
-
----
-
-## 测试与性能
-
-> **v8 简化**：不再提供 `run.py`，改为四条命令（见[快速开始](#快速开始四条命令)）：`train_detector.py` → `calibrate.py` → `train_classifier.py` → `infer.py`。为此：
-> `train_detector.py` 的默认值改成原先 README 推荐的细长缺陷配方（10000 iters、关 rot90、`local-loss-w 1.0`、`hard-pos-ratio 0.2`、`hard-normal-w 0.5`、`local-loss-warmup 2000`、`defect-bg-w 0.5`、`eval-interval 2500`），
-> 并把 kNN 记忆库 + 融合并入训练末尾（`--no-knn` 关），产出 `model_final.pth`；`calibrate.py` 默认 `--sweep`、默认读 `model_final.pth`、输出写在权重同目录；
-> `infer.py` / `evaluate.py` / `benchmark.py` 默认同样读 `model_final.pth`，`infer.py` 新增 `--input` 自动识别、缺分类器时降级为只检测。
-> 想恢复旧默认：`--local-loss-w 0 --hard-pos-ratio 0 --hard-normal-w 0 --local-loss-warmup 0 --defect-bg-w 0 --rot90 --total-iters 20000 --eval-interval 5000 --no-knn`。
-> ⚠️ kNN/融合的收益来自 AnomalyDINO 等公开结果与"融合在 val 上不会比单个差"的构造，**在你的布匹数据上的实际提升没有实测**；融合会让推理多一次最近邻搜索，请用 `benchmark.py --half` 在 1660 上看延迟，嫌慢就加 `--no-knn` 重新生成 `model_final.pth`（或 `cp checkpoints/detector/model_best.pth checkpoints/detector/model_final.pth`，再重新校准）。
-
+## 10. 测试
 
 ```bash
 python tests/smoke_test.py            # CPU 可跑, tiny_test_14 随机初始化: 训练/校准/推理/分类/可视化全链路
-python tests/test_detector_fixes.py   # 回归测试 (秒级): 增强同步 / 平滑核 / 校准 / StableAdamW / 调度器 / score_ratio / autocast / 扫参 / 分类器增强 / 缺陷占比采样
-python scripts/benchmark.py --data-yaml dataset/fabric19.yaml --device cuda:0   # 速度
+python tests/test_detector_fixes.py   # 回归测试 (秒级): 增强与掩码同步 / 平滑核 / 校准 / StableAdamW / 调度器 / 扫参 /
+                                      #   kNN / 融合 / 分类头 / 训练后自动融合 / 命令行参数存在
 ```
 
-448 + ViT-S 约 30~60 FPS（`--half` 再翻倍）；检测器训练 bs=16 约 2s/iter。
+沙箱里只有 CPU 和合成数据，两套测试只验证流程与数值等价，**不代表真实数据上的精度或速度**。

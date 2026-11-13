@@ -8,7 +8,6 @@ dinov2_vit_small_14 / dinov2_vit_base_14, 以及本项目测试用的 tiny_test_
 """
 import math
 from functools import partial
-from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -216,28 +215,6 @@ class DinoVisionTransformer(nn.Module):
             x = blk(x)
         x = self.norm(x)
         return x
-
-    def get_intermediate_layers(self, x, n, reshape=False, return_class_token=False, norm=True):
-        x = self.prepare_tokens(x)
-        out = []
-        for i, blk in enumerate(self.blocks):
-            x = blk(x)
-            if i in n:
-                out.append(x)
-        if norm:
-            out = [self.norm(o) for o in out]
-        if reshape:
-            res = []
-            for o in out:
-                cls_tok = o[:, :1]
-                patch = o[:, 1 + self.num_register_tokens:]
-                if return_class_token:
-                    res.append(torch.cat((patch, cls_tok), dim=1))
-                else:
-                    res.append(patch)
-            return res
-        return out
-
 
 def vit_small(patch_size=14, num_register_tokens=0, img_size=518, **kwargs):
     return DinoVisionTransformer(patch_size=patch_size, embed_dim=384, depth=12, num_heads=6,
