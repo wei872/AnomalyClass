@@ -1,0 +1,13 @@
+# AnomalyClass — 基于 Dinomaly2 的布匹异常检测 + 缺陷分类流水线
+# 安装 (1660 机器, 建议 python 3.10 + CUDA 对应的 torch):
+#   pip install -r requirements.txt
+#   若需 GPU: 先装对应 CUDA 版本的 torch/torchvision, 再装其余依赖
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+opencv-python-headless>=4.8
+PyYAML>=6.0
+Pillow>=9.5
+scikit-learn>=1.3
+scipy>=1.10
+tqdm>=4.65

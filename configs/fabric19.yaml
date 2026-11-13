@@ -1,0 +1,41 @@
+# AnomalyClass 推荐设置参考 (数据路径见 dataset/fabric19.yaml, 不要改这里)
+# 所有脚本的默认参数已与本文件一致, 直接运行即可:
+#   python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpoints/detector
+#   python scripts/calibrate.py     --data-yaml dataset/fabric19.yaml --det-ckpt checkpoints/detector/model_best.pth
+#   python scripts/infer.py         --data-yaml dataset/fabric19.yaml --dir <图片目录> --out runs/infer
+#   python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out checkpoints/classifier
+
+detector:                      # 正异常检测器 (Dinomaly2): 正常图 + 带框缺陷图联合训练, 固定 448
+  backbone: dinov2reg_vit_small_14   # 1660@448 实时; 更准可换 dinov2reg_vit_base_14
+  image_size: 448              # 推理输入尺寸 (训练/校准/推理必须一致, 勿改)
+  crop_size: 448              # = image_size, 不裁边缘 (图四周暗角属于正常, 必须训练到)
+  total_iters: 20000           # 1660 上 bs=16 约 2s/iter -> 20000 约 11h; 断点续训 --resume model_last.pth
+  batch_size: 16
+  local_loss_w: 0.0            # 细长经线类缺陷建议 1.0 (局部逐位置损失, 避免全局cosine稀释细线信号)
+  hard_pos_ratio: 0.0          # 配合 local_loss_w 的 hard mining 比例 (如 0.2)
+  margin_w: 1.0                # 缺陷监督-图级hinge: 缺陷图分数须比同batch正常图高 margin (联合训练默认开)
+  margin: 0.05                 # margin 目标间隙 (cos距离量级)
+  box_margin_w: 1.0            # 缺陷监督-框级hinge: 框内token平均距离 >= margin, 抬高 min_defect
+  hard_normal_w: 0.0           # 困难正常重加权 (如 0.5): 压 max_normal
+  half: false                  # GTX 1660 上可开 true (FP16, 约 2x 加速)
+  # 推理顺序: 先检测区域 -> 再分类 (见 segmentation/classifier); --no-defect-sup 仅消融对照
+
+calibration:                   # 阈值校准: normalval 正常分数 vs val 缺陷分数, 可分时取间隙中点
+  pix_quantile: 0.9999         # 正常图异常像素分位数 -> 区域分割阈值 pix_thr
+  # 若正常/缺陷分数重叠 (无法同时 100%), 会告警并取 max_normal; 那时需要重训检测器让分布分开
+
+segmentation:                  # 异常图 -> 区域框 -> 只对最异常的 top_k 个做分类
+  mask_ratio: 0.5              # 掩码阈值 = mask_ratio * pix_thr
+  region_score_ratio: 0.5      # 掩码阈值还取 max(全局阈值, 图内最高分*该比例), 只圈最热区域
+  top_k: 1                     # 只对最异常的 top_k 个区域做分类 (0=全部); 其余标未知类型
+  min_area_ratio: 0.0002       # 最小区域面积 (占图比例)
+  dilate: 7                    # 连通域前膨胀核大小
+  box_pad: 0.3                 # 检测框向外扩展比例 = 分类器训练裁剪 crop_pad, 两者一致
+
+classifier:                    # 缺陷分类器 (在 YOLO 疵点框裁剪上训练, letterbox 保宽高比)
+  arch: mobilenet_v3_small     # 最轻量
+  crop_size: 224               # letterbox 目标尺寸, 训练与推理一致 (不用调)
+  crop_pad: 0.3                # 训练裁剪四周扩展比例 (与检测区域 box_pad 一致)
+  epochs: 50                   # 配合早停 patience=15
+  batch_size: 32
+  unknown_thr: auto            # 按 val 最大概率分位数自动校准 (clamp 0.5~0.8), 低于此判 "未知类型"

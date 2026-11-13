@@ -1,0 +1,11 @@
+python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpoints/detector
+
+python scripts/calibrate.py --data-yaml dataset/fabric19.yaml --det-ckpt checkpoints/detector/model_best.pth --out checkpoints/detector/thresholds.json
+
+python scripts/infer.py --data-yaml dataset/fabric19.yaml --no-classify --det-ckpt checkpoints/detector/model_best.pth --thresholds checkpoints/detector/thresholds.json --dir D:/tyhn/yolo/dataset/source5_augmenteds/images/train --out runs/det_val
+
+
+
+python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpoints/detector --total-iters 10000 --local-loss-w 1.0 --hard-pos-ratio 0.2 --hard-normal-w 0.5 --local-loss-warmup 2000
+
+python scripts/calibrate.py --data-yaml dataset/fabric19.yaml --det-ckpt checkpoints/detector/model_best.pth --out checkpoints/detector/thresholds.json
