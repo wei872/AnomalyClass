@@ -13,7 +13,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.detect import (CombinedTrainDataset, TrainAug, calibrate, evaluate_detector, AnomalyDetector,
+from src.classify import CropDataset
+import src.classify as classify_mod
+from src.data.yolo import pil_to_tensor_batch
+from src.detect import (CombinedTrainDataset, train_detector, TrainAug, calibrate, evaluate_detector, AnomalyDetector,
                         WarmupCosineScheduler, sweep_postprocess)
 from src.dinomaly import build_dinomaly
 from src.dinomaly.losses import masked_recon
@@ -198,6 +201,59 @@ def test_half_path_and_sweep():
     print('ok  autocast 路径 / sweep_postprocess / thresholds 记录 score_ratio')
 
 
+def test_classifier_aug():
+    """分类器: 默认不做 90° 旋转 (经/纬方向是类别信息); 训练裁剪对 GT 框做抖动, 评估不抖."""
+    stripes = np.zeros((64, 64, 3), np.uint8)
+    stripes[::4] = 255                                       # 水平线 (纬向)
+
+    def orient(rot90):
+        vert = 0
+        for _ in range(40):
+            t = pil_to_tensor_batch([stripes], 64, augment=True, rot90=rot90)[0, 0]
+            if (t[1:] - t[:-1]).abs().mean() < (t[:, 1:] - t[:, :-1]).abs().mean():
+                vert += 1
+        return vert
+
+    assert orient(False) == 0, '默认不应出现 90° 旋转'
+    assert orient(True) > 0
+    with tempfile.TemporaryDirectory() as d:
+        imwrite_unicode(f'{d}/a.png', np.full((200, 200, 3), 90, np.uint8))
+        idx = [(f'{d}/a.png', (0, 0.5, 0.5, 0.3, 0.3), 0.3)]
+        shapes = {True: set(), False: set()}
+        orig = classify_mod.pil_to_tensor_batch
+        try:
+            classify_mod.pil_to_tensor_batch = lambda crops, *a, **k: (shapes[k['augment']].add(crops[0].shape[:2]),
+                                                                       orig(crops, *a, **k))[1]
+            for aug in (True, False):
+                ds = CropDataset(idx, 64, augment=aug, box_jitter=0.3)
+                for _ in range(30):
+                    ds[0]
+        finally:
+            classify_mod.pil_to_tensor_batch = orig
+        assert len(shapes[False]) == 1 and len(shapes[True]) > 5, (shapes[False], len(shapes[True]))
+    print('ok  分类器: 默认不旋转 / 训练框抖动 / 评估不抖')
+
+
+def test_defect_frac_log():
+    """缺陷图极少时, auto 模式把每个 batch 的缺陷占比抬到 25%."""
+    rng = np.random.default_rng(0)
+    msgs = []
+    with tempfile.TemporaryDirectory() as d:
+        for sub in ['n', 'd', 'l']:
+            os.makedirs(f'{d}/{sub}')
+        for i in range(30):
+            imwrite_unicode(f'{d}/n/{i}.png', rng.integers(100, 140, (112, 112, 3), dtype=np.uint8))
+        for i in range(2):
+            imwrite_unicode(f'{d}/d/{i}.png', rng.integers(100, 140, (112, 112, 3), dtype=np.uint8))
+            open(f'{d}/l/{i}.txt', 'w').write(' '.join(map(str, xyxy_to_yolo([(0, 20, 20, 60, 60)], 112, 112)[0])))
+        train_detector(f'{d}/n', f'{d}/out', backbone='tiny_test_14', image_size=112, crop_size=112, total_iters=2,
+                       batch_size=4, device='cpu', num_workers=0, allow_random_init=True, no_eval=True,
+                       defect_dir=f'{d}/d', defect_labels_dir=f'{d}/l', logger=lambda *a, **k: msgs.append(str(a[0])))
+    line = [m for m in msgs if '缺陷图自然占比' in m]
+    assert line and '目标占比 25%' in line[0], line
+    print('ok  defect_frac auto: 缺陷图极少时抬到 25%')
+
+
 if __name__ == '__main__':
     test_mask_follows_image_aug()
     test_thin_box_not_lost()
@@ -209,4 +265,6 @@ if __name__ == '__main__':
     test_scheduler_semantics()
     test_score_from_map()
     test_half_path_and_sweep()
+    test_classifier_aug()
+    test_defect_frac_log()
     print('ALL PASSED ✅')

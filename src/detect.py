@@ -309,7 +309,8 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                    hard_normal_w: float = 0.0, local_loss_warmup: int = 0,
                    rot90: bool = True, margin_score: str = 'smooth', defect_bg_w: float = 0.0,
                    eval_normal_dir: Optional[str] = None, eval_max_images: int = 0,
-                   flip: bool = True, optimizer: str = 'stableadamw', lr_final_ratio: float = 0.0):
+                   flip: bool = True, optimizer: str = 'stableadamw', lr_final_ratio: float = 0.0,
+                   defect_frac: float = -1.0):
     """联合训练 Dinomaly2 检测器: 正常图 (重建损失) + 带框缺陷图 (监督 margin: 图级 hinge + 框内 hinge)
     同一 batch 混合, 直接推开正常/缺陷分数分布, 解决 calibrate 重叠. 返回保存路径.
 
@@ -319,6 +320,9 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                   'token' = 旧做法 (token 网格上未平滑的最大值, 与推理分数有偏差).
     defect_bg_w: >0 时缺陷图框外 token (正常纹理) 也参与重建损失, 多榨一份正常数据 (默认关).
     flip: 训练增强是否含随机水平/垂直翻转. 官方 Dinomaly2 的 2D 配方完全不做增强 (rot90=flip=False).
+    defect_frac: 每个 batch 中缺陷图的期望占比. 缺陷图太少时 (如 5%), bs=16 约 44% 的 batch 一张缺陷图都没有,
+                 margin / box 损失那一步等于没开. -1=自动 (自然占比 <20% 时抬到 25%, 否则保持自然); 0=自然 (均匀打乱);
+                 >0=指定占比 (按带放回加权采样实现).
     optimizer: 'stableadamw' (官方配方, 更新量 RMS 超阈值时缩步长 + 坏梯度整步跳过, 抑制 loss 尖峰) / 'adamw'.
     lr_final_ratio: 余弦退火终点 = lr * 该值; 0 = 退火到 0 (默认), 1 = 恒定学习率 (官方默认).
     eval_normal_dir: 训练中评估时的纯正常 val 图目录. 没有它 val 只有缺陷图, I-AUROC 恒为 NaN, model_best 选不出来.
@@ -348,8 +352,21 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
         train_ds = NormalTransformDataset(normal_train_dir, tf)
         if defect_dir:
             log('注意: margin_w=box_margin_w=0, 缺陷监督关闭 (仅消融对照, 正式训练保持联合)')
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              drop_last=True, pin_memory=True)
+    sampler = None
+    if use_defect:
+        n_n, n_d = len(train_ds.normal), len(train_ds.defect)
+        nat = n_d / max(n_n + n_d, 1)
+        frac = defect_frac
+        if frac < 0:
+            frac = 0.25 if nat < 0.2 else 0.0
+        p_none = (1 - (frac if frac > 0 else nat)) ** batch_size
+        log(f'缺陷图自然占比 {nat:.1%}; 目标占比 {"自然" if frac <= 0 else f"{frac:.0%}"}; '
+            f'每个 batch 完全没有缺陷图的概率 ≈ {p_none:.1%}')
+        if frac > 0:
+            w = [(1 - frac) / max(n_n, 1)] * n_n + [frac / max(n_d, 1)] * n_d
+            sampler = torch.utils.data.WeightedRandomSampler(w, num_samples=len(train_ds), replacement=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
+                              num_workers=num_workers, drop_last=True, pin_memory=True)
     log(f'训练样本数: {len(train_ds)}, batch={batch_size}, iters={total_iters}')
 
     model = build_dinomaly(backbone, dropout=dropout, la=la, lc=lc, cr=cr, weights_dir=weights_dir,
@@ -385,7 +402,7 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                'defect_sup': bool(use_defect), 'rot90': bool(rot90), 'margin_score': margin_score,
                'defect_bg_w': float(defect_bg_w), 'flip': bool(flip),
                'optimizer': type(optimizer).__name__ if not isinstance(optimizer, str) else optimizer,
-               'lr_final_ratio': float(lr_final_ratio)}
+               'lr_final_ratio': float(lr_final_ratio), 'defect_frac': float(defect_frac)}
     smoother = make_smoother(smooth_sigma, device=device)     # 训练端 margin 分数用的平滑 (= 推理端同一个核)
     best_path = os.path.join(out_dir, 'model_best.pth')
     last_path = os.path.join(out_dir, 'model_last.pth')

@@ -79,7 +79,10 @@ class CropDataset(Dataset):
     DataLoader worker 要 pickle 数据集; 若把所有裁剪像素存在内存里会 MemoryError).
     """
 
-    def __init__(self, index, crop_size: int = 224, augment: bool = False, max_side: int = 1024):
+    def __init__(self, index, crop_size: int = 224, augment: bool = False, max_side: int = 1024,
+                 box_jitter: float = 0.0, rot90: bool = False):
+        self.box_jitter = float(box_jitter)
+        self.rot90 = rot90
         self.index = index
         self.crop_size = crop_size
         self.augment = augment
@@ -107,6 +110,13 @@ class CropDataset(Dataset):
         path, (c, cx, cy, w, h), pad = self.index[i]
         img = self._load(path)
         H, W = img.shape[:2]
+        if self.augment and self.box_jitter > 0:
+            # 框抖动: 推理时的框来自检测器热力图连通域 (大小/位置与人工 GT 框并不一致), 训练时随机缩放+平移 GT 框来模拟
+            j = self.box_jitter
+            w = w * float(np.exp(np.random.uniform(-j, j)))
+            h = h * float(np.exp(np.random.uniform(-j, j)))
+            cx = float(np.clip(cx + np.random.uniform(-j, j) * 0.5 * w, 0.0, 1.0))
+            cy = float(np.clip(cy + np.random.uniform(-j, j) * 0.5 * h, 0.0, 1.0))
         bw, bh = w * W, h * H
         x1 = max(0, int((cx - w / 2) * W - bw * pad))
         y1 = max(0, int((cy - h / 2) * H - bh * pad))
@@ -117,7 +127,7 @@ class CropDataset(Dataset):
         if y2 - y1 < 8:
             y2 = min(H, y1 + 8)
         crop = img[y1:y2, x1:x2]
-        x = pil_to_tensor_batch([crop], self.crop_size, augment=self.augment)[0]
+        x = pil_to_tensor_batch([crop], self.crop_size, augment=self.augment, rot90=self.rot90)[0]
         return x, c
 
 
@@ -245,8 +255,16 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
                      crop_pad: float = 0.3, epochs: int = 30, batch_size: int = 64, lr: float = 1e-3,
                      val_ratio: float = 0.1, unknown_quantile: float = 0.05, unknown_min: float = 0.5,
                      unknown_max: float = 0.8, pretrained: bool = True, device: str = 'cuda',
-                     num_workers: int = 4, seed: int = 1, logger=None, pretrained_path: Optional[str] = None) -> str:
-    """在 YOLO 标注的缺陷裁剪上训练分类器, 并校准 unknown_thr / temperature. 返回 best 路径."""
+                     num_workers: int = 4, seed: int = 1, logger=None, pretrained_path: Optional[str] = None,
+                     box_jitter: float = 0.3, rot90: bool = False, balance_power: float = 1.0) -> str:
+    """在 YOLO 标注的缺陷裁剪上训练分类器, 并校准 unknown_thr / temperature. 返回 best 路径.
+
+    box_jitter: 训练裁剪时对 GT 框做随机缩放/平移的幅度 (0=关), 模拟推理时检测器给出的框.
+    rot90: 是否加随机 90° 旋转增强 (默认关: 经线/纬线类别靠方向区分).
+    balance_power: 类别均衡强度, 只通过加权采样实现 (采样权重 ∝ n_c^-power; 1=完全均衡, 0=自然分布).
+                   旧版同时用了加权采样 + 逆频率损失权重, 少数类被补偿了两次 (有效权重 ∝ 1/n_c²), 现只保留采样.
+    best 按 val 的 **balanced accuracy** (各类召回的平均) 选, 而不是总体准确率 (多数类会掩盖少数类).
+    """
     log = logger or get_logger('train_classifier')
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -266,7 +284,7 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
     if not val_index:
         val_index = train_index[:max(1, len(train_index) // 10)]
 
-    train_ds = CropDataset(train_index, crop_size, augment=True)
+    train_ds = CropDataset(train_index, crop_size, augment=True, box_jitter=box_jitter, rot90=rot90)
     val_ds = CropDataset(val_index, crop_size, augment=False)
 
     # 每类样本数统计 + 类别权重 (19 类样本不均时, 少数类权重更大) + 加权随机采样
@@ -275,14 +293,11 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
     names_all = (names or []) + ['未知类型']
     log('每类训练样本数: ' + ', '.join(f'{names_all[c] if c < len(names_all) else c}:{cnt.get(c, 0)}'
                                         for c in sorted(cnt)))
-    class_weight = torch.zeros(nc, dtype=torch.float32)
-    total_n = max(sum(cnt.values()), 1)
-    for c in range(nc):
-        class_weight[c] = total_n / (nc * max(cnt.get(c, 0), 1))     # 逆频率权重
-    class_weight = (class_weight / class_weight.mean()).clamp(0.2, 10.0)
-    class_weight = class_weight.to(device)
-    sample_weights = torch.tensor([float(class_weight[item[1][0]]) for item in train_index],
-                                  dtype=torch.float32)
+    # 类别均衡只用加权采样 (损失不再加权, 避免重复补偿)
+    cw = np.array([max(cnt.get(c, 0), 1) ** (-float(balance_power)) for c in range(nc)], dtype=np.float64)
+    cw = cw / cw[[c for c in range(nc) if cnt.get(c, 0) > 0]].mean() if cnt else cw
+    sample_weights = torch.tensor([float(cw[item[1][0]]) for item in train_index], dtype=torch.float32)
+    class_weight = None
     sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(train_index),
                                                      replacement=True)
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
@@ -295,7 +310,8 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_path = os.path.join(out_dir, 'best.pt')
-    best_acc = -1.0
+    best_acc = -1.0                      # 这里记录的是 best 的 balanced accuracy
+    best_plain_acc = 0.0
     bad_epochs = 0
     patience = 15
     mixup_p = 0.5          # MixUp 概率
@@ -324,26 +340,28 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
             total += x.size(0)
         scheduler.step()
         model.eval()
-        vcorrect, vtotal = 0, 0
+        vt, vp = [], []
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                pred = model(x).argmax(1)
-                vcorrect += (pred == y).sum().item()
-                vtotal += x.size(0)
-        acc = vcorrect / max(vtotal, 1)
+                vp.append(model(x.to(device)).argmax(1).cpu())
+                vt.append(y)
+        vt, vp = torch.cat(vt).numpy(), torch.cat(vp).numpy()
+        plain_acc = float((vt == vp).mean()) if len(vt) else 0.0
+        recalls = [float((vp[vt == c] == c).mean()) for c in np.unique(vt)]
+        acc = float(np.mean(recalls)) if recalls else 0.0           # balanced accuracy
         log(f'[classifier] epoch {ep}/{epochs} loss={losses / max(total, 1):.4f} '
-            f'train_acc={correct / max(total, 1):.4f} val_acc={acc:.4f}')
+            f'train_acc={correct / max(total, 1):.4f} val_acc={plain_acc:.4f} val_bal_acc={acc:.4f}')
         if acc > best_acc:
             best_acc = acc
+            best_plain_acc = plain_acc
             bad_epochs = 0
             torch.save({'model': model.state_dict(), 'meta': {'arch': arch, 'nc': nc, 'crop_size': crop_size,
-                                                              'val_acc': acc}}, best_path)
-            log(f'  *** 新最优 val_acc={acc:.4f}, 保存 {best_path}')
+                                                              'val_acc': plain_acc, 'val_bal_acc': acc}}, best_path)
+            log(f'  *** 新最优 val_bal_acc={acc:.4f} (val_acc={plain_acc:.4f}), 保存 {best_path}')
         else:
             bad_epochs += 1
             if bad_epochs >= patience:
-                log(f'早停: {patience} 个 epoch val_acc 未提升')
+                log(f'早停: {patience} 个 epoch val_bal_acc 未提升')
                 break
 
     # 校准 temperature 和 unknown_thr
@@ -357,10 +375,11 @@ def train_classifier(train_images: str, train_labels: Optional[str], val_images:
         f'-> unknown_thr={unknown_thr:.4f} (未知类阈值)')
 
     meta = {'arch': arch, 'nc': nc, 'names': names or [], 'crop_size': crop_size, 'crop_pad': crop_pad,
-            'unknown_thr': unknown_thr, 'temperature': temperature, 'val_acc': best_acc,
+            'unknown_thr': unknown_thr, 'temperature': temperature, 'val_acc': best_plain_acc,
+            'val_bal_acc': best_acc, 'box_jitter': box_jitter, 'rot90': bool(rot90),
             'unknown_id': nc, 'unknown_name': '未知类型'}
     torch.save({'model': model.state_dict(), 'meta': meta}, best_path)
     with open(os.path.join(out_dir, 'classifier_meta.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    log(f'分类器训练完成: {best_path} (val_acc={best_acc:.4f}, unknown_thr={unknown_thr:.3f}, T={temperature:.3f})')
+    log(f'分类器训练完成: {best_path} (val_acc={best_plain_acc:.4f}, val_bal_acc={best_acc:.4f}, unknown_thr={unknown_thr:.3f}, T={temperature:.3f})')
     return best_path

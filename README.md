@@ -25,7 +25,8 @@
 7. [调参与排障](#调参与排障)
 8. [检测器优化清单（v2）](#检测器优化清单v2)
 9. [与官方 Dinomaly2 对照（v3）](#与官方-dinomaly2-对照v3)
-10. [测试与性能](#测试与性能)
+10. [分类器与训练采样改进（v4）](#分类器与训练采样改进v4)
+11. [测试与性能](#测试与性能)
 
 ---
 
@@ -134,6 +135,7 @@ python scripts/train_detector.py --data-yaml dataset/fabric19.yaml --out checkpo
 |---|---|---|
 | `--optimizer` | `stableadamw` | 官方优化器：更新量 RMS 超阈值时缩步长，坏梯度整步跳过；`adamw` 为旧行为 |
 | `--lr-final-ratio` | `0.0` | 余弦退火终点 = lr×该值；0 = 退火到 0，1 = warmup 后恒定（官方默认） |
+| `--defect-frac` | `-1`（自动） | 每个 batch 缺陷图期望占比；缺陷图太少时抬到 25%，保证 margin/box 损失每步都有正样本 |
 | `--no-rot90` / `--no-flip` | 关（即开增强） | 官方 2D 配方无任何增强，即两者都加；方向固定的布匹至少加 `--no-rot90` |
 
 ### 2) 校准阈值 `calibrate.py`
@@ -169,9 +171,9 @@ python scripts/evaluate.py --data-yaml dataset/fabric19.yaml --mode pipeline \
 
 ### 4) 训练分类器 `train_classifier.py`
 
-- 默认 `mobilenet_v3_small @224`，50 epochs 早停；letterbox 保宽高比 + 类别加权 + MixUp；
+- 默认 `mobilenet_v3_small @224`，50 epochs 早停（按 balanced accuracy 选 best）；letterbox 保宽高比 + 加权采样均衡类别 + MixUp + 框抖动；
 - 预训练权重自动下载，慢/损坏时用 `--pretrained-path` 指向本地 `.pth`；
-- 区域尺寸一致性：检测框按 `box_pad=0.3` 扩展（与训练裁剪 `crop_pad=0.3` 相同）再 letterbox，**训练与推理同一套裁剪**；
+- 区域尺寸一致性：检测框按 `box_pad=0.3` 扩展（与训练裁剪 `crop_pad=0.3` 相同）再 letterbox；训练时再对 GT 框做随机缩放/平移，模拟检测器框与人工框的差异；
 - 最大 softmax 低于自动校准的 `unknown_thr` → 判「未知类型」。
 
 验证分类器本身（GT 框直接喂分类器 → 准确率/混淆矩阵）：
@@ -292,11 +294,28 @@ LinearAttention2 / Block / DINOv2 位置编码插值、loose loss（`p` 在 1000
 
 ---
 
+## 分类器与训练采样改进（v4）
+
+| # | 问题 | 影响 | 处理 |
+|---|---|---|---|
+| 17 | **分类器训练框 ≠ 推理框**：训练用人工 GT 框，推理用检测器热力图连通域出的框（大小/位置都不同），README 里「训练与推理同一套裁剪」只对 pad 成立 | 端到端分类准确率低于 `--mode gt` 的准确率 | 训练裁剪对 GT 框随机缩放（×0.74~1.35）+ 平移，`--box-jitter 0.3`，评估不抖 |
+| 18 | **分类器的 90° 旋转增强会制造错标签**：19 类里有大量经线/纬线类（纬线杂质/断纬/纬斜 vs 经线毛球…），方向就是类别信息 | 纬向缺陷旋转后变成经向，标签噪声 | 默认关；需要时 `--rot90` 打开（翻转保留） |
+| 19 | **类别均衡补偿了两次**：既用逆频率加权采样，损失里又乘了逆频率权重 | 少数类有效权重 ∝ 1/n_c²，过度补偿，多数类被压、概率校准变差 | 只保留加权采样，损失不加权；`--balance-power`（默认 1=完全均衡，0.5 折中，0=自然分布） |
+| 20 | **按总体准确率选 best**：类别不均衡时多数类掩盖少数类 | 选出的 checkpoint 对稀有缺陷召回差 | 按 balanced accuracy（各类召回均值）选 best，日志同时打印 `val_acc` 和 `val_bal_acc` |
+| 21 | **检测器训练 batch 里可能没有缺陷图**：均匀打乱时缺陷图占比低（如 5%，bs=16）约 44% 的 batch 一张缺陷图都没有 | 那一步 margin / box 损失等于没开 | `--defect-frac`：默认 -1=自动（自然占比 <20% 时抬到 25%，否则自然）；日志会打印自然占比和「batch 无缺陷图概率」 |
+
+**没做（需要真实数据 / 更大改动）**：
+- **难负样本挖掘**：分类器只见过真缺陷裁剪，检测器的误报区域（正常图上的热点）会被分到某一类或「未知类型」。
+  更稳的做法是用训练好的检测器在 normaltrain 上跑一遍，把误报区域裁剪当作「未知类型」负样本加入分类器训练。
+- 检测器 encoder 的 fp16（`autocast`）训练加速：1660 没有 Tensor Core，收益不确定，需要实测。
+
+---
+
 ## 测试与性能
 
 ```bash
 python tests/smoke_test.py            # CPU 可跑, tiny_test_14 随机初始化: 训练/校准/推理/分类/可视化全链路
-python tests/test_detector_fixes.py   # 检测器关键修复回归测试 (秒级): 增强同步 / 平滑核 / 校准 / StableAdamW / 调度器 / score_ratio / autocast / 扫参
+python tests/test_detector_fixes.py   # 回归测试 (秒级): 增强同步 / 平滑核 / 校准 / StableAdamW / 调度器 / score_ratio / autocast / 扫参 / 分类器增强 / 缺陷占比采样
 python scripts/benchmark.py --data-yaml dataset/fabric19.yaml --device cuda:0   # 速度
 ```
 

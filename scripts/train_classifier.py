@@ -33,6 +33,12 @@ def main():
     p.add_argument('--unknown-quantile', type=float, default=0.05, help='unknown_thr 取 val 最大概率的该分位数')
     p.add_argument('--unknown-min', type=float, default=0.5)
     p.add_argument('--unknown-max', type=float, default=0.8)
+    p.add_argument('--box-jitter', type=float, default=0.3,
+                   help='训练裁剪时对 GT 框随机缩放/平移的幅度 (0=关), 模拟推理时检测器给出的框 (默认 0.3)')
+    p.add_argument('--rot90', action='store_true',
+                   help='加随机 90° 旋转增强. 默认关: 经线/纬线类别靠方向区分, 旋转会让纬向缺陷变成经向 (标签噪声)')
+    p.add_argument('--balance-power', type=float, default=1.0,
+                   help='类别均衡强度 (仅加权采样, 权重∝n_c^-power): 1=完全均衡, 0.5=折中, 0=自然分布')
     p.add_argument('--out', default='checkpoints/classifier')
     p.add_argument('--no-pretrained', action='store_true')
     p.add_argument('--pretrained-path', default=None,
@@ -58,7 +64,8 @@ def main():
                      unknown_quantile=args.unknown_quantile, unknown_min=args.unknown_min,
                      unknown_max=args.unknown_max, pretrained=not args.no_pretrained,
                      pretrained_path=args.pretrained_path, device=args.device,
-                     num_workers=args.num_workers, seed=args.seed, logger=log)
+                     num_workers=args.num_workers, seed=args.seed, logger=log,
+                     box_jitter=args.box_jitter, rot90=args.rot90, balance_power=args.balance_power)
 
 
 if __name__ == '__main__':

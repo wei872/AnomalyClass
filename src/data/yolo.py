@@ -177,10 +177,12 @@ def _letterbox_pil(img_rgb: np.ndarray, size: int):
     return canvas
 
 
-def pil_to_tensor_batch(crops: List[np.ndarray], crop_size: int = 224, augment: bool = False):
+def pil_to_tensor_batch(crops: List[np.ndarray], crop_size: int = 224, augment: bool = False, rot90: bool = False):
     """把一批 RGB 裁剪转成 (N,3,crop_size,crop_size) tensor (letterbox 保宽高比 + ImageNet 归一化).
 
-    训练(augment=True)额外: 翻转/旋转90/颜色抖动/RandomErasing; 推理保持确定性.
+    训练(augment=True)额外: 翻转/颜色抖动/RandomErasing; 推理保持确定性.
+    rot90=True 才加随机 90° 旋转: 类别名里有经线/纬线之分 (方向就是类别信息), 旋转会把纬向缺陷变成经向,
+    等于给分类器喂错标签, 所以默认关.
     """
     from torchvision import transforms as T
     norm = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -189,7 +191,8 @@ def pil_to_tensor_batch(crops: List[np.ndarray], crop_size: int = 224, augment: 
             im = _letterbox_pil(c, crop_size)
             im = T.RandomHorizontalFlip()(im)
             im = T.RandomVerticalFlip()(im)
-            im = T.functional.rotate(im, int(np.random.choice([0, 90, 180, 270])))
+            if rot90:
+                im = T.functional.rotate(im, int(np.random.choice([0, 90, 180, 270])))
             if np.random.rand() < 0.6:
                 im = T.ColorJitter(0.3, 0.3, 0.3, 0.1)(im)
             x = T.ToTensor()(im)

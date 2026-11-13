@@ -17,6 +17,7 @@ detector:                      # 正异常检测器 (Dinomaly2): 正常图 + 带
   margin: 0.05                 # margin 目标间隙 (cos距离量级)
   box_margin_w: 1.0            # 缺陷监督-框级hinge: 框内token平均距离 >= margin, 抬高 min_defect
   hard_normal_w: 0.0           # 困难正常重加权 (如 0.5): 压 max_normal
+  defect_frac: -1              # 每batch缺陷图期望占比: -1=自动(自然占比<20%时抬到25%) / 0=自然 / 0.25=指定
   optimizer: stableadamw      # 官方配方 (RMS限幅+NaN跳步); adamw=旧行为
   lr_final_ratio: 0.0          # 余弦退火终点=lr*该值: 0=退火到0(默认) / 1=恒定(官方默认)
   flip: true                   # 随机翻转增强 (--no-flip 关); 官方2D配方=无增强 (rot90/flip 都关)
@@ -48,4 +49,7 @@ classifier:                    # 缺陷分类器 (在 YOLO 疵点框裁剪上训
   crop_pad: 0.3                # 训练裁剪四周扩展比例 (与检测区域 box_pad 一致)
   epochs: 50                   # 配合早停 patience=15
   batch_size: 32
+  box_jitter: 0.3              # 训练裁剪对GT框随机缩放/平移, 模拟检测器给出的框 (0=关)
+  rot90: false                 # 90°旋转增强默认关: 经线/纬线类别靠方向区分 (--rot90 打开)
+  balance_power: 1.0           # 类别均衡仅用加权采样(权重∝n_c^-power), 损失不再加权; 1=完全均衡 0=自然分布
   unknown_thr: auto            # 按 val 最大概率分位数自动校准 (clamp 0.5~0.8), 低于此判 "未知类型"
