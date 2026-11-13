@@ -49,6 +49,7 @@ class ImageResult:
     img_thr: float
     regions: List[RegionResult] = field(default_factory=list)
     latency_ms: float = 0.0
+    heat: Optional[np.ndarray] = field(default=None, repr=False)   # 异常图 (仅供可视化复用, 不进 json)
 
     def to_dict(self):
         return {
@@ -71,7 +72,8 @@ class FabricAnomalyPipeline:
                  class_names: List[str], img_thr: float, pix_thr: Optional[float] = None,
                  mask_ratio: float = 0.5, min_area_ratio: float = 2e-4, dilate: int = 7, box_pad: float = 0.3,
                  device: str = 'cuda', logger=None, max_map_side: int = 1024, max_vis_side: int = 1600,
-                 top_k: int = 1, region_score_ratio: float = 0.5):
+                 top_k: int = 1, region_score_ratio: float = 0.5,
+                 heat_floor_ratio: float = 1.0, heat_region_only: bool = False):
         self.det = detector
         self.cls = classifier
         self.class_names = class_names          # 长度 nc+1, 末尾为 '未知类型'
@@ -90,6 +92,10 @@ class FabricAnomalyPipeline:
         # 掩码阈值同时跟随图内最高分, 只圈最热的区域
         self.top_k = int(top_k)
         self.region_score_ratio = float(region_score_ratio)
+        # 热力图显示: 低于 heat_floor = pix_thr*heat_floor_ratio 的像素完全透明 (正常图噪声上限就是 pix_thr);
+        # heat_region_only=True 时只在检出的区域框内显示热力
+        self.heat_floor_ratio = float(heat_floor_ratio)
+        self.heat_region_only = bool(heat_region_only)
         self.log = logger or get_logger('pipeline')
 
     # ---------------- 核心推理 ----------------
@@ -104,7 +110,8 @@ class FabricAnomalyPipeline:
         is_anom = score > self.img_thr
         conf = deviation_confidence(score, self.img_thr)
         result = ImageResult(image=image_name, width=w0, height=h0, is_anomaly=bool(is_anom),
-                             anomaly_score=score, anomaly_conf=conf, img_thr=self.img_thr)
+                             anomaly_score=score, anomaly_conf=conf, img_thr=self.img_thr,
+                             heat=full_map if is_anom else None)
         if is_anom:
             # 掩码阈值 = max(全局阈值, 图内最高分 * region_score_ratio): 只圈最热的异常区域
             mask_thr_eff = max(self.mask_thr, score * self.region_score_ratio)
@@ -169,13 +176,16 @@ class FabricAnomalyPipeline:
         else:
             vis = img_bgr.copy()
         if show_heatmap and result.is_anomaly:
-            full_map, _, (sx, sy) = self.det.predict(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
-                                                     max_map_side=self.max_map_side)
+            full_map = result.heat
+            if full_map is None:                       # 兼容: result 不带异常图时才重算
+                full_map, _, _ = self.det.predict(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+                                                  max_map_side=self.max_map_side)
             m = cv2.resize(full_map, (vis.shape[1], vis.shape[0]), interpolation=cv2.INTER_LINEAR)
-            lo, hi = np.percentile(m, 50), max(np.percentile(m, 99), 1e-6)
-            mn = np.clip((m - lo) / (hi - lo), 0, 1)
-            heat = cv2.applyColorMap((mn * 255).astype(np.uint8), cv2.COLORMAP_JET)
-            vis = cv2.addWeighted(vis, 0.65, heat, 0.35, 0)
+            region_boxes = None
+            if self.heat_region_only:
+                region_boxes = [tuple(int(round(v * vscale)) for v in r.box) for r in result.regions]
+            vis = render_heatmap(vis, m, floor=self.pix_thr * self.heat_floor_ratio,
+                                 peak=result.anomaly_score, region_boxes=region_boxes)
         for r in result.regions:
             x1, y1, x2, y2 = [int(round(v * vscale)) for v in r.box]
             color = UNKNOWN_COLOR if r.class_id == self.nc else class_color(r.class_id)
@@ -201,6 +211,28 @@ class FabricAnomalyPipeline:
         return vis
 
 
+def render_heatmap(vis_bgr: np.ndarray, amap: np.ndarray, floor: float, peak: float, max_alpha: float = 0.6,
+                   region_boxes: Optional[List[Tuple[int, int, int, int]]] = None) -> np.ndarray:
+    """把异常图以 **绝对阈值** 叠到图上.
+
+    旧做法按每张图自己的 50%~99% 分位数拉伸, 会把正常背景里本来就很低的起伏放大成满屏红蓝噪声.
+    现在: 分数 <= floor (正常图噪声上限) 的像素 alpha=0, 完全不上色; floor~peak 线性映射到 JET 颜色,
+    alpha 也随强度增大 -> 只有真正偏离正常的地方才亮起来.
+    region_boxes 非 None 时, 框外的热力一律清零 (框坐标与 vis_bgr 同尺度).
+    """
+    peak = max(float(peak), floor + 1e-6)
+    t = np.clip((amap - floor) / (peak - floor), 0.0, 1.0)
+    if region_boxes is not None:
+        keep = np.zeros(t.shape, dtype=bool)
+        for x1, y1, x2, y2 in region_boxes:
+            keep[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = True
+        t = np.where(keep, t, 0.0)
+    heat = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    alpha = (t * max_alpha)[..., None].astype(np.float32)
+    out = vis_bgr.astype(np.float32) * (1 - alpha) + heat.astype(np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def warn_threshold_mismatch(thr: dict, det, log) -> None:
     """核对 thresholds.json 记录的训练分辨率 vs 当前推理分辨率, 不一致则告警 (分数尺度不同会全漏/全报)."""
     if 'image_size' in thr and int(thr['image_size']) != int(det.image_size):
@@ -211,7 +243,8 @@ def warn_threshold_mismatch(thr: dict, det, log) -> None:
 def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
                    class_names: List[str], device: str = 'cuda', half: bool = False,
                    image_size: Optional[int] = None, logger=None, top_k: int = 1,
-                   region_score_ratio: float = 0.5) -> FabricAnomalyPipeline:
+                   region_score_ratio: float = 0.5, heat_floor_ratio: float = 1.0,
+                   heat_region_only: bool = False) -> FabricAnomalyPipeline:
     """从 checkpoint 路径构建完整流水线 (cls_ckpt=None 时为纯正异常检测, 不加载分类器)."""
     from .detect import load_json
     log = logger or get_logger('pipeline')
@@ -232,4 +265,5 @@ def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
         log('[pipeline] 未提供分类器权重, 只做异常检测 (区域标为未知类型)')
     return FabricAnomalyPipeline(det, cls, class_names, img_thr=thr['img_thr'], pix_thr=thr.get('pix_thr'),
                                   device=device, logger=log, top_k=top_k,
-                                  region_score_ratio=region_score_ratio)
+                                  region_score_ratio=region_score_ratio, heat_floor_ratio=heat_floor_ratio,
+                                  heat_region_only=heat_region_only)

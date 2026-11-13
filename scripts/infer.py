@@ -53,6 +53,9 @@ def main():
     p.add_argument('--show', action='store_true', help='弹出窗口显示 (视频/摄像头)')
     p.add_argument('--font', default=None, help='中文字体文件路径 (可选)')
     p.add_argument('--no-heatmap', action='store_true')
+    p.add_argument('--heat-floor-ratio', type=float, default=1.0,
+                   help='热力图显示下限 = pix_thr * 该值, 低于它的像素不上色; 噪声还多就调大 (如 1.3~1.6), 淡了就调小')
+    p.add_argument('--heat-region-only', action='store_true', help='热力图只显示在检出的区域框内')
     p.add_argument('--device', default='cuda' if __import__('torch').cuda.is_available() else 'cpu')
     p.add_argument('--allow-random-init', action='store_true')
     args = p.parse_args()
@@ -64,7 +67,8 @@ def main():
     cls_ckpt = None if args.no_classify else args.cls_ckpt
     pipe = build_pipeline(args.det_ckpt, cls_ckpt, args.thresholds, class_names,
                           device=args.device, half=args.half, image_size=args.image_size, logger=log,
-                          top_k=args.top_k, region_score_ratio=args.region_score_ratio)
+                          top_k=args.top_k, region_score_ratio=args.region_score_ratio,
+                          heat_floor_ratio=args.heat_floor_ratio, heat_region_only=args.heat_region_only)
     if args.smooth_sigma:
         pipe.det.set_smooth_sigma(args.smooth_sigma)
         log(f'[infer] 平滑核 sigma={args.smooth_sigma} (须与 calibrate 一致)')

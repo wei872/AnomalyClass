@@ -66,7 +66,7 @@ class AnomalyDetector:
     """封装 Dinomaly 模型的推理接口."""
 
     def __init__(self, model: nn.Module, device: str = 'cuda', image_size: int = 448, crop_size: int = 448,
-                 smooth_kernel: int = 5, smooth_sigma: float = 4.0, half: bool = False):
+                 smooth_kernel: int = 0, smooth_sigma: float = 4.0, half: bool = False):
         self.model = model.to(device).eval()
         self.device = device
         self.image_size = int(image_size)
@@ -74,11 +74,23 @@ class AnomalyDetector:
         self.offset = (self.image_size - self.crop_size) // 2
         self.tf = get_eval_transform(self.image_size, self.crop_size)
         self.half = half and device.startswith('cuda')
-        self.gaussian = get_gaussian_kernel(smooth_kernel, smooth_sigma, device=device)
+        self.smooth_kernel = int(smooth_kernel)
+        self.gaussian = self._make_gaussian(smooth_sigma)
+
+    def _make_gaussian(self, sigma: float):
+        """sigma<=4 保持 Dinomaly2 原版 5×5 核 (与已有 checkpoint/阈值兼容);
+        sigma>4 时核宽随 sigma 增长 (2*ceil(3σ)+1), 否则 5×5 核里 sigma=8 与 sigma=4 几乎一样 (都≈均值滤波),
+        调大 sigma 起不到平滑作用. 大核用 replicate 填充, 避免四周边缘被零填充压暗而漏掉边缘疵点."""
+        sigma = float(sigma)
+        k = self.smooth_kernel
+        if k <= 0:
+            k = 5 if sigma <= 4.0 else 2 * math.ceil(3 * sigma) + 1
+        return get_gaussian_kernel(k, sigma, device=self.device,
+                                   padding_mode='zeros' if k <= 5 else 'replicate')
 
     def set_smooth_sigma(self, sigma: float):
         """调整异常图高斯平滑核: 越大越抑制正常图的单点噪声(其max分数下降), 成片/成线的缺陷响应保留."""
-        self.gaussian = get_gaussian_kernel(5, float(sigma), device=self.device)
+        self.gaussian = self._make_gaussian(sigma)
 
     @torch.no_grad()
     def anomaly_map_crop(self, img_rgb: np.ndarray) -> np.ndarray:

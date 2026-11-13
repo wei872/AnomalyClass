@@ -73,6 +73,7 @@ python scripts/infer.py --data-yaml dataset/fabric19.yaml --no-classify \
     --det-ckpt checkpoints/detector/model_best.pth --thresholds checkpoints/detector/thresholds.json \
     --dir D:/.../normal/images/val --out runs/det_normal
 # 每图输出 <名>_vis.png (热力图+框), results.json 含 is_anomaly/anomaly_score/img_thr/regions
+# 热力图只显示 > pix_thr*heat-floor-ratio 的像素 (绝对阈值, 不再按每图分位数拉伸); 噪声还多: --heat-floor-ratio 1.5, 或 --heat-region-only 只在框内显示
 ```
 
 验证正异常二分类（图级准确率 + 漏检/误报逐张列表）:
@@ -134,6 +135,8 @@ python scripts/benchmark.py --data-yaml dataset/fabric19.yaml --device cuda:0
 
 ## 常见问题
 
+- **热力图满屏噪点**: ① 显示层已改为绝对阈值 (低于正常图噪声上限 `pix_thr` 的像素不上色), 调 `--heat-floor-ratio` / `--heat-region-only`; ② 想从分数本身压噪点, 用 `--smooth-sigma 8~12` 重训/重校准 (旧版 5×5 核下 sigma 4 和 8 几乎无差别, 已修复).
+
 - **Windows 训练卡住**: 已默认 `--num-workers 0`（主进程加载，无 spawn 子进程重 import 问题），可手动调大。
 - **中文路径/中文文件名**: 全部走 Unicode 安全读写（imread_unicode/imwrite_unicode），无碍。
 - **坏图/截断图**: 数据集构建时 PIL 头校验自动跳过，日志有计数。
@@ -144,7 +147,7 @@ python scripts/benchmark.py --data-yaml dataset/fabric19.yaml --device cuda:0
   - 局部损失可预热 (`--local-loss-warmup 2000`) 避免初期不稳; `--no-defect-sup` 仅消融对照用。
 - **calibrate 告警「正常/缺陷分数重叠」(无法同时 100%)**: 先看日志里「各缺陷类最低图分数」定位是哪些类重叠（常见是细长经线类），然后：
   1. 重训检测器更多 iters，细线缺陷加 `--local-loss-w 1.0 --hard-pos-ratio 0.2`（margin/box 默认已开）;
-  2. 试 `--smooth-sigma 8`（训练/校准/推理三处一致）：加大异常图平滑核，压掉正常图的单点噪声峰值，成片/成线的缺陷响应保留，可把两类分数分布拉开；
+  2. 试 `--smooth-sigma 8`（训练/校准/推理三处一致；sigma>4 时平滑核宽随 sigma 增长，sigma≤4 仍是原版 5×5 以兼容旧阈值，改 sigma 后须重新 calibrate）：加大异常图平滑核，压掉正常图的单点噪声峰值，成片/成线的缺陷响应保留，可把两类分数分布拉开；
   3. 确认 normaltrain 覆盖了全部正常变化（暗角/光照/品种），整图 448 进网络不裁边缘；
   4. 若仍只差一点，可把 image_size 提到 560（14×40，仍是合法尺寸）。
 - **校准太慢**: 加 `--max-images 200` 先抽样校准。

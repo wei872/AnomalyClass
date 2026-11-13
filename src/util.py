@@ -127,7 +127,8 @@ def imwrite_unicode(path: str, img: np.ndarray) -> bool:
     return cv2.imwrite(path, img)
 
 
-def get_gaussian_kernel(kernel_size: int = 5, sigma: float = 4, channels: int = 1, device='cpu'):
+def get_gaussian_kernel(kernel_size: int = 5, sigma: float = 4, channels: int = 1, device='cpu',
+                        padding_mode: str = 'zeros'):
     """与 Dinomaly2 utils.get_gaussian_kernel 相同: depthwise 高斯卷积 (nn.Conv2d, 可直接调用)."""
     import torch.nn as nn
     x_coord = torch.arange(kernel_size, dtype=torch.float32, device=device)
@@ -141,7 +142,7 @@ def get_gaussian_kernel(kernel_size: int = 5, sigma: float = 4, channels: int = 
     gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
     gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size).repeat(channels, 1, 1, 1)
     gaussian_filter = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=kernel_size,
-                                groups=channels, bias=False, padding=kernel_size // 2, device=device)
+                                groups=channels, bias=False, padding=kernel_size // 2, padding_mode=padding_mode, device=device)
     gaussian_filter.weight.data = gaussian_kernel
     gaussian_filter.weight.requires_grad = False
     return gaussian_filter
