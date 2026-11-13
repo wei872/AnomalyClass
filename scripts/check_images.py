@@ -10,6 +10,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import cv2
+
+from src.util import get_logger, list_images, imread_unicode, image_diag
 
 
 def scan(dir_path, log):
@@ -27,8 +30,6 @@ def scan(dir_path, log):
 
 
 def main():
-    import cv2
-    from src.util import get_logger, list_images, imread_unicode, image_diag
     p = argparse.ArgumentParser(description='扫描图片目录, 找出无法解码的文件')
     p.add_argument('--dir', default=None)
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(

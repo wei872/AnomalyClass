@@ -68,6 +68,11 @@ def main():
     p.add_argument('--defect-frac', type=float, default=-1,
                    help='每个 batch 的缺陷图期望占比: -1=自动(自然占比<20%%时抬到25%%, 否则自然) / 0=自然 / 0.25=指定. '
                         '缺陷图太少时 margin/box 损失经常整步没有正样本')
+    p.add_argument('--enc-fp16', action='store_true',
+                   help='冻结的 encoder 用 fp16 autocast 前向 (CUDA; encoder 约占训练耗时一半, 且省显存). '
+                        'decoder 仍 fp32. 建议先跑几百 iter 对比 loss 与不加此项是否一致')
+    p.add_argument('--early-stop', type=int, default=0,
+                   help='连续 N 次评估 model_best 都没提升就提前结束 (0=关). 配合 --eval-interval 使用')
     p.add_argument('--margin-score', choices=['smooth', 'token'], default='smooth',
                    help="图级 hinge 用的分数: smooth=与推理/校准同款 (上采样+高斯平滑后取最大, 默认); token=旧做法(token网格未平滑)")
     p.add_argument('--defect-bg-w', type=float, default=0.0,
@@ -105,7 +110,7 @@ def main():
                    margin_w=args.margin_w, margin=args.margin, box_margin_w=args.box_margin_w,
                    hard_normal_w=args.hard_normal_w, local_loss_warmup=args.local_loss_warmup,
                    rot90=not args.no_rot90, flip=not args.no_flip, optimizer=args.optimizer,
-                   lr_final_ratio=args.lr_final_ratio, defect_frac=args.defect_frac, margin_score=args.margin_score, defect_bg_w=args.defect_bg_w,
+                   lr_final_ratio=args.lr_final_ratio, defect_frac=args.defect_frac, enc_fp16=args.enc_fp16, early_stop=args.early_stop, margin_score=args.margin_score, defect_bg_w=args.defect_bg_w,
                    eval_normal_dir=cfg.normalval_images, eval_max_images=args.eval_max_images,
                    weights_dir=args.weights_dir, allow_random_init=args.allow_random_init,
                    resume=args.resume, logger=log, save_interval=args.save_interval, no_eval=args.no_eval)

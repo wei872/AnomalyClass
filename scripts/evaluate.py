@@ -13,6 +13,8 @@ import argparse
 import os
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -45,6 +47,14 @@ def confusion_report(names, y_true, y_pred):
     print('每类准确率:')
     for name, acc, tot in per_cls:
         print(f'  {name}: {acc:.3f} (n={tot})' if tot else f'  {name}: n=0')
+    accs = [a for _, a, t in per_cls if t]
+    if accs:
+        print(f'macro 平均(各类召回均值, 不被多数类掩盖)={np.mean(accs):.4f}')
+    pairs = sorted(((int(cm[i, j]), i, j) for i in range(n) for j in range(n) if i != j and cm[i, j] > 0), reverse=True)
+    if pairs:
+        print('最常见的混淆 (真实 -> 预测, 次数, 占该真实类比例) — 先看这里决定是合并近义类、补数据还是改标注:')
+        for c, i, j in pairs[:8]:
+            print(f'  {names[i]} -> {names[j]}: {c} ({c / max(cm[i].sum(), 1):.0%})')
 
 
 def main():
@@ -82,9 +92,9 @@ def main():
     log(f'评估集: {images_dir}  标签: {labels_dir}  类别数(含未知): {len(class_names)}')
 
     if args.mode == 'gt':
-        from src.classify import RegionClassifier
+        from src.classify import load_classifier
         from src.data.yolo import build_crop_index
-        cls = RegionClassifier.load(args.cls_ckpt, nc=nc, names=class_names, device=args.device, logger=log)
+        cls = load_classifier(args.cls_ckpt, nc=nc, names=class_names, device=args.device, logger=log)
         index, bad = build_crop_index(images_dir, labels_dir, pad=args.crop_pad)
         if bad:
             log(f'跳过 {len(bad)} 个坏图')

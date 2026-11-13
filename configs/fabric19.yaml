@@ -17,6 +17,8 @@ detector:                      # 正异常检测器 (Dinomaly2): 正常图 + 带
   margin: 0.05                 # margin 目标间隙 (cos距离量级)
   box_margin_w: 1.0            # 缺陷监督-框级hinge: 框内token平均距离 >= margin, 抬高 min_defect
   hard_normal_w: 0.0           # 困难正常重加权 (如 0.5): 压 max_normal
+  enc_fp16: false              # 冻结 encoder 用 fp16 autocast (CUDA), 省约一半 encoder 耗时, 需在1660上实测
+  early_stop: 0                # 连续N次评估 model_best 未提升就提前结束 (0=关)
   defect_frac: -1              # 每batch缺陷图期望占比: -1=自动(自然占比<20%时抬到25%) / 0=自然 / 0.25=指定
   optimizer: stableadamw      # 官方配方 (RMS限幅+NaN跳步); adamw=旧行为
   lr_final_ratio: 0.0          # 余弦退火终点=lr*该值: 0=退火到0(默认) / 1=恒定(官方默认)
@@ -43,8 +45,22 @@ segmentation:                  # 异常图 -> 区域框 -> 只对最异常的 to
   dilate: 7                    # 连通域前膨胀核大小
   box_pad: 0.3                 # 检测框向外扩展比例 = 分类器训练裁剪 crop_pad, 两者一致
 
+knn_detector:                  # 免训练检测器 (scripts/fit_knn.py): DINOv2 中层 patch 记忆库, 几分钟建好, 当快速基线/实时方案
+  layer_sets: "5,7,9"          # encoder 的 0-based 层 (逗号=多层平均, 分号=多组候选, 按 val 间隙择优)
+  bank_size: 20000             # coreset 大小; 推理最近邻搜索耗时 ∝ bank_size
+  max_images: 300              # 最多用多少张正常图建库
+
+fusion:                        # Dinomaly + kNN 融合 (scripts/fuse_detectors.py): 共用 encoder, w 在 val 上自动选, 融合后必须重新 calibrate
+  weights: "0,0.25,0.5,0.75,1"  # 候选的 Dinomaly 权重; 1=纯Dinomaly 0=纯kNN 都是候选, 不会比单个差
+
 classifier:                    # 缺陷分类器 (在 YOLO 疵点框裁剪上训练, letterbox 保宽高比)
-  arch: mobilenet_v3_small     # 最轻量
+  kind: embed                  # embed=冻结DINOv2嵌入+余弦头+Balanced Softmax (默认, 小样本/不均衡友好, 几分钟) / cnn=旧方案端到端微调
+  backbone: dinov2reg_vit_small_14   # [embed] 与检测器共用权重文件
+  views: 4                     # [embed] 每个裁剪至少抽几个视角 (1干净+其余增强)
+  min_per_class: 200           # [embed] 稀有类按此目标多抽增强视角 (特征级过采样, 最多16个)
+  tau: 1.0                     # [embed] logit adjustment 强度: 1=Balanced Softmax, 0=普通CE
+  head_epochs: 200             # [embed] 分类头轮数 (特征已缓存, 秒级)
+  arch: mobilenet_v3_small     # [cnn] 最轻量
   crop_size: 224               # letterbox 目标尺寸, 训练与推理一致 (不用调)
   crop_pad: 0.3                # 训练裁剪四周扩展比例 (与检测区域 box_pad 一致)
   epochs: 50                   # 配合早停 patience=15

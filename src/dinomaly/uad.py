@@ -37,6 +37,9 @@ class Dinomaly(nn.Module):
         self.remove_class_token = remove_class_token
         self.context_aware_recenter = context_aware_recenter
         self.mask_neighbor_size = mask_neighbor_size
+        self.keep_raw = False       # True: forward 后把 encoder 各目标层的原始 token 留在 self._raw_en (融合检测器复用, 不重复跑 encoder)
+        self._raw_en = None
+        self.enc_amp = False        # True: 冻结的 encoder 用 fp16 autocast 前向 (无梯度, 不需要 GradScaler); 特征转回 fp32 后再进 decoder/损失
         if not hasattr(self.encoder, 'num_register_tokens'):
             self.encoder.num_register_tokens = getattr(self.encoder, 'n_storage_tokens', 0)
 
@@ -59,18 +62,21 @@ class Dinomaly(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        with torch.no_grad():
-            x = self.encoder.prepare_tokens(x)
         en_list = []
-        for i, blk in enumerate(self.encoder.blocks):
-            if i <= self.target_layers[-1]:
-                with torch.no_grad():
-                    x = blk(x)
-            else:
-                continue
-            if i in self.target_layers:
-                en_list.append(x)
+        amp = bool(self.enc_amp) and x.is_cuda
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=amp):
+            x = self.encoder.prepare_tokens(x)
+            for i, blk in enumerate(self.encoder.blocks):
+                if i > self.target_layers[-1]:
+                    break
+                x = blk(x)
+                if i in self.target_layers:
+                    en_list.append(x)
+        if amp:
+            en_list = [e.float() for e in en_list]
 
+        if self.keep_raw:
+            self._raw_en = en_list
         side = int(math.sqrt(en_list[0].shape[1] - 1 - self.encoder.num_register_tokens))
 
         if self.remove_class_token:

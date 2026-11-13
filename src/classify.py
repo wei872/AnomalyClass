@@ -196,6 +196,17 @@ class RegionClassifier:
                    temperature=meta.get('temperature', 1.0), device=device, crop_size=meta.get('crop_size', 224))
 
 
+def load_classifier(path: str, nc: int, names: List[str], device: str = 'cuda', logger=None,
+                    allow_random_init: bool = False) -> 'RegionClassifier':
+    """按 checkpoint 里的 meta['kind'] 选择加载 CNN 分类器 (默认) 或 DINOv2 嵌入分类器 ('embed')."""
+    ckpt = torch_load(path, map_location='cpu')
+    if ckpt.get('meta', {}).get('kind') == 'embed':
+        from .embed_classify import EmbedRegionClassifier
+        return EmbedRegionClassifier.load(path, nc=nc, names=names, device=device, logger=logger,
+                                          allow_random_init=allow_random_init)
+    return RegionClassifier.load(path, nc=nc, names=names, device=device, logger=logger)
+
+
 # ------------------------- 训练 -------------------------
 def _split_samples(samples, val_ratio: float, seed: int = 1):
     import random
@@ -211,15 +222,18 @@ def _split_samples(samples, val_ratio: float, seed: int = 1):
 
 def calibrate_temperature(model: nn.Module, val_loader: DataLoader, device: str, logger=None) -> float:
     """在 val 上用 1D 温度缩放校准 softmax 温度 (降低 NLL)."""
-    log = logger or (lambda *a, **k: print(*a))
     model.eval()
     logits, labels = [], []
     with torch.no_grad():
         for x, y in val_loader:
             logits.append(model(x.to(device)).cpu())
             labels.append(y)
-    logits = torch.cat(logits)
-    labels = torch.cat(labels)
+    return fit_temperature(torch.cat(logits), torch.cat(labels), logger)
+
+
+def fit_temperature(logits: torch.Tensor, labels: torch.Tensor, logger=None) -> float:
+    """已有 val logits / 标签时直接拟合温度 (LBFGS, 降低 NLL), 范围夹到 [0.05, 10]."""
+    log = logger or (lambda *a, **k: print(*a))
     T_param = torch.tensor([1.0], requires_grad=True)
     opt = torch.optim.LBFGS([T_param], lr=0.5, max_iter=50)
 

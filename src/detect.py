@@ -104,6 +104,15 @@ class TrainAug:
 
 
 # ------------------------- 检测器 -------------------------
+def model_anomaly_map(model: nn.Module, x: torch.Tensor, out_size: int) -> torch.Tensor:
+    """模型 -> (B,1,S,S) 未平滑异常图. 模型自带 anomaly_map (融合检测器) 就用它, 否则 = 1-cos(en,de) 上采样."""
+    if hasattr(model, 'anomaly_map'):
+        return model.anomaly_map(x, out_size)
+    en, de = model(x)
+    amap, _ = cal_anomaly_maps(en, de, out_size=out_size)
+    return amap
+
+
 class AnomalyDetector:
     """封装 Dinomaly 模型的推理接口."""
 
@@ -142,12 +151,9 @@ class AnomalyDetector:
         x = self.tf(img_rgb).unsqueeze(0).to(self.device)
         if self.half:
             with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype):
-                en, de = self.model(x)
-            en = [e.float() for e in en]
-            de = [d.float() for d in de]
+                amap = model_anomaly_map(self.model, x, x.shape[-1])
         else:
-            en, de = self.model(x)
-        amap, _ = cal_anomaly_maps(en, de, out_size=x.shape[-1])
+            amap = model_anomaly_map(self.model, x, x.shape[-1])
         return amap.float()
 
     @torch.no_grad()
@@ -207,6 +213,29 @@ class AnomalyDetector:
         log = logger or (lambda *a, **k: print(*a))
         ckpt = torch_load(path, map_location='cpu')
         hp = ckpt['hparams']
+        if hp.get('arch') == 'fusion':
+            # Dinomaly + kNN 记忆库融合 (src/fusion.py, scripts/fuse_detectors.py)
+            from .fusion import FusionModel
+            dino = build_dinomaly(hp['backbone'], dropout=hp.get('dropout', 0.4), la=bool(hp.get('la', 1)),
+                                  lc=hp.get('lc', 2), cr=bool(hp.get('cr', 1)), allow_random_init=allow_random_init,
+                                  logger=log)
+            model = FusionModel(dino, torch.zeros_like(ckpt['model']['bank']), hp['knn_layers'],
+                                w=hp['fusion_w'], ref_d=hp['ref_d'], ref_k=hp['ref_k'])
+            model.load_state_dict(ckpt['model'])
+            log(f'[detector] 加载融合检测器: {path} (w_dinomaly={hp["fusion_w"]:.2f}, knn_layers={hp["knn_layers"]}, '
+                f'bank={tuple(ckpt["model"]["bank"].shape)})')
+            return cls(model, device=device, image_size=hp['image_size'], crop_size=hp['crop_size'], half=half,
+                       smooth_sigma=float(hp.get('smooth_sigma', 4.0)))
+        if hp.get('arch') == 'knn':
+            # 免训练 kNN 检测器 (src/knn_detect.py): 记忆库大小要先对上才能 load_state_dict
+            from .knn_detect import build_knn
+            bank = ckpt['model']['bank']
+            model = build_knn(hp['backbone'], layers=hp['layers'], allow_random_init=allow_random_init,
+                              logger=log, bank=torch.zeros_like(bank))
+            model.load_state_dict(ckpt['model'])
+            log(f'[detector] 加载 kNN 记忆库检测器: {path}  (bank={tuple(bank.shape)}, layers={hp["layers"]})')
+            return cls(model, device=device, image_size=hp['image_size'], crop_size=hp['crop_size'], half=half,
+                       smooth_sigma=float(hp.get('smooth_sigma', 4.0)))
         model = build_dinomaly(hp['backbone'], dropout=hp.get('dropout', 0.4), la=bool(hp.get('la', 1)),
                                lc=hp.get('lc', 2), cr=bool(hp.get('cr', 1)), allow_random_init=allow_random_init,
                                logger=log)
@@ -310,7 +339,7 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                    rot90: bool = True, margin_score: str = 'smooth', defect_bg_w: float = 0.0,
                    eval_normal_dir: Optional[str] = None, eval_max_images: int = 0,
                    flip: bool = True, optimizer: str = 'stableadamw', lr_final_ratio: float = 0.0,
-                   defect_frac: float = -1.0):
+                   defect_frac: float = -1.0, enc_fp16: bool = False, early_stop: int = 0):
     """联合训练 Dinomaly2 检测器: 正常图 (重建损失) + 带框缺陷图 (监督 margin: 图级 hinge + 框内 hinge)
     同一 batch 混合, 直接推开正常/缺陷分数分布, 解决 calibrate 重叠. 返回保存路径.
 
@@ -323,6 +352,10 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
     defect_frac: 每个 batch 中缺陷图的期望占比. 缺陷图太少时 (如 5%), bs=16 约 44% 的 batch 一张缺陷图都没有,
                  margin / box 损失那一步等于没开. -1=自动 (自然占比 <20% 时抬到 25%, 否则保持自然); 0=自然 (均匀打乱);
                  >0=指定占比 (按带放回加权采样实现).
+    early_stop: 连续这么多次评估 model_best 都没有提升就提前结束 (0=关). 余弦调度是按 total_iters 排的,
+                提前停会少走完退火那一段, 一般配合较大的 eval_interval 使用.
+    enc_fp16: 冻结的 encoder 用 fp16 autocast 前向 (约占训练耗时一半; 仅 CUDA 有效, 只影响训练, 推理仍默认 fp32).
+              decoder/bottleneck 仍是 fp32 (LinearAttention eps=1e-8 在 fp16 下会下溢成 0).
     optimizer: 'stableadamw' (官方配方, 更新量 RMS 超阈值时缩步长 + 坏梯度整步跳过, 抑制 loss 尖峰) / 'adamw'.
     lr_final_ratio: 余弦退火终点 = lr * 该值; 0 = 退火到 0 (默认), 1 = 恒定学习率 (官方默认).
     eval_normal_dir: 训练中评估时的纯正常 val 图目录. 没有它 val 只有缺陷图, I-AUROC 恒为 NaN, model_best 选不出来.
@@ -365,8 +398,12 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
         if frac > 0:
             w = [(1 - frac) / max(n_n, 1)] * n_n + [frac / max(n_d, 1)] * n_d
             sampler = torch.utils.data.WeightedRandomSampler(w, num_samples=len(train_ds), replacement=True)
+    # persistent_workers: 每个 epoch 结束不销毁 worker. Windows 用 spawn 启动 worker (重新 import torch/cv2, 每次 ~10s+),
+    # 而数据集 epoch 很短时 (iters 远大于 len/bs), 旧版每个 epoch 都重启一遍 worker, GPU 在空等.
+    dl_kw = dict(persistent_workers=True, prefetch_factor=4) if num_workers > 0 else {}
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
-                              num_workers=num_workers, drop_last=True, pin_memory=True)
+                              num_workers=num_workers, drop_last=True, pin_memory=str(device).startswith('cuda'),
+                              **dl_kw)
     log(f'训练样本数: {len(train_ds)}, batch={batch_size}, iters={total_iters}')
 
     model = build_dinomaly(backbone, dropout=dropout, la=la, lc=lc, cr=cr, weights_dir=weights_dir,
@@ -374,6 +411,9 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
     if resume:
         model.load_state_dict(torch_load(resume, map_location='cpu')['model'])
         log(f'从 {resume} 恢复')
+    model.enc_amp = bool(enc_fp16) and str(device).startswith('cuda')
+    if enc_fp16:
+        log(f'encoder fp16 autocast: {"开" if model.enc_amp else "关 (非 CUDA)"}')
     model.train()
     for p in model.encoder.parameters():
         p.requires_grad_(False)   # encoder 冻结 (前向本就在 no_grad 下), 节省显存
@@ -402,23 +442,26 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                'defect_sup': bool(use_defect), 'rot90': bool(rot90), 'margin_score': margin_score,
                'defect_bg_w': float(defect_bg_w), 'flip': bool(flip),
                'optimizer': type(optimizer).__name__ if not isinstance(optimizer, str) else optimizer,
-               'lr_final_ratio': float(lr_final_ratio), 'defect_frac': float(defect_frac)}
+               'lr_final_ratio': float(lr_final_ratio), 'defect_frac': float(defect_frac), 'enc_fp16': bool(enc_fp16)}
     smoother = make_smoother(smooth_sigma, device=device)     # 训练端 margin 分数用的平滑 (= 推理端同一个核)
     best_path = os.path.join(out_dir, 'model_best.pth')
     last_path = os.path.join(out_dir, 'model_last.pth')
     best_key = None                       # (I-AUROC, 相对间隙): 字典序比较, AUROC 饱和为 1.0 后看间隙大小
 
     it = 0
-    loss_meter = AverageMeter()
-    while it < total_iters:
+    loss_sum = torch.zeros((), device=device)     # 在设备上累加, 避免每步 loss.item() 的 GPU 同步
+    loss_cnt = 0
+    evals_no_gain = 0
+    stop = False
+    while it < total_iters and not stop:
         for batch in train_loader:
             if use_defect:
                 img, flag, tmask = batch
-                img = img.to(device)
-                flag = flag.to(device)
-                tmask = tmask.to(device)
+                img = img.to(device, non_blocking=True)
+                flag = flag.to(device, non_blocking=True)
+                tmask = tmask.to(device, non_blocking=True)
             else:
-                img = batch.to(device)
+                img = batch.to(device, non_blocking=True)
                 flag = None
             en, de = model(img)
             nmask = (flag == 0) if flag is not None else torch.ones(img.shape[0], dtype=torch.bool, device=device)
@@ -463,11 +506,13 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
             nn.utils.clip_grad_norm_(trainable.parameters(), max_norm=0.1)
             optimizer.step()
             scheduler.step()
-            loss_meter.update(loss.item())
+            loss_sum += loss.detach()
+            loss_cnt += 1
             it += 1
             if it % 100 == 0:
-                log(f'iter [{it}/{total_iters}] loss={loss_meter.avg:.4f} lr={optimizer.param_groups[-1]["lr"]:.2e}')
-                loss_meter.reset()
+                log(f'iter [{it}/{total_iters}] loss={loss_sum.item() / loss_cnt:.4f} lr={optimizer.param_groups[-1]["lr"]:.2e}')
+                loss_sum.zero_()
+                loss_cnt = 0
             if it % save_interval == 0 or it == total_iters:
                 # 先无条件保存 last —— 即使评估炸了, 也不能丢掉已训练的权重
                 AnomalyDetector(model, device, image_size, crop_size).save(last_path, hparams)
@@ -494,10 +539,14 @@ def train_detector(normal_train_dir: str, out_dir: str, backbone: str = 'dinov2r
                     if better:
                         AnomalyDetector(model, device, image_size, crop_size).save(best_path, hparams)
                         log(f'*** 新最优 I-AUROC={auroc:.4f} 间隙={st["gap_rel"]:.3f}, 保存 {best_path}')
+                    evals_no_gain = 0 if better else evals_no_gain + 1
+                    if early_stop > 0 and evals_no_gain >= early_stop and it < total_iters:
+                        log(f'早停: 连续 {early_stop} 次评估 model_best 未提升, 在 iter {it} 停止 (best key={best_key})')
+                        stop = True
                 except Exception as e:
                     log(f'警告: 评估失败 ({e}), 已跳过, 不影响 checkpoint 保存 (last 已保存)')
                 model.train()
-            if it >= total_iters:
+            if it >= total_iters or stop:
                 break
     # 兜底: 保证至少有一个 checkpoint
     AnomalyDetector(model, device, image_size, crop_size).save(last_path, hparams)
@@ -544,9 +593,7 @@ def evaluate_detector(model: nn.Module, images_dir: str, labels_dir: Optional[st
             img, boxes = nds[i][0], []
         h, w = img.shape[:2]
         x = tf(img).unsqueeze(0).to(device)
-        en, de = model(x)
-        amap, _ = cal_anomaly_maps(en, de, x.shape[-1])
-        amap = det.gaussian(amap.float())                       # (1,1,C,C)
+        amap = det.gaussian(model_anomaly_map(model, x, x.shape[-1]).float())                       # (1,1,C,C)
         amap = F.interpolate(amap, size=(eval_size, eval_size), mode='bilinear', align_corners=False)
         amap = amap[0, 0].cpu().numpy()
         score = score_from_map(amap, score_ratio)

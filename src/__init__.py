@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .pipeline import FabricAnomalyPipeline, ImageResult, RegionResult, build_pipeline
     from .detect import AnomalyDetector, train_detector, calibrate, evaluate_detector, deviation_confidence
-    from .classify import RegionClassifier, train_classifier, build_classifier
+    from .classify import RegionClassifier, train_classifier, build_classifier, load_classifier
     from .data import load_fabric_config, FabricConfig, UNKNOWN_CLASS_NAME
 
 _LAZY = {
@@ -18,6 +18,7 @@ _LAZY = {
     'AnomalyDetector': '.detect', 'train_detector': '.detect', 'calibrate': '.detect',
     'evaluate_detector': '.detect', 'deviation_confidence': '.detect',
     'RegionClassifier': '.classify', 'train_classifier': '.classify', 'build_classifier': '.classify',
+    'load_classifier': '.classify',
     'load_fabric_config': '.data', 'FabricConfig': '.data', 'UNKNOWN_CLASS_NAME': '.data',
 }
 

@@ -1,8 +1,11 @@
 """训练异常区域分类器 (YOLO 框裁剪 -> 19 类缺陷; 低置信度自动归为 "未知类型").
 
+默认 --kind embed: 冻结 DINOv2 嵌入 + 余弦头 + Balanced Softmax (小样本/类别不均衡友好, 训练只要几分钟);
+--kind cnn: 旧方案, 端到端微调 MobileNetV3 等 (逐 epoch 读图, 慢). 两者可用 evaluate.py --mode gt 做 A/B 对比.
+
 示例:
-  python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml \
-      --arch mobilenet_v3_small --epochs 50 --batch-size 32 --out checkpoints/classifier
+  python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out checkpoints/classifier
+  python scripts/train_classifier.py --kind cnn --arch mobilenet_v3_small --epochs 50 --out checkpoints/classifier_cnn
 """
 import argparse
 import os
@@ -20,6 +23,16 @@ def main():
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))
     p.add_argument('--root', default=None)
+    p.add_argument('--kind', default='embed', choices=['embed', 'cnn'],
+                   help='embed=DINOv2 冻结嵌入+余弦头 (默认); cnn=端到端微调小 CNN (旧方案)')
+    p.add_argument('--backbone', default='dinov2reg_vit_small_14', help='[embed] 嵌入骨干 (与检测器共用同一份权重文件)')
+    p.add_argument('--views', type=int, default=4, help='[embed] 每个训练裁剪至少抽几个视角 (1 干净 + 其余增强)')
+    p.add_argument('--min-per-class', type=int, default=200,
+                   help='[embed] 稀有类按此目标多抽增强视角 (特征级过采样, 最多 16 个视角)')
+    p.add_argument('--tau', type=float, default=1.0, help='[embed] logit adjustment 强度: 1=Balanced Softmax, 0=普通 CE')
+    p.add_argument('--head-epochs', type=int, default=200, help='[embed] 分类头训练轮数 (特征已缓存, 很快)')
+    p.add_argument('--weights-dir', default=None, help='[embed] backbone 权重目录 (默认 backbones/weights)')
+    p.add_argument('--allow-random-init', action='store_true', help='[embed] 仅冒烟测试')
     p.add_argument('--arch', default='mobilenet_v3_small',
                    choices=['mobilenet_v3_small', 'mobilenet_v3_large', 'resnet18', 'resnet34',
                             'efficientnet_b0'],
@@ -56,6 +69,19 @@ def main():
     log(cfg.summary())
     if not cfg.train_images or not os.path.isdir(cfg.train_images):
         raise FileNotFoundError(f'训练图片目录不存在: {cfg.train_images}')
+    if args.kind == 'embed':
+        from src.embed_classify import train_embed_classifier
+        train_embed_classifier(train_images=cfg.train_images, train_labels=cfg.train_labels,
+                               val_images=cfg.val_images if cfg.val_images and os.path.isdir(cfg.val_images) else None,
+                               val_labels=cfg.val_labels, out_dir=args.out, nc=cfg.nc, names=cfg.names,
+                               backbone=args.backbone, crop_size=args.crop_size, crop_pad=args.crop_pad,
+                               views=args.views, min_per_class=args.min_per_class, box_jitter=args.box_jitter,
+                               epochs=args.head_epochs, tau=args.tau, val_ratio=args.val_ratio,
+                               unknown_quantile=args.unknown_quantile, unknown_min=args.unknown_min,
+                               unknown_max=args.unknown_max, device=args.device, num_workers=args.num_workers,
+                               seed=args.seed, logger=log, weights_dir=args.weights_dir,
+                               allow_random_init=args.allow_random_init)
+        return
     train_classifier(train_images=cfg.train_images, train_labels=cfg.train_labels,
                      val_images=cfg.val_images if cfg.val_images and os.path.isdir(cfg.val_images) else None,
                      val_labels=cfg.val_labels, out_dir=args.out, nc=cfg.nc, names=cfg.names, arch=args.arch,

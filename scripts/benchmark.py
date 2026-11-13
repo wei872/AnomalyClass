@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _flops(model, input_shape, device):
+    import torch
     try:
         from thop import profile
         x = torch.randn(*input_shape, device=device)
@@ -37,7 +38,7 @@ def main():
     import torch
     from src.data import load_fabric_config
     from src.detect import AnomalyDetector, load_json
-    from src.classify import RegionClassifier
+    from src.classify import load_classifier
     from src.pipeline import FabricAnomalyPipeline
     from src.util import AverageMeter, get_logger
     p = argparse.ArgumentParser(description='推理速度 benchmark')
@@ -71,7 +72,7 @@ def main():
         from src.detect import get_eval_transform
         det.tf = get_eval_transform(det.image_size, det.crop_size)
     thr = load_json(args.thresholds) if os.path.exists(args.thresholds) else {'img_thr': 0.5, 'pix_thr': 0.25}
-    cls = RegionClassifier.load(args.cls_ckpt, nc=len(class_names) - 1, names=class_names,
+    cls = load_classifier(args.cls_ckpt, nc=len(class_names) - 1, names=class_names,
                                 device=args.device, logger=log) if os.path.exists(args.cls_ckpt) else None
     pipe = FabricAnomalyPipeline(det, cls, class_names, img_thr=thr['img_thr'], pix_thr=thr.get('pix_thr'),
                                  device=args.device, logger=log)

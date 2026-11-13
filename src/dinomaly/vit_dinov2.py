@@ -95,10 +95,16 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if hasattr(F, 'scaled_dot_product_attention') and not (self.training and self.attn_drop.p > 0):
+            # 融合注意力: 不再物化 B×heads×N×N 的注意力矩阵 (448 输入 N=1029, bs16 时单层 ~400MB 的显存读写),
+            # 数值与手写 softmax 等价 (encoder 冻结, 无 attn dropout)
+            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

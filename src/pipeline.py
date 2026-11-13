@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import torch
 
-from .classify import RegionClassifier
+from .classify import RegionClassifier, load_classifier
 from .detect import AnomalyDetector, deviation_confidence
 from .util import (class_color, get_cjk_font, get_logger, imread_unicode, UNKNOWN_COLOR)
 
@@ -266,7 +266,7 @@ def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
         det.set_score_ratio(float(thr['score_ratio']))      # 图级分数取法同样沿用校准时的设置
     cls = None
     if cls_ckpt and os.path.exists(cls_ckpt):
-        cls = RegionClassifier.load(cls_ckpt, nc=len(class_names) - 1, names=class_names, device=device, logger=log)
+        cls = load_classifier(cls_ckpt, nc=len(class_names) - 1, names=class_names, device=device, logger=log)
     else:
         log('[pipeline] 未提供分类器权重, 只做异常检测 (区域标为未知类型)')
     return FabricAnomalyPipeline(det, cls, class_names, img_thr=thr['img_thr'], pix_thr=thr.get('pix_thr'),
