@@ -479,37 +479,48 @@ def test_fusion_detector():
     print('ok  融合检测器: w=1 / w=0 退化一致, 混合正确, 存取一致')
 
 
-def test_run_py_and_tiny_head():
-    """run.py --dry-run 能生成完整命令且子脚本参数都存在; 极少步数的分类头训练不再除零."""
-    import subprocess, sys as _sys
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    outs = {}
-    with tempfile.TemporaryDirectory() as td:
-        for sub in ('images/train', 'images/val', 'labels/train', 'labels/val', 'normal/images/train', 'normal/images/val'):
-            os.makedirs(os.path.join(td, sub))
-        ypath = os.path.join(td, 'd.yaml')
-        open(ypath, 'w').write(f"path: {td}\ntrain: images/train\nval: images/val\nnormaltrain: normal/images/train\n"
-                               f"normalval: normal/images/val\nnames:\n  0: a\n  1: b\n")
-        for preset in ('full', 'fast', 'smoke'):
-            r = subprocess.run([_sys.executable, os.path.join(root, 'run.py'), '--preset', preset, '--dry-run',
-                                '--data-yaml', ypath, '--out', os.path.join(td, 'out_' + preset)],
-                               capture_output=True, text=True, cwd=root)
-            assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
-            outs[preset] = r.stdout
-    # 每条命令里出现的 --参数 必须是对应脚本 argparse 里真实存在的
-    import re
-    for text in outs.values():
-        for m in re.finditer(r'scripts/(\w+\.py)([^\n]*)', text):
-            src = open(os.path.join(root, 'scripts', m.group(1)), encoding='utf-8').read()
-            for flag in re.findall(r'(?<![\w-])--([a-z][\w-]*)', m.group(2)):
-                assert f"'--{flag}'" in src, f'{m.group(1)} 没有参数 --{flag}'
+def test_tiny_head_and_calibrate_checkpoint():
+    """极少步数的分类头训练不再除零; calibrate_checkpoint 能从权重文件一步写出 thresholds.json."""
+    import json
     import torch.nn.functional as F
     from src.embed_classify import train_head
+    from src.detect import calibrate_checkpoint
     g = torch.Generator().manual_seed(0)
     X = F.normalize(torch.randn(8, 16, generator=g), dim=1)
     Y = torch.tensor([0, 1] * 4)
     train_head(X, Y, X, Y, nc=2, epochs=3, logger=lambda *a, **k: None)
-    print('ok  run.py dry-run 参数与脚本一致; 少步数分类头不除零')
+    rng = np.random.default_rng(0)
+    quiet = lambda *a, **k: None
+    with tempfile.TemporaryDirectory() as d:
+        for sub in ['dimg', 'dlab', 'nimg']:
+            os.makedirs(f'{d}/{sub}')
+        for i in range(3):
+            img = rng.integers(100, 140, (112, 112, 3), dtype=np.uint8)
+            img[20:60, 20:60] = 250
+            imwrite_unicode(f'{d}/dimg/{i}.png', img)
+            open(f'{d}/dlab/{i}.txt', 'w').write(' '.join(map(str, xyxy_to_yolo([(0, 20, 20, 60, 60)], 112, 112)[0])))
+            imwrite_unicode(f'{d}/nimg/{i}.png', rng.integers(100, 140, (112, 112, 3), dtype=np.uint8))
+        model = build_dinomaly('tiny_test_14', allow_random_init=True)
+        det = AnomalyDetector(model, 'cpu', 112, 112, smooth_sigma=4.0)
+        det.save(f'{d}/m.pth', {'backbone': 'tiny_test_14', 'image_size': 112, 'crop_size': 112, 'smooth_sigma': 4.0})
+        res = calibrate_checkpoint(f'{d}/m.pth', f'{d}/thresholds.json', f'{d}/nimg', f'{d}/dimg', f'{d}/dlab',
+                                   device='cpu', sweep=True, allow_random_init=True, logger=quiet)
+        assert os.path.exists(f'{d}/thresholds.json') and json.load(open(f'{d}/thresholds.json'))['img_thr'] == res['img_thr']
+        # 训练后自动 kNN + 融合 -> model_final.pth, 且 resolve_det_ckpt 优先选它
+        import shutil
+        from src.detect import resolve_det_ckpt
+        from src.fusion import build_final_detector
+        os.makedirs(f'{d}/ck')
+        shutil.copyfile(f'{d}/m.pth', f'{d}/ck/model_best.pth')
+        assert resolve_det_ckpt(None, f'{d}/ck').endswith('model_best.pth')
+        r = build_final_detector(f'{d}/ck', f'{d}/nimg', f'{d}/nimg', f'{d}/dimg', f'{d}/dlab', backbone='tiny_test_14',
+                                 image_size=112, layer_sets='0,1', bank_size=500, max_images=3, device='cpu',
+                                 allow_random_init=True, logger=quiet)
+        assert os.path.exists(f'{d}/ck/model_final.pth') and resolve_det_ckpt(None, f'{d}/ck').endswith('model_final.pth')
+        det_f = AnomalyDetector.load(f'{d}/ck/model_final.pth', device='cpu', allow_random_init=True, logger=quiet)
+        assert det_f.predict(cv2.imread(f'{d}/nimg/0.png')[..., ::-1])[1] == det_f.predict(cv2.imread(f'{d}/nimg/0.png')[..., ::-1])[1]
+        assert 0.0 <= r['w'] <= 1.0
+    print('ok  少步数分类头不除零; calibrate_checkpoint 一步写出 thresholds.json; 训练后 kNN+融合产出 model_final.pth')
 
 
 if __name__ == '__main__':
@@ -531,5 +542,5 @@ if __name__ == '__main__':
     test_balanced_softmax_head()
     test_embed_classifier_pipeline()
     test_fusion_detector()
-    test_run_py_and_tiny_head()
+    test_tiny_head_and_calibrate_checkpoint()
     print('ALL PASSED ✅')

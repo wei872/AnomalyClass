@@ -69,8 +69,8 @@ def main():
     p.add_argument('--mode', choices=['gt', 'pipeline'], default='gt',
                    help='gt=直接用YOLO疵点框评分类器; pipeline=端到端(检测框IoU匹配)')
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
-    p.add_argument('--det-ckpt', default='checkpoints/detector/model_best.pth')
-    p.add_argument('--thresholds', default='checkpoints/detector/thresholds.json')
+    p.add_argument('--det-ckpt', default=None, help='默认 checkpoints/detector/model_final.pth (没有则 model_best.pth)')
+    p.add_argument('--thresholds', default=None, help='默认取检测器权重同目录的 thresholds.json')
     p.add_argument('--split', default='val', choices=['train', 'val'])
     p.add_argument('--crop-pad', type=float, default=0.3)
     p.add_argument('--iou-thr', type=float, default=0.3, help='pipeline 模式匹配 GT 框的 IoU 阈值')
@@ -82,6 +82,10 @@ def main():
     p.add_argument('--device', default='cuda' if __import__('torch').cuda.is_available() else 'cpu')
     p.add_argument('--allow-random-init', action='store_true')
     args = p.parse_args()
+    from src.detect import resolve_det_ckpt
+    args.det_ckpt = resolve_det_ckpt(args.det_ckpt)
+    if args.thresholds is None:
+        args.thresholds = os.path.join(os.path.dirname(os.path.abspath(args.det_ckpt)), 'thresholds.json')
 
     log = get_logger('evaluate')
     cfg = load_fabric_config(args.data_yaml, root_override=args.root)

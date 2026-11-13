@@ -45,7 +45,7 @@ def main():
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))
     p.add_argument('--root', default=None)
-    p.add_argument('--det-ckpt', default='checkpoints/detector/model_best.pth')
+    p.add_argument('--det-ckpt', default=None, help='默认 checkpoints/detector/model_final.pth (没有则 model_best.pth)')
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
     p.add_argument('--thresholds', default='checkpoints/detector/thresholds.json')
     p.add_argument('--image-size', type=int, default=None)
@@ -56,6 +56,8 @@ def main():
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--allow-random-init', action='store_true')
     args = p.parse_args()
+    from src.detect import resolve_det_ckpt
+    args.det_ckpt = resolve_det_ckpt(args.det_ckpt)
 
     log = get_logger('benchmark')
     if args.device.startswith('cuda') and torch.cuda.is_available():

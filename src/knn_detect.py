@@ -11,6 +11,7 @@
 cal_anomaly_maps / calibrate / evaluate_detector / AnomalyDetector / pipeline / infer 都直接可用.
 """
 import math
+import os
 from typing import Callable, List, Optional, Sequence
 
 import numpy as np
@@ -175,3 +176,54 @@ def fit_knn(model: KNNModel, images: Sequence[np.ndarray], tf: Callable, device:
     model.bank = F.normalize(pool[sel].float(), dim=-1).contiguous()     # 候选池存的是 fp16, 取出后重新归一化 (点积才严格等于余弦)
     log(f'[knn] 记忆库 {tuple(model.bank.shape)} ({model.bank.numel() * 4 / 1e6:.1f} MB)')
     return int(model.bank.shape[0])
+
+
+def fit_knn_best(normal_dir: str, out_path: str, backbone: str = 'dinov2reg_vit_small_14', image_size: int = 448,
+                 layer_sets: str = '5,7,9', bank_size: int = 20000, max_images: int = 300, batch_size: int = 8,
+                 smooth_sigma: float = 4.0, val_images=None, val_labels=None, normal_val_dir=None,
+                 eval_max_images: int = 0, device: str = 'cuda', seed: int = 1, weights_dir=None,
+                 allow_random_init: bool = False, logger=None) -> str:
+    """对每组层建一个记忆库并在 val 上评估, 把 (I-AUROC, 相对间隙) 最优的存成 out_path. 返回 out_path.
+    layer_sets: 逗号=多层平均, 分号=多组候选. scripts/fit_knn.py 与 train_detector.py (训练后自动建库) 共用."""
+    import random
+    from .data.yolo import NormalImageDataset
+    from .detect import AnomalyDetector, evaluate_detector, get_eval_transform
+    log = logger or (lambda *a, **k: print(*a))
+    ds = NormalImageDataset(normal_dir, verify=True, logger=log)
+    ids = list(range(len(ds)))
+    random.Random(seed).shuffle(ids)
+    ids = ids[:max_images] if max_images else ids
+    log(f'用 {len(ids)}/{len(ds)} 张正常图建记忆库')
+
+    class _Sub:
+        def __len__(self):
+            return len(ids)
+
+        def __getitem__(self, i):
+            return ds[ids[i]]
+
+    tf = get_eval_transform(image_size, image_size)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    best_key = None
+    sets = [tuple(int(v) for v in x.split(',') if v.strip()) for x in layer_sets.split(';') if x.strip()]
+    for layers in sets:
+        log(f'===== kNN layers={layers} =====')
+        model = build_knn(backbone, layers=layers, weights_dir=weights_dir, allow_random_init=allow_random_init,
+                          logger=log)
+        fit_knn(model, _Sub(), tf, device=device, bank_size=bank_size, batch_size=batch_size, seed=seed, logger=log)
+        hp = {'arch': 'knn', 'backbone': backbone, 'image_size': image_size, 'crop_size': image_size,
+              'layers': list(layers), 'bank_size': int(model.bank.shape[0]), 'smooth_sigma': smooth_sigma}
+        det = AnomalyDetector(model, device, image_size, image_size, smooth_sigma=smooth_sigma)
+        key = (0.0, 0.0)
+        if val_images and os.path.isdir(val_images):
+            st = evaluate_detector(model, val_images, val_labels, device, image_size, image_size, logger=log,
+                                   normal_dir=normal_val_dir, smooth_sigma=smooth_sigma,
+                                   max_images=eval_max_images, return_stats=True)
+            a, g = st['i_auroc'], st['gap_rel']
+            key = (a if a == a else 0.0, g if g == g else -1e9)
+        if best_key is None or key > best_key:
+            best_key = key
+            det.save(out_path, hp)
+            log(f'*** 当前最优 kNN layers={layers} key={key}, 已保存 {out_path}')
+        del model, det
+    return out_path

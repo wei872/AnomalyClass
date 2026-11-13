@@ -1,5 +1,11 @@
 """推理入口: 单图 / 图片目录 / 视频文件 / 摄像头实时检测 + 分类.
 
+最短用法 (训练完直接用, 检测器/阈值/分类器路径都有默认值):
+  python scripts/infer.py --input 图片或目录或视频 [--out runs/infer]
+  --input 自动识别: 文件夹 / 图片文件 / 视频文件 / 数字(摄像头编号). 也可以分别用 --image/--dir/--video/--camera.
+  默认: 检测器 checkpoints/detector/model_best.pth, 阈值取检测器同目录 thresholds.json, 分类器 checkpoints/classifier/best.pt
+  (分类器不存在时只检测不分类; --no-classify 也可强制只检测)
+
 示例:
   # 单图
   python scripts/infer.py --image test.jpg --out runs/infer
@@ -33,11 +39,12 @@ def main():
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))
     p.add_argument('--root', default=None)
-    p.add_argument('--det-ckpt', default='checkpoints/detector/model_best.pth')
+    p.add_argument('--input', default=None, help='图片 / 图片目录 / 视频文件 / 摄像头编号 (自动识别, 等价于 --image/--dir/--video/--camera)')
+    p.add_argument('--det-ckpt', default=None, help='默认 checkpoints/detector/model_final.pth (没有则 model_best.pth)')
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
     p.add_argument('--no-classify', action='store_true',
                    help='纯正异常检测: 不加载分类器, 区域只定位(标未知类型/classified=false), 更快')
-    p.add_argument('--thresholds', default='checkpoints/detector/thresholds.json')
+    p.add_argument('--thresholds', default=None, help='默认取检测器权重同目录的 thresholds.json')
     p.add_argument('--image', default=None)
     p.add_argument('--dir', default=None)
     p.add_argument('--video', default=None)
@@ -59,8 +66,32 @@ def main():
     p.add_argument('--device', default='cuda' if __import__('torch').cuda.is_available() else 'cpu')
     p.add_argument('--allow-random-init', action='store_true')
     args = p.parse_args()
+    from src.detect import resolve_det_ckpt
+    args.det_ckpt = resolve_det_ckpt(args.det_ckpt)
 
     log = get_logger('infer')
+    if args.input is not None:
+        inp = args.input
+        if os.path.isdir(inp):
+            args.dir = inp
+        elif inp.isdigit():
+            args.camera = int(inp)
+        elif inp.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+            args.video = inp
+        else:
+            args.image = inp
+    if not (args.image or args.dir or args.video or args.camera is not None):
+        p.error('请用 --input 指定图片 / 目录 / 视频 / 摄像头编号')
+    if not os.path.exists(args.det_ckpt):
+        raise SystemExit(f'找不到检测器权重: {args.det_ckpt}\n请先训练: python scripts/train_detector.py (或用 --det-ckpt 指定)')
+    if args.thresholds is None:
+        args.thresholds = os.path.join(os.path.dirname(os.path.abspath(args.det_ckpt)), 'thresholds.json')
+    if not os.path.exists(args.thresholds):
+        raise SystemExit(f'找不到阈值文件: {args.thresholds}\n请先校准阈值: '
+                         f'python scripts/calibrate.py --det-ckpt {args.det_ckpt}')
+    if not args.no_classify and not os.path.exists(args.cls_ckpt):
+        log(f'⚠️ 找不到分类器权重 {args.cls_ckpt}, 本次只检测不分类 (先运行 python scripts/train_classifier.py)')
+        args.no_classify = True
     cfg = load_fabric_config(args.data_yaml, root_override=args.root)
     class_names = cfg.class_names
     log(f'类别({len(class_names)}): {class_names}')

@@ -808,6 +808,49 @@ def calibrate(detector: AnomalyDetector, normal_dir: str, defect_dir: Optional[s
     return result
 
 
+def calibrate_checkpoint(det_ckpt: str, out_path: str, normal_dir: str, defect_dir: Optional[str],
+                         defect_labels_dir: Optional[str], class_names=None, device: str = 'cuda',
+                         sweep: bool = True, smooth_sigma: float = 0, score_ratio: float = -1,
+                         pix_quantile: float = 0.9999, max_images: int = 0, half: bool = False,
+                         run_eval: bool = True, allow_random_init: bool = False, logger=None) -> Dict:
+    """加载检测器权重 -> (可选)扫 smooth_sigma x score_ratio -> 校准阈值 -> 写 thresholds.json. 返回校准结果.
+    scripts/calibrate.py 与 train_detector.py (训练结束自动校准) 共用."""
+    log = logger or (lambda *a, **k: print(*a))
+    det = AnomalyDetector.load(det_ckpt, device=device, allow_random_init=allow_random_init, logger=log, half=half)
+    if smooth_sigma and smooth_sigma != det.smooth_sigma:
+        det.set_smooth_sigma(smooth_sigma)
+        log(f'平滑核 sigma={smooth_sigma} (已写入 thresholds.json, 推理自动沿用)')
+    else:
+        log(f'平滑核 sigma={det.smooth_sigma} (取自权重 hparams, 已写入 thresholds.json)')
+    if sweep:
+        sw = sweep_postprocess(det, normal_dir, defect_dir, defect_labels_dir, max_images=max_images, logger=log)
+        det.set_smooth_sigma(sw['best']['smooth_sigma'])
+        det.set_score_ratio(sw['best']['score_ratio'])
+        log(f'已采用扫参最优: smooth_sigma={det.smooth_sigma} score_ratio={det.score_ratio}')
+    elif score_ratio >= 0:
+        det.set_score_ratio(score_ratio)
+    log('图级分数取法: ' + ('最大值' if det.score_ratio <= 0 else f'最高 {det.score_ratio:.1%} 像素均值'))
+    result = calibrate(det, normal_dir, defect_dir=defect_dir, defect_labels_dir=defect_labels_dir,
+                       pix_quantile=pix_quantile, max_images=max_images, class_names=class_names, logger=log)
+    if run_eval and defect_dir and os.path.isdir(defect_dir):
+        evaluate_detector(det.model, defect_dir, defect_labels_dir, device=device, image_size=det.image_size,
+                          crop_size=det.crop_size, logger=log, normal_dir=normal_dir, smooth_sigma=det.smooth_sigma,
+                          max_images=max_images, score_ratio=det.score_ratio)
+    save_json(result, out_path)
+    log(f'阈值已保存: {out_path}  (img_thr={result["img_thr"]:.4f}, pix_thr={result["pix_thr"]:.4f}, '
+        f'separable={result.get("separable")})')
+    return result
+
+
+def resolve_det_ckpt(path: Optional[str] = None, out_dir: str = 'checkpoints/detector') -> str:
+    """检测器权重默认路径: 显式给了就用; 否则优先 model_final.pth (train_detector 训练结束产出, 可能是融合检测器),
+    没有再退回 model_best.pth (旧版本训练产物 / --no-knn)."""
+    if path:
+        return path
+    final = os.path.join(out_dir, 'model_final.pth')
+    return final if os.path.exists(final) else os.path.join(out_dir, 'model_best.pth')
+
+
 def deviation_confidence(score: float, img_thr: float) -> float:
     """与正常样本偏离的置信度, 单调映射到 [0,1): 等于阈值时为 0.5, 远超阈值趋近 1."""
     if img_thr <= 0:
