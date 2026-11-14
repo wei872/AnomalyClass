@@ -1,4 +1,4 @@
-"""端到端流水线: 异常检测 (Dinomaly2) -> 区域定位 (连通域) -> 缺陷分类 (轻量 CNN + 未知类型).
+"""端到端流水线: 异常检测 (Dinomaly2) -> 区域定位 (连通域) -> 二次判断 (整图+区域综合: 19 类 / 未知异常 / 推翻为正常).
 
 每张图输出:
   is_anomaly      : 图级是否异常 (score > img_thr, 阈值由 calibrate 在间隙中点取, 正常/异常各自分开)
@@ -31,6 +31,9 @@ class RegionResult:
     class_conf: float             # 分类置信度
     classified: bool = True       # 是否真正过了分类器 (top_k 之外的区域为 False, 标未知类型)
     probs: List[float] = field(default_factory=list)
+    unknown: bool = False         # 二次判断: 新颖且严重 -> 没见过的异常类型 (class_id=nc)
+    novelty: float = 0.0          # 二次判断的新颖度 p(未知) ∈ [0,1]
+    severe: bool = False          # Dinomaly 视角: 区域够大且图级分数够高
 
     def to_dict(self):
         d = asdict(self)
@@ -49,6 +52,10 @@ class ImageResult:
     img_thr: float
     regions: List[RegionResult] = field(default_factory=list)
     latency_ms: float = 0.0
+    verdict: str = ''             # 最终结论: 正常 / 缺陷类名 / 未知类型 (二次判断给出; 纯检测时只有 正常/异常)
+    final_class_id: int = -1      # 整图最终类别 (-1=正常, nc=未知类型)
+    final_conf: float = 0.0
+    judge_override: bool = False  # Dinomaly 判异常, 但二次判断推翻为正常
     heat: Optional[np.ndarray] = field(default=None, repr=False)   # 异常图 (仅供可视化复用, 不进 json)
 
     def to_dict(self):
@@ -61,6 +68,10 @@ class ImageResult:
             'anomaly_conf': round(self.anomaly_conf, 6),
             'img_thr': round(self.img_thr, 6),
             'latency_ms': round(self.latency_ms, 2),
+            'verdict': self.verdict,
+            'final_class_id': self.final_class_id,
+            'final_conf': round(self.final_conf, 6),
+            'judge_override': self.judge_override,
             'regions': [r.to_dict() for r in self.regions],
         }
 
@@ -73,7 +84,8 @@ class FabricAnomalyPipeline:
                  mask_ratio: float = 0.5, min_area_ratio: float = 2e-4, dilate: int = 7, box_pad: float = 0.3,
                  device: str = 'cuda', logger=None, max_map_side: int = 1024, max_vis_side: int = 1600,
                  top_k: int = 1, region_score_ratio: float = 0.5,
-                 heat_floor_ratio: float = 1.0, heat_region_only: bool = False):
+                 heat_floor_ratio: float = 1.0, heat_region_only: bool = False,
+                 severe_score: Optional[float] = None, severe_area: Optional[float] = None):
         self.det = detector
         self.cls = classifier
         self.class_names = class_names          # 长度 nc+1, 末尾为 '未知类型'
@@ -96,6 +108,10 @@ class FabricAnomalyPipeline:
         # heat_region_only=True 时只在检出的区域框内显示热力
         self.heat_floor_ratio = float(heat_floor_ratio)
         self.heat_region_only = bool(heat_region_only)
+        # 二次判断的"严重度"门槛 (calibrate 写在 thresholds.json 里); 缺省: 图级分数 >= 1.3*img_thr 且框面积 >= 0.5%
+        self.severe_score = float(severe_score) if severe_score is not None else 1.3 * self.img_thr
+        self.severe_area = float(severe_area) if severe_area is not None else 0.005
+        self.judge_max_regions = 8
         self.log = logger or get_logger('pipeline')
 
     # ---------------- 核心推理 ----------------
@@ -123,36 +139,86 @@ class FabricAnomalyPipeline:
                 x1, y1, x2, y2 = r['box']
                 box = (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy)))
                 items.append((r, box))
-            cls_map = {}
-            if self.cls is not None and k > 0:
-                crops, idxs = [], []
-                for i in range(k):
-                    r, box = items[i]
-                    bx1, by1 = max(0, box[0]), max(0, box[1])
-                    bx2, by2 = min(w0, box[2]), min(h0, box[3])
-                    if bx2 > bx1 and by2 > by1:
-                        crops.append(img_rgb[by1:by2, bx1:bx2])
-                        idxs.append(i)
-                if crops:
-                    for j, cr in enumerate(self.cls.predict(crops)):   # 一次 batch 推理
-                        cls_map[idxs[j]] = cr
-            for i, (r, box) in enumerate(items):
-                r_conf = deviation_confidence(r['mean_score'], self.img_thr)
-                cr = cls_map.get(i)
-                if cr is None:
-                    # 未送分类器 (top_k 之外) 或分类器为空 -> 未知类型
-                    result.regions.append(RegionResult(
-                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
-                        class_id=self.nc, class_name='未知类型', class_conf=0.0, classified=False, probs=[]))
-                else:
-                    cid = cr['class_id']
-                    result.regions.append(RegionResult(
-                        box=box, area=r['area'], anomaly_score=r['mean_score'], anomaly_conf=r_conf,
-                        class_id=cid,
-                        class_name=self.class_names[cid] if cid < len(self.class_names) else '未知类型',
-                        class_conf=cr['class_conf'], classified=True, probs=cr['probs']))
+            if getattr(self.cls, 'is_judge', False):
+                k = min(len(items), self.judge_max_regions)      # 二次判断要看全部区域 (不受 top_k 限制, 上限防极端图)
+                self._judge(img_rgb, result, items, k, score, w0, h0)
+            else:
+                self._classify_crops(img_rgb, result, items, k, w0, h0)
+        else:
+            result.verdict, result.final_class_id = '正常', -1
+            result.final_conf = 1.0 - conf
         result.latency_ms = (time.perf_counter() - t0) * 1000
         return result
+
+    def _region(self, r, box, **kw) -> RegionResult:
+        return RegionResult(box=box, area=r['area'], anomaly_score=r['mean_score'],
+                            anomaly_conf=deviation_confidence(r['mean_score'], self.img_thr), **kw)
+
+    def _classify_crops(self, img_rgb, result, items, k, w0, h0):
+        """旧式分类 (cnn / embed): 每个区域裁剪后单独分类, top_k 之外标未知类型 (classified=false)."""
+        cls_map = {}
+        if self.cls is not None and k > 0:
+            crops, idxs = [], []
+            for i in range(k):
+                r, box = items[i]
+                bx1, by1 = max(0, box[0]), max(0, box[1])
+                bx2, by2 = min(w0, box[2]), min(h0, box[3])
+                if bx2 > bx1 and by2 > by1:
+                    crops.append(img_rgb[by1:by2, bx1:bx2])
+                    idxs.append(i)
+            if crops:
+                for j, cr in enumerate(self.cls.predict(crops)):   # 一次 batch 推理
+                    cls_map[idxs[j]] = cr
+        for i, (r, box) in enumerate(items):
+            cr = cls_map.get(i)
+            if cr is None:
+                result.regions.append(self._region(r, box, class_id=self.nc, class_name='未知类型',
+                                                   class_conf=0.0, classified=False, probs=[]))
+            else:
+                cid = cr['class_id']
+                result.regions.append(self._region(
+                    r, box, class_id=cid, class_name=self.class_names[cid] if cid < len(self.class_names) else '未知类型',
+                    class_conf=cr['class_conf'], classified=True, probs=cr['probs'], unknown=cid == self.nc))
+        if result.regions:
+            top = result.regions[0]
+            result.final_class_id, result.final_conf, result.verdict = top.class_id, top.class_conf, top.class_name
+        else:
+            result.verdict, result.final_class_id = '异常', self.nc
+
+    def _judge(self, img_rgb, result, items, k, score, w0, h0):
+        """二次判断: 整图 + 区域一起看 (src/judge.py). 先推翻误报, 再给每个区域 类别 / 未知异常."""
+        cls = self.cls
+        sel = list(range(k))
+        ana = cls.analyse(img_rgb, [items[i][1] for i in sel]) if sel else None
+        severe_img = score >= self.severe_score
+        judged = {}
+        if ana is not None:
+            for j, i in enumerate(sel):
+                r, box = items[i]
+                probs, p_nov = ana['probs'][j], float(ana['p_nov'][j])
+                sev = bool(severe_img and (box[2] - box[0]) * (box[3] - box[1]) >= self.severe_area * w0 * h0)
+                cid, cconf, unk = cls.decide(probs, p_nov, sev)
+                judged[i] = (cid, cconf, unk, p_nov, sev, probs)
+            # 所有被判断的区域都"像正常纹理" -> 推翻 Dinomaly 的异常结论 (阈值很保守, 见 train_judge)
+            if len(judged) == len(items) and all(ana['probs'][j][self.nc] >= cls.normal_thr for j in range(len(sel))):
+                result.is_anomaly, result.judge_override, result.heat = False, True, None
+                result.verdict, result.final_class_id, result.final_conf = '正常', -1, float(
+                    np.mean([ana['probs'][j][self.nc] for j in range(len(sel))]))
+                return
+        for i, (r, box) in enumerate(items):
+            if i in judged:
+                cid, cconf, unk, p_nov, sev, probs = judged[i]
+                result.regions.append(self._region(
+                    r, box, class_id=cid, class_name=self.class_names[cid], class_conf=cconf, classified=True,
+                    probs=[round(float(v), 5) for v in probs[:self.nc]], unknown=unk, novelty=p_nov, severe=sev))
+            else:
+                result.regions.append(self._region(r, box, class_id=self.nc, class_name='未知类型', class_conf=0.0,
+                                                   classified=False, probs=[]))
+        if judged:
+            top = result.regions[min(judged)]
+            result.final_class_id, result.final_conf, result.verdict = top.class_id, top.class_conf, top.class_name
+        else:
+            result.verdict, result.final_class_id = '异常', self.nc
 
     def process_file(self, path: str) -> ImageResult:
         img = imread_unicode(path, cv2.IMREAD_COLOR)
@@ -272,4 +338,5 @@ def build_pipeline(det_ckpt: str, cls_ckpt: Optional[str], thresholds_json: str,
     return FabricAnomalyPipeline(det, cls, class_names, img_thr=thr['img_thr'], pix_thr=thr.get('pix_thr'),
                                   device=device, logger=log, top_k=top_k,
                                   region_score_ratio=region_score_ratio, heat_floor_ratio=heat_floor_ratio,
-                                  heat_region_only=heat_region_only)
+                                  heat_region_only=heat_region_only, severe_score=thr.get('severe_score'),
+                                  severe_area=thr.get('severe_area'))

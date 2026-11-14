@@ -58,6 +58,36 @@ def confusion_report(names, y_true, y_pred):
             print(f'  {names[i]} -> {names[j]}: {c} ({c / max(cm[i].sum(), 1):.0%})')
 
 
+def gt_judge_eval(cls, images_dir, labels_dir, class_names, max_images, log):
+    """二次判断分类器的 GT 验证: 每张图把全部 GT 框交给 judge (整图+区域), severe 视为 True (GT 框都当"严重").
+    报告: 缺陷类准确率 (含被判未知/正常的算错)、被判未知比例、被判正常比例、混淆矩阵."""
+    from src.data.yolo import YoloDefectDataset
+    nc = cls.nc
+    ds = YoloDefectDataset(images_dir, labels_dir, max_side=1024)
+    n = len(ds) if not max_images else min(max_images, len(ds))
+    y_true, y_pred, n_norm = [], [], 0
+    for i in range(n):
+        img, boxes, _, _ = ds[i]
+        if not boxes:
+            continue
+        ana = cls.analyse(img, [b[1:] for b in boxes])
+        for j, b in enumerate(boxes):
+            cid, _, unk = cls.decide(ana['probs'][j], float(ana['p_nov'][j]), True)
+            if ana['probs'][j][nc] >= cls.normal_thr:
+                n_norm += 1
+            y_true.append(int(b[0]))
+            y_pred.append(cid)
+        if (i + 1) % 20 == 0:
+            log(f'  进度 {i + 1}/{n}')
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    if not len(y_true):
+        log('[gt分类] val 里没有缺陷框')
+        return
+    log(f'[gt分类/二次判断] 总准确率={float((y_true == y_pred).mean()):.4f}  被判未知类型={float((y_pred == nc).mean()):.4f}  '
+        f'p(正常)>=normal_thr 的缺陷框={n_norm}/{len(y_true)}  (n={len(y_true)})')
+    confusion_report(class_names, y_true, y_pred)
+
+
 def main():
     import numpy as np
     from src.data import load_fabric_config
@@ -101,6 +131,9 @@ def main():
         from src.classify import load_classifier
         from src.data.yolo import build_crop_index
         cls = load_classifier(args.cls_ckpt, nc=nc, names=class_names, device=args.device, logger=log)
+        if getattr(cls, 'is_judge', False):
+            gt_judge_eval(cls, images_dir, labels_dir, class_names, args.max_images, log)
+            return
         index, bad = build_crop_index(images_dir, labels_dir, pad=args.crop_pad)
         if bad:
             log(f'跳过 {len(bad)} 个坏图')

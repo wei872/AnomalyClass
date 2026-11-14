@@ -95,17 +95,20 @@ def main():
         torch.cuda.synchronize()
     t_det = (time.perf_counter() - t0) / args.iters * 1000
 
-    # classifier: 模拟 batch-crops 个区域
+    # classifier: 模拟 batch-crops 个区域 (二次判断分类器: 同一张整图 + batch-crops 个框)
     crop = (rng.random((224, 224, 3)) * 255).astype(np.uint8)
     crops = [crop] * args.batch_crops
+    judge_boxes = [(10 + 20 * i, 10, 110 + 20 * i, 110) for i in range(args.batch_crops)]
+    run_cls = ((lambda: cls.analyse(img, judge_boxes)) if getattr(cls, 'is_judge', False)
+               else (lambda: cls.predict_probs(crops)))
     for _ in range(args.warmup):
-        cls.predict_probs(crops) if cls else None
+        run_cls() if cls else None
     if args.device.startswith('cuda'):
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(args.iters):
         if cls:
-            cls.predict_probs(crops)
+            run_cls()
     if args.device.startswith('cuda'):
         torch.cuda.synchronize()
     t_cls = (time.perf_counter() - t0) / args.iters * 1000 if cls else 0.0

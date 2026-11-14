@@ -200,6 +200,10 @@ def load_classifier(path: str, nc: int, names: List[str], device: str = 'cuda', 
                     allow_random_init: bool = False) -> 'RegionClassifier':
     """按 checkpoint 里的 meta['kind'] 选择加载 CNN 分类器 (默认) 或 DINOv2 嵌入分类器 ('embed')."""
     ckpt = torch_load(path, map_location='cpu')
+    if ckpt.get('meta', {}).get('kind') == 'judge':
+        from .judge import JudgeClassifier
+        return JudgeClassifier.load(path, nc=nc, names=names, device=device, logger=logger,
+                                    allow_random_init=allow_random_init)
     if ckpt.get('meta', {}).get('kind') == 'embed':
         from .embed_classify import EmbedRegionClassifier
         return EmbedRegionClassifier.load(path, nc=nc, names=names, device=device, logger=logger,

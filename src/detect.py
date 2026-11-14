@@ -759,7 +759,7 @@ def calibrate(detector: AnomalyDetector, normal_dir: str, defect_dir: Optional[s
     min_defect = None
     if defect_dir and os.path.isdir(defect_dir):
         ds_d = YoloDefectDataset(defect_dir, defect_labels_dir, max_side=2048)
-        d_scores = []
+        d_scores, d_areas = [], []
         per_class = {}                       # cls -> [scores of images containing this class]
         n = len(ds_d) if not max_images else min(max_images, len(ds_d))
         for i in range(n):
@@ -768,8 +768,10 @@ def calibrate(detector: AnomalyDetector, normal_dir: str, defect_dir: Optional[s
                 continue                      # 无标注框的 val 图按正常处理, 不参与缺陷侧
             _, score, _ = detector.predict(img)
             d_scores.append(score)
-            for c, *_ in boxes:
+            ih, iw = img.shape[:2]
+            for c, bx1, by1, bx2, by2 in boxes:
                 per_class.setdefault(int(c), []).append(score)
+                d_areas.append(max(bx2 - bx1, 0) * max(by2 - by1, 0) / float(max(ih * iw, 1)))
             if (i + 1) % 10 == 0:
                 log(f'  缺陷校准进度 {i + 1}/{n}')
         if d_scores:
@@ -777,6 +779,10 @@ def calibrate(detector: AnomalyDetector, normal_dir: str, defect_dir: Optional[s
             result['n_defect'] = int(len(d_scores))
             result['min_defect'] = min_defect
             result['defect_p10'] = float(np.quantile(d_scores, 0.1))
+            # 二次判断用的"严重度"门槛: 缺陷图分数/缺陷框面积占比各自的 25% 分位, 高于它才算"区域较大且异常严重"
+            result['severe_score'] = float(np.quantile(d_scores, 0.25))
+            if d_areas:
+                result['severe_area'] = float(np.quantile(d_areas, 0.25))
             # 按类别诊断: 哪些缺陷类的图分数最低 (重叠主因)
             cls_stat = sorted(((float(np.min(v)), float(np.mean(v)), c, len(v))
                                for c, v in per_class.items()))

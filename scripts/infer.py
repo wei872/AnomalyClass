@@ -112,11 +112,13 @@ def main():
         imwrite_unicode(out_img, vis)   # 支持中文文件名
         d = res.to_dict()
         d['vis'] = out_img
-        log(f'{name}: is_anomaly={d["is_anomaly"]} anomaly_conf={d["anomaly_conf"]:.3f} '
-            f'latency={d["latency_ms"]:.1f}ms regions={len(d["regions"])}')
+        log(f'{name}: is_anomaly={d["is_anomaly"]} anomaly_conf={d["anomaly_conf"]:.3f} 结论={d["verdict"] or "-"} '
+            f'latency={d["latency_ms"]:.1f}ms regions={len(d["regions"])}'
+            + (' [二次判断推翻了异常结论]' if d['judge_override'] else ''))
         for r in d['regions']:
             log(f'   - box={r["box"]} class={r["class_name"]}({r["class_id"]}) '
-                f'class_conf={r["class_conf"]:.3f} anomaly_conf={r["anomaly_conf"]:.3f}')
+                f'class_conf={r["class_conf"]:.3f} anomaly_conf={r["anomaly_conf"]:.3f}'
+                + (f' novelty={r["novelty"]:.2f} severe={r["severe"]}' if r['classified'] and r['novelty'] else ''))
         return d
 
     if args.image:

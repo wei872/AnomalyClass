@@ -1,6 +1,7 @@
 """训练异常区域分类器 (YOLO 框裁剪 -> 19 类缺陷; 低置信度自动归为 "未知类型").
 
-默认 --kind embed: 冻结 DINOv2 嵌入 + 余弦头 + Balanced Softmax (小样本/类别不均衡友好, 训练只要几分钟);
+--kind judge (默认): 二次判断, 整图+区域综合分类并识别未知异常 (见 src/judge.py).
+--kind embed: 冻结 DINOv2 嵌入 + 余弦头 + Balanced Softmax (小样本/类别不均衡友好, 训练只要几分钟);
 --kind cnn: 旧方案, 端到端微调 MobileNetV3 等 (逐 epoch 读图, 慢). 两者可用 evaluate.py --mode gt 做 A/B 对比.
 
 示例:
@@ -23,8 +24,12 @@ def main():
     p.add_argument('--data-yaml', default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'dataset', 'fabric19.yaml'))
     p.add_argument('--root', default=None)
-    p.add_argument('--kind', default='embed', choices=['embed', 'cnn'],
-                   help='embed=DINOv2 冻结嵌入+余弦头 (默认); cnn=端到端微调小 CNN (旧方案)')
+    p.add_argument('--kind', default='judge', choices=['judge', 'embed', 'cnn'],
+                   help='judge=二次判断: 整图+区域+几何 综合分类, 留一类校准未知异常 (默认); '
+                        'embed=只看区域裁剪的 DINOv2 嵌入分类; cnn=端到端微调小 CNN (旧方案)')
+    p.add_argument('--no-loco', action='store_true', help='[judge] 跳过留一类校准 (未知异常退回最大概率阈值)')
+    p.add_argument('--loco-epochs', type=int, default=40, help='[judge] 留一类校准时每个子头的训练轮数')
+    p.add_argument('--max-normal', type=int, default=1500, help='[judge] 训练用的正常图最多取多少张')
     p.add_argument('--backbone', default='dinov2reg_vit_small_14', help='[embed] 嵌入骨干 (与检测器共用同一份权重文件)')
     p.add_argument('--views', type=int, default=4, help='[embed] 每个训练裁剪至少抽几个视角 (1 干净 + 其余增强)')
     p.add_argument('--min-per-class', type=int, default=200,
@@ -69,6 +74,18 @@ def main():
     log(cfg.summary())
     if not cfg.train_images or not os.path.isdir(cfg.train_images):
         raise FileNotFoundError(f'训练图片目录不存在: {cfg.train_images}')
+    if args.kind == 'judge':
+        from src.judge import train_judge
+        train_judge(train_images=cfg.train_images, train_labels=cfg.train_labels,
+                    val_images=cfg.val_images if cfg.val_images and os.path.isdir(cfg.val_images) else None,
+                    val_labels=cfg.val_labels, normal_train=cfg.normaltrain_images, normal_val=cfg.normalval_images,
+                    out_dir=args.out, nc=cfg.nc, names=cfg.names, backbone=args.backbone,
+                    crop_size=args.crop_size, ctx_size=args.crop_size, crop_pad=args.crop_pad, views=args.views,
+                    min_per_class=args.min_per_class, box_jitter=args.box_jitter, epochs=args.head_epochs,
+                    tau=args.tau, max_normal=args.max_normal, loco=not args.no_loco, loco_epochs=args.loco_epochs,
+                    device=args.device, num_workers=args.num_workers, seed=args.seed, logger=log,
+                    weights_dir=args.weights_dir, allow_random_init=args.allow_random_init)
+        return
     if args.kind == 'embed':
         from src.embed_classify import train_embed_classifier
         train_embed_classifier(train_images=cfg.train_images, train_labels=cfg.train_labels,
