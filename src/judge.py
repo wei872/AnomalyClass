@@ -486,6 +486,7 @@ def scan_detector(pipe, paths: Sequence[str], ctx_size: int, max_side: int = 102
     """用训练好的检测器 (经流水线同一条 propose 路径) 扫一遍图片 ->
     {path: {'grid': 热力网格, 'regions': [(归一化 xyxy 框, 区域均分)], 'score': 图级分数/img_thr}}."""
     db = {}
+    t_start = time.perf_counter()
     for i, p in enumerate(paths):
         img = load_rgb(p, max_side)
         H, W = img.shape[:2]
@@ -497,8 +498,9 @@ def scan_detector(pipe, paths: Sequence[str], ctx_size: int, max_side: int = 102
                 regs.append(((x1 / W, y1 / H, x2 / W, y2 / H), float(r['mean_score'])))
         db[p] = {'grid': heat_to_grid(full_map, pipe.img_thr, ctx_size), 'regions': regs,
                  'score': float(score) / max(pipe.img_thr, 1e-8)}
-        if log and (i + 1) % 200 == 0:
-            log(f'  [{tag}] 检测器扫描 {i + 1}/{len(paths)}')
+        if log and ((i + 1) % 50 == 0 or i + 1 == len(paths)):
+            el = time.perf_counter() - t_start
+            log(f'  [{tag}] 检测器扫描 {i + 1}/{len(paths)}  {(i + 1) / el:.1f} 张/秒, 预计剩余 {(len(paths) - i - 1) / ((i + 1) / el) / 60:.1f} 分钟')
     return db
 
 
@@ -576,6 +578,7 @@ def train_judge(pipe, train_images: str, train_labels: Optional[str], val_images
             log(f'警告: 跳过 {len(bad)} 个无法解码的图片')
         return [(p, int(b[0]), (b[1], b[2], b[3], b[4])) for p, b, _ in idx]
 
+    log('[judge] 读取并校验缺陷图标注 (图片多时这一步要几分钟, 无输出属正常) ...')
     tr = defect_items(train_images, train_labels)
     if val_images and os.path.isdir(val_images):
         va = defect_items(val_images, val_labels)
@@ -607,6 +610,7 @@ def train_judge(pipe, train_images: str, train_labels: Optional[str], val_images
         if bad:
             log(f'警告: 跳过 {bad} 个无法解码的正常图')
         return ok
+    log(f'[judge] 缺陷框: train {len(tr)}, val {len(va)}; 校验正常图 (最多 {max_normal} + 300 张) ...')
     ntp = normal_paths(normal_train, max_normal)
     nvp = normal_paths(normal_val, 300)
     if not nvp and ntp:
