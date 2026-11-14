@@ -12,7 +12,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.judge import JudgeClassifier, token_mask, train_judge
+from src.detect import AnomalyDetector
+from src.judge import JudgeClassifier, heat_to_grid, heat_vector, token_mask, train_judge
 from src.pipeline import FabricAnomalyPipeline
 from src.util import imwrite_unicode, xyxy_to_yolo
 
@@ -54,19 +55,46 @@ def test_token_mask():
     assert m[0].sum() < 1e-4 and abs(m.sum() - 8 * 4) < 1e-3
 
 
+class BlobDet:
+    """假检测器: 偏离纹理灰度的色块 = 热点 (热力 ~1), 纹理 ~0.1-0.3; 区域分割用真实的 AnomalyDetector.segment."""
+
+    def predict(self, img, max_map_side=1024):
+        g = img.astype(np.float32).mean(2)
+        m = np.clip(np.abs(g - 145.0) / 100.0, 0, 1.2).astype(np.float32)
+        m = cv2.GaussianBlur(m, (0, 0), 2)
+        return m, float(m.max()), (1.0, 1.0)
+
+    def segment(self, *a, **k):
+        return AnomalyDetector.segment(None, *a, **k)
+
+
+def test_heat_features():
+    fm = np.zeros((100, 200), np.float32)
+    fm[:, :50] = 2.0                                       # 左侧热点 (img_thr=1 -> 2 倍)
+    g = heat_to_grid(fm, 1.0, 112)
+    assert g.shape == (8, 8) and g.min() >= 1.0 - 1e-6     # 下限 1: 低于阈值的纹理不带信息
+    m_hot = token_mask((0, 0, 50, 100), 200, 100, 112)
+    m_cold = token_mask((150, 0, 200, 100), 200, 100, 112)
+    assert heat_vector(g, m_hot)[0] > 0.6 and heat_vector(g, m_cold)[0] < 1e-3   # 区域内峰值 ln2≈0.69 vs 0
+    assert heat_vector(g, m_hot)[3] == heat_vector(g, m_cold)[3]                 # 整图峰值与框无关
+
+
 def test_judge_train_and_pipeline():
     with tempfile.TemporaryDirectory() as tmp:
         rng = np.random.default_rng(3)
         _make(tmp, rng)
         out = os.path.join(tmp, 'cls')
-        best = train_judge(f'{tmp}/images/train', f'{tmp}/labels/train', f'{tmp}/images/val', f'{tmp}/labels/val',
+        det_pipe = FabricAnomalyPipeline(BlobDet(), None, NAMES + ['未知类型'], img_thr=0.5, pix_thr=0.5, device='cpu',
+                                         logger=lambda *a, **k: None)
+        best = train_judge(det_pipe, f'{tmp}/images/train', f'{tmp}/labels/train', f'{tmp}/images/val', f'{tmp}/labels/val',
                            f'{tmp}/normal/train', f'{tmp}/normal/val', out_dir=out, nc=NC, names=NAMES,
                            backbone='tiny_test_14', crop_size=56, ctx_size=112, views=2, min_per_class=8,
                            epochs=20, loco_epochs=10, device='cpu', allow_random_init=True, logger=lambda *a, **k: None)
         cls = JudgeClassifier.load(best, nc=NC, names=NAMES + ['未知类型'], device='cpu', logger=lambda *a, **k: None)
-        assert cls.fuser is not None and cls.scorer is not None
+        assert cls.fuser is not None and cls.scorer is not None and cls.meta['use_heat']
+        assert cls.meta['img_thr'] == 0.5 and cls.meta['det_recall_train'] > 0.5, cls.meta
         img = _tex(rng)
-        ana = cls.analyse(img, [(10, 10, 50, 50), (60, 60, 100, 100)])
+        ana = cls.analyse(img, [(10, 10, 50, 50), (60, 60, 100, 100)], heat=np.ones((8, 8), np.float32))
         assert ana['probs'].shape == (2, NC + 1) and ana['p_nov'].shape == (2,)
         assert abs(float(ana['probs'][0].sum()) - 1) < 1e-4
         # decide: 新颖且严重 -> 未知; 新颖但不严重 -> 最像的已知类
@@ -95,13 +123,17 @@ def test_judge_train_and_pipeline():
             assert res.regions[0].severe and not res.regions[1].severe      # 面积占比 0.15 vs 0.055, 门槛 0.08
         assert 'verdict' in d and 'judge_override' in d
 
-        # 强制: 所有区域都像"正常" -> 推翻 Dinomaly
-        cls.analyse = lambda im, boxes, tta=True: {'probs': np.tile(np.array([0, 0, 0, 0, 1.0], np.float32), (len(boxes), 1)),
+        # 强制: 所有区域都像"正常": 默认只标记 suspect_normal, 不改 Dinomaly 结论
+        cls.analyse = lambda im, boxes, heat=None, tta=True: {'probs': np.tile(np.array([0, 0, 0, 0, 1.0], np.float32), (len(boxes), 1)),
                                                    'p_nov': np.zeros(len(boxes), np.float32)}
+        r1 = pipe.process(bgr, 't1.png')
+        assert r1.is_anomaly and r1.suspect_normal and not r1.judge_override and r1.regions
+        pipe.judge_override = True                                              # 开 --judge-override 才推翻
         r2 = pipe.process(bgr, 't2.png')
-        assert r2.judge_override and not r2.is_anomaly and r2.verdict == '正常' and r2.heat is None
+        pipe.judge_override = False
+        assert r2.suspect_normal and r2.judge_override and not r2.is_anomaly and r2.verdict == '正常' and r2.heat is None
         # 强制: 新颖 + 严重 -> 未知异常
-        cls.analyse = lambda im, boxes, tta=True: {'probs': np.tile(np.array([.4, .3, .2, .1, 0], np.float32), (len(boxes), 1)),
+        cls.analyse = lambda im, boxes, heat=None, tta=True: {'probs': np.tile(np.array([.4, .3, .2, .1, 0], np.float32), (len(boxes), 1)),
                                                    'p_nov': np.ones(len(boxes), np.float32)}
         r3 = pipe.process(bgr, 't3.png')
         assert r3.regions[0].unknown and r3.verdict == '未知类型' and r3.final_class_id == NC
@@ -110,5 +142,6 @@ def test_judge_train_and_pipeline():
 
 if __name__ == '__main__':
     test_token_mask()
+    test_heat_features()
     test_judge_train_and_pipeline()
     print('PASSED')

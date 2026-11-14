@@ -58,10 +58,11 @@ def confusion_report(names, y_true, y_pred):
             print(f'  {names[i]} -> {names[j]}: {c} ({c / max(cm[i].sum(), 1):.0%})')
 
 
-def gt_judge_eval(cls, images_dir, labels_dir, class_names, max_images, log):
-    """二次判断分类器的 GT 验证: 每张图把全部 GT 框交给 judge (整图+区域), severe 视为 True (GT 框都当"严重").
+def gt_judge_eval(cls, pipe, images_dir, labels_dir, class_names, max_images, log):
+    """二次判断分类器的 GT 验证: 每张图把全部 GT 框交给 judge (整图+区域+检测器热力), severe 视为 True (GT 框都当"严重").
     报告: 缺陷类准确率 (含被判未知/正常的算错)、被判未知比例、被判正常比例、混淆矩阵."""
     from src.data.yolo import YoloDefectDataset
+    from src.judge import heat_to_grid
     nc = cls.nc
     ds = YoloDefectDataset(images_dir, labels_dir, max_side=1024)
     n = len(ds) if not max_images else min(max_images, len(ds))
@@ -70,7 +71,11 @@ def gt_judge_eval(cls, images_dir, labels_dir, class_names, max_images, log):
         img, boxes, _, _ = ds[i]
         if not boxes:
             continue
-        ana = cls.analyse(img, [b[1:] for b in boxes])
+        heat = None
+        if cls.meta.get('use_heat'):
+            full_map, _, _ = pipe.det.predict(img, max_map_side=1024)
+            heat = heat_to_grid(full_map, pipe.img_thr, cls.ctx_size)
+        ana = cls.analyse(img, [b[1:] for b in boxes], heat=heat)
         for j, b in enumerate(boxes):
             cid, _, unk = cls.decide(ana['probs'][j], float(ana['p_nov'][j]), True)
             if ana['probs'][j][nc] >= cls.normal_thr:
@@ -102,6 +107,7 @@ def main():
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
     p.add_argument('--no-classify', action='store_true', help='pipeline 模式: 纯检测评估, 不加载分类器')
     p.add_argument('--det-ckpt', default=None, help='默认 checkpoints/detector/model_final.pth (没有则 model_best.pth)')
+    p.add_argument('--judge-override', action='store_true', help='pipeline 模式: 允许二次判断推翻异常 (默认关, 与不开的结果对比即为推翻的净影响)')
     p.add_argument('--thresholds', default=None, help='默认取检测器权重同目录的 thresholds.json')
     p.add_argument('--split', default='val', choices=['train', 'val'])
     p.add_argument('--crop-pad', type=float, default=0.3)
@@ -132,7 +138,10 @@ def main():
         from src.data.yolo import build_crop_index
         cls = load_classifier(args.cls_ckpt, nc=nc, names=class_names, device=args.device, logger=log)
         if getattr(cls, 'is_judge', False):
-            gt_judge_eval(cls, images_dir, labels_dir, class_names, args.max_images, log)
+            from src.pipeline import build_pipeline
+            pipe = build_pipeline(args.det_ckpt, None, args.thresholds, class_names, device=args.device,
+                                  half=args.half, image_size=args.image_size, logger=log)
+            gt_judge_eval(cls, pipe, images_dir, labels_dir, class_names, args.max_images, log)
             return
         index, bad = build_crop_index(images_dir, labels_dir, pad=args.crop_pad)
         if bad:
@@ -167,7 +176,8 @@ def main():
         from src.pipeline import build_pipeline
         pipe = build_pipeline(args.det_ckpt, None if args.no_classify else args.cls_ckpt, args.thresholds, class_names,
                               device=args.device, half=args.half, image_size=args.image_size, logger=log,
-                              top_k=args.top_k, region_score_ratio=args.region_score_ratio)
+                              top_k=args.top_k, region_score_ratio=args.region_score_ratio,
+                              judge_override=args.judge_override)
         ds = YoloDefectDataset(images_dir, labels_dir, max_side=2048)
         n = len(ds) if not args.max_images else min(args.max_images, len(ds))
         img_ok = 0

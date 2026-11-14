@@ -34,12 +34,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from .classify import _split_samples, fit_temperature
+from .classify import fit_temperature
 from .data.yolo import build_crop_index, pil_to_tensor_batch, verify_images
 from .dinomaly import encoder as encoder_mod
 from .util import get_logger, imread_unicode, list_images
 
-GEOM_DIM = 4
+HEAT_DIM = 5
+GEOM_DIM = 4 + HEAT_DIM                       # 框几何 4 + Dinomaly2 热力图统计 5
 GEOM_SCALE = 0.35
 N_BLOCKS = 7
 
@@ -81,17 +82,49 @@ def crop_box(img: np.ndarray, box_xyxy: Sequence[float], pad: float, min_side: i
     return img[cy1:cy2, cx1:cx2]
 
 
+def heat_to_grid(full_map: np.ndarray, img_thr: float, ctx_size: int) -> np.ndarray:
+    """Dinomaly2 异常图 -> 与整图 letterbox 对齐的 token 网格 (g,g), 值 = max(分数/img_thr, 1).
+    取 max 池化 (细线型缺陷的峰值不被平均掉); 下限 1 = 只描述"超过图级阈值多少倍": 低于阈值的纹理不携带信息,
+    防止分类头走捷径 ("热力低 = 正常"), 因为推理时进到二次判断的图本来就都超过阈值."""
+    mh, mw = full_map.shape
+    s = ctx_size / max(mh, mw)
+    nw, nh = max(1, int(round(mw * s))), max(1, int(round(mh * s)))
+    m = cv2.resize(full_map.astype(np.float32), (nw, nh), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((ctx_size, ctx_size), np.float32)
+    ox, oy = (ctx_size - nw) // 2, (ctx_size - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = m
+    g = ctx_size // 14
+    grid = canvas.reshape(g, 14, g, 14).max(axis=(1, 3))
+    return np.maximum(grid / max(img_thr, 1e-8), 1.0).astype(np.float32)
+
+
+def heat_vector(grid: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """热力网格 (≥1 的倍数) + 区域 token 覆盖率 -> 5 维: [区域内峰值, 区域内均值, 区域外均值, 整图峰值, 区域内热点占比] (log 倍数)."""
+    e = np.log(grid)
+    inn, out = float(m.sum()), float((1 - m).sum())
+    sel = m > 0.05
+    max_in = float(e[sel].max()) if sel.any() else 0.0
+    mean_in = float((e * m).sum() / max(inn, 1e-3))
+    mean_out = float((e * (1 - m)).sum() / max(out, 1e-3))
+    frac = float(((e > math.log(1.5)) * m).sum() / max(inn, 1e-3))
+    return np.array([max_in, mean_in, mean_out, float(e.max()), frac], dtype=np.float32)
+
+
 def make_sample(img_rgb: np.ndarray, box_xyxy: Sequence[float], crop_size: int, ctx_size: int, pad: float,
-                ctx_tensor: Optional[torch.Tensor] = None):
-    """一个区域 -> (crop tensor, ctx tensor, token mask, geom). ctx_tensor 给定时复用 (同一张图的多个区域)."""
+                ctx_tensor: Optional[torch.Tensor] = None, heat: Optional[np.ndarray] = None):
+    """一个区域 -> (crop, ctx, token 掩码 (g,g), 热力权重 (g,g), 几何+热力 (GEOM_DIM,)).
+    heat: heat_to_grid 的结果 (None=没有检测器热力, 全按 1 处理). ctx_tensor 给定时复用 (同一张图的多个区域)."""
     H, W = img_rgb.shape[:2]
+    g = ctx_size // 14
     crop = pil_to_tensor_batch([crop_box(img_rgb, box_xyxy, pad)], crop_size, augment=False)[0]
     if ctx_tensor is None:
         ctx_tensor = pil_to_tensor_batch([img_rgb], ctx_size, augment=False)[0]
     x1, y1, x2, y2 = box_xyxy
-    m = torch.from_numpy(token_mask(box_xyxy, W, H, ctx_size))
-    g = torch.from_numpy(geom_feature((x2 - x1) / W, (y2 - y1) / H, W, H))
-    return crop, ctx_tensor, m, g
+    mk = token_mask(box_xyxy, W, H, ctx_size)
+    grid = heat if heat is not None else np.ones((g, g), np.float32)
+    hw = 1.0 + np.clip(np.log(grid), 0.0, 2.0)                 # 区域内越热的 token 权重越大 (最多 3 倍)
+    geom = np.concatenate([geom_feature((x2 - x1) / W, (y2 - y1) / H, W, H), heat_vector(grid, mk) * 0.5])
+    return crop, ctx_tensor, torch.from_numpy(mk), torch.from_numpy(hw.astype(np.float32)), torch.from_numpy(geom)
 
 
 # ------------------------------------------------------------------ 特征抽取
@@ -125,14 +158,15 @@ class JudgeExtractor(nn.Module):
         return h[:, 0].float(), h[:, 1 + nreg:].float(), mid[:, 1 + nreg:].float()
 
     @torch.no_grad()
-    def forward(self, crop: torch.Tensor, ctx: torch.Tensor, mask: torch.Tensor, geom: torch.Tensor) -> torch.Tensor:
+    def forward(self, crop: torch.Tensor, ctx: torch.Tensor, mask: torch.Tensor, hw: torch.Tensor,
+                geom: torch.Tensor) -> torch.Tensor:
         c_cls, c_last, c_mid = self.tokens(crop)
         i_cls, i_last, i_mid = self.tokens(ctx)
-        m = mask.flatten(1).unsqueeze(-1).to(i_last.dtype)                    # (B,N,1)
-        inn = m.sum(1).clamp_min(1e-3)
+        m = mask.flatten(1).unsqueeze(-1).to(i_last.dtype)                    # (B,N,1) 区域覆盖率
+        w = m * hw.flatten(1).unsqueeze(-1).to(i_last.dtype)                  # 区域内再按 Dinomaly2 热力加权
         out = (1 - m)
-        foc_last = (i_last * m).sum(1) / inn                                  # 区域内 token 均值: 重点看
-        foc_mid = (i_mid * m).sum(1) / inn
+        foc_last = (i_last * w).sum(1) / w.sum(1).clamp_min(1e-3)             # 区域内 token 加权均值: 重点看
+        foc_mid = (i_mid * w).sum(1) / w.sum(1).clamp_min(1e-3)
         rest_last = (i_last * out).sum(1) / out.sum(1).clamp_min(1e-3)        # 区域外 token 均值: 其他区域
         blocks = [c_cls, c_last.mean(1), c_mid.mean(1), i_cls, foc_last, foc_mid, rest_last]
         f = torch.cat([F.normalize(b, dim=-1) for b in blocks], -1) / math.sqrt(len(blocks))
@@ -150,13 +184,26 @@ class CosineHead(nn.Module):
 
 
 # ------------------------------------------------------------------ 训练数据集
+def load_rgb(path: str, max_side: int = 1024) -> np.ndarray:
+    img = imread_unicode(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise IOError(f'无法读取图片: {path}')
+    if max_side and max(img.shape[:2]) > max_side:
+        sc = max_side / max(img.shape[:2])
+        img = cv2.resize(img, (max(1, round(img.shape[1] * sc)), max(1, round(img.shape[0] * sc))),
+                         interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 class JudgeDataset(Dataset):
     """items: [(img_path, label, (cx,cy,w,h) 归一化 | None)]. box=None 的是正常图, 随机取一个与缺陷框同分布大小的框.
+    heat_db: {img_path: heat_to_grid 结果} (检测器在该图上的热力网格; None=不用热力). 翻转时网格同步翻转.
     augment=True: 整图翻转 + 颜色抖动 (整图/区域一致) + 框抖动 (模拟检测器框与人工框的差异)."""
 
     def __init__(self, items, crop_size: int = 224, ctx_size: int = 224, pad: float = 0.3, augment: bool = False,
                  box_jitter: float = 0.3, geom_pool: Optional[List[Tuple[float, float]]] = None,
-                 max_side: int = 1024, seed: int = 0):
+                 max_side: int = 1024, seed: int = 0, heat_db: Optional[Dict[str, np.ndarray]] = None):
+        self.heat_db = heat_db
         self.items, self.crop_size, self.ctx_size, self.pad = items, crop_size, ctx_size, pad
         self.augment, self.box_jitter, self.max_side, self.seed = augment, box_jitter, max_side, seed
         self.geom_pool = geom_pool or [(0.1, 0.1)]
@@ -167,14 +214,7 @@ class JudgeDataset(Dataset):
 
     def _load(self, path: str):
         if path != self._last_path:
-            img = imread_unicode(path, cv2.IMREAD_COLOR)
-            if img is None:
-                raise IOError(f'无法读取图片: {path}')
-            if self.max_side and max(img.shape[:2]) > self.max_side:
-                s = self.max_side / max(img.shape[:2])
-                img = cv2.resize(img, (max(1, round(img.shape[1] * s)), max(1, round(img.shape[0] * s))),
-                                 interpolation=cv2.INTER_AREA)
-            self._last_path, self._last_img = path, cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            self._last_path, self._last_img = path, load_rgb(path, self.max_side)
         return self._last_img
 
     def __getitem__(self, i):
@@ -187,11 +227,14 @@ class JudgeDataset(Dataset):
             cx, cy = float(rng.uniform(w / 2, 1 - w / 2)) if w < 1 else 0.5, float(rng.uniform(h / 2, 1 - h / 2)) if h < 1 else 0.5
         else:
             cx, cy, w, h = box
+        heat = self.heat_db.get(path) if self.heat_db else None
         if self.augment:
             if rng.rand() < 0.5:
                 img, cx = img[:, ::-1], 1.0 - cx
+                heat = None if heat is None else heat[:, ::-1]
             if rng.rand() < 0.5:
                 img, cy = img[::-1], 1.0 - cy
+                heat = None if heat is None else heat[::-1]
             img = np.ascontiguousarray(img)
             if rng.rand() < 0.6:
                 from torchvision import transforms as T
@@ -205,16 +248,17 @@ class JudgeDataset(Dataset):
                 cy = float(np.clip(cy + rng.uniform(-j, j) * 0.5 * h, 0.0, 1.0))
         bxy = (max(0.0, (cx - w / 2) * W), max(0.0, (cy - h / 2) * H), min(float(W), (cx + w / 2) * W),
                min(float(H), (cy + h / 2) * H))
-        crop, ctx, m, g = make_sample(img, bxy, self.crop_size, self.ctx_size, self.pad)
-        return crop, ctx, m, g, int(label)
+        heat = None if heat is None else np.ascontiguousarray(heat)
+        crop, ctx, m, hw, g = make_sample(img, bxy, self.crop_size, self.ctx_size, self.pad, heat=heat)
+        return crop, ctx, m, hw, g, int(label)
 
 
 @torch.no_grad()
 def extract_features(ext: JudgeExtractor, ds: JudgeDataset, device: str, batch_size: int = 32, num_workers: int = 0):
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     fs, ys = [], []
-    for crop, ctx, m, g, y in loader:
-        fs.append(ext(crop.to(device), ctx.to(device), m.to(device), g.to(device)).cpu())
+    for crop, ctx, m, hw, g, y in loader:
+        fs.append(ext(crop.to(device), ctx.to(device), m.to(device), hw.to(device), g.to(device)).cpu())
         ys.append(y)
     if not fs:
         return torch.zeros(0, ext.dim), torch.zeros(0, dtype=torch.long)
@@ -354,28 +398,29 @@ class JudgeClassifier:
                 setattr(self.scorer, a, getattr(self.scorer, a).to(device))
 
     @torch.no_grad()
-    def _views(self, img_rgb: np.ndarray, boxes: Sequence[Sequence[float]]):
-        H, W = img_rgb.shape[:2]
+    def _views(self, img_rgb: np.ndarray, boxes: Sequence[Sequence[float]], heat: Optional[np.ndarray] = None):
         ctx = pil_to_tensor_batch([img_rgb], self.ctx_size, augment=False)[0]
-        crops, ctxs, ms, gs = [], [], [], []
+        crops, ctxs, ms, hws, gs = [], [], [], [], []
         for b in boxes:
-            c, x, m, g = make_sample(img_rgb, b, self.crop_size, self.ctx_size, self.pad, ctx_tensor=ctx)
-            crops.append(c); ctxs.append(x); ms.append(m); gs.append(g)
-        return [torch.stack(t).to(self.device) for t in (crops, ctxs, ms, gs)]
+            c, x, m, hw, g = make_sample(img_rgb, b, self.crop_size, self.ctx_size, self.pad, ctx_tensor=ctx, heat=heat)
+            crops.append(c); ctxs.append(x); ms.append(m); hws.append(hw); gs.append(g)
+        return [torch.stack(t).to(self.device) for t in (crops, ctxs, ms, hws, gs)]
 
     @torch.no_grad()
-    def analyse(self, img_rgb: np.ndarray, boxes: Sequence[Sequence[float]], tta: bool = True) -> Dict:
-        """boxes: 原图像素坐标 (x1,y1,x2,y2) 列表. 返回 {'probs': (R,nc+1), 'p_nov': (R,), 'logits'}.
-        probs 已温度缩放; 第 nc 列是"正常". tta: 再对整图+框做一次水平翻转取平均."""
+    def analyse(self, img_rgb: np.ndarray, boxes: Sequence[Sequence[float]], heat: Optional[np.ndarray] = None,
+                tta: bool = True) -> Dict:
+        """boxes: 原图像素坐标 (x1,y1,x2,y2) 列表; heat: heat_to_grid(异常图, img_thr, ctx_size) 的结果 (必须与训练同口径).
+        返回 {'probs': (R,nc+1), 'p_nov': (R,)}. probs 已温度缩放; 第 nc 列是"正常". tta: 整图+框+热力一起水平翻转再算一次取平均."""
         if len(boxes) == 0:
             return {'probs': np.zeros((0, self.nc + 1), np.float32), 'p_nov': np.zeros(0, np.float32)}
         H, W = img_rgb.shape[:2]
-        variants = [(img_rgb, list(boxes))]
+        variants = [(img_rgb, list(boxes), heat)]
         if tta:
-            variants.append((np.ascontiguousarray(img_rgb[:, ::-1]), [(W - b[2], b[1], W - b[0], b[3]) for b in boxes]))
+            variants.append((np.ascontiguousarray(img_rgb[:, ::-1]), [(W - b[2], b[1], W - b[0], b[3]) for b in boxes],
+                             None if heat is None else np.ascontiguousarray(heat[:, ::-1])))
         probs_all, nov_all = [], []
-        for im, bx in variants:
-            f = self.extractor(*self._views(im, bx))
+        for im, bx, ht in variants:
+            f = self.extractor(*self._views(im, bx, ht))
             logits = self.head(f).cpu()
             probs_all.append(torch.softmax(logits / self.temperature, 1).numpy())
             if self.scorer is not None and self.fuser is not None:
@@ -430,20 +475,91 @@ class JudgeClassifier:
 
 
 # ------------------------------------------------------------------ 训练
+def _iou_xyxy(a, b) -> float:
+    iw, ih = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    inter = max(iw, 0.0) * max(ih, 0.0)
+    return inter / max((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter, 1e-9)
+
+
+def scan_detector(pipe, paths: Sequence[str], ctx_size: int, max_side: int = 1024, max_regions: int = 4,
+                  log=None, tag: str = '') -> Dict[str, dict]:
+    """用训练好的检测器 (经流水线同一条 propose 路径) 扫一遍图片 ->
+    {path: {'grid': 热力网格, 'regions': [(归一化 xyxy 框, 区域均分)], 'score': 图级分数/img_thr}}."""
+    db = {}
+    for i, p in enumerate(paths):
+        img = load_rgb(p, max_side)
+        H, W = img.shape[:2]
+        full_map, score, (sx, sy) = pipe.det.predict(img, max_map_side=1024)
+        regs = []
+        for r, box in pipe.propose(full_map, score, sx, sy)[:max_regions]:
+            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3])
+            if x2 > x1 and y2 > y1:
+                regs.append(((x1 / W, y1 / H, x2 / W, y2 / H), float(r['mean_score'])))
+        db[p] = {'grid': heat_to_grid(full_map, pipe.img_thr, ctx_size), 'regions': regs,
+                 'score': float(score) / max(pipe.img_thr, 1e-8)}
+        if log and (i + 1) % 200 == 0:
+            log(f'  [{tag}] 检测器扫描 {i + 1}/{len(paths)}')
+    return db
+
+
+def _coverage(g, r) -> float:
+    """标注框 g 被检测区域 r 覆盖的面积比例 (检测区域外扩了 30%, 用 IoU 衡量召回会偏低)."""
+    iw, ih = min(g[2], r[2]) - max(g[0], r[0]), min(g[3], r[3]) - max(g[1], r[1])
+    return max(iw, 0.0) * max(ih, 0.0) / max((g[2] - g[0]) * (g[3] - g[1]), 1e-9)
+
+
+def _to_cxcywh(b):
+    return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, b[2] - b[0], b[3] - b[1])
+
+
+def _from_cxcywh(b):
+    return (b[0] - b[2] / 2, b[1] - b[3] / 2, b[0] + b[2] / 2, b[1] + b[3] / 2)
+
+
+def detector_items(gt_items, db, log=None, tag: str = '', match_iou: float = 0.1):
+    """检测器出的区域框按 IoU 匹配人工标注: 与某个标注框 IoU>=match_iou -> 取它的类别; 没有任何重叠的区域 (可能是误报,
+    也可能是漏标的缺陷) 一律丢弃, 不当"正常"训练. 返回 (新增样本, 标注召回率: 覆盖>=50%)."""
+    by_path: Dict[str, list] = {}
+    for p, c, b in gt_items:
+        by_path.setdefault(p, []).append((c, _from_cxcywh(b)))
+    new, hit, total, dropped = [], 0, 0, 0
+    for p, gts in by_path.items():
+        regs = db[p]['regions']
+        for c, g in gts:
+            total += 1
+            hit += int(any(_coverage(g, r) >= 0.5 for r, _ in regs))
+        for r, _ in regs:
+            ious = [_iou_xyxy(g, r) for _, g in gts]
+            j = int(np.argmax(ious))
+            if ious[j] >= match_iou:
+                new.append((p, gts[j][0], _to_cxcywh(r)))
+            else:
+                dropped += 1
+    if log:
+        log(f'[judge] {tag}: 检测器区域 -> 匹配标注得 {len(new)} 个样本, 无重叠丢弃 {dropped} 个; '
+            f'标注框被检测区域覆盖>=50% {hit}/{total}={hit / max(total, 1):.1%}')
+    return new, hit / max(total, 1)
+
+
 def _bal_acc(y: np.ndarray, p: np.ndarray, classes: Sequence[int]) -> float:
     rec = [float((p[y == c] == c).mean()) for c in classes if (y == c).any()]
     return float(np.mean(rec)) if rec else 0.0
 
 
-def train_judge(train_images: str, train_labels: Optional[str], val_images: Optional[str], val_labels: Optional[str],
-                normal_train: Optional[str], normal_val: Optional[str], out_dir: str = 'checkpoints/classifier',
+def train_judge(pipe, train_images: str, train_labels: Optional[str], val_images: Optional[str],
+                val_labels: Optional[str], normal_train: Optional[str], normal_val: Optional[str], out_dir: str = 'checkpoints/classifier',
                 nc: int = 19, names: Optional[List[str]] = None, backbone: str = 'dinov2reg_vit_small_14',
                 crop_size: int = 224, ctx_size: int = 224, crop_pad: float = 0.3, views: int = 4,
                 min_per_class: int = 200, max_reps: int = 16, box_jitter: float = 0.3, epochs: int = 200,
                 tau: float = 1.0, max_normal: int = 1500, loco: bool = True, loco_epochs: int = 40,
                 severe_q: float = 0.25, device: str = 'cuda', num_workers: int = 0, seed: int = 1, logger=None,
                 weights_dir: Optional[str] = None, allow_random_init: bool = False, amp: bool = True) -> str:
-    """训练二次判断分类器, 返回 out_dir/best.pt."""
+    """训练二次判断分类器, 返回 out_dir/best.pt.
+
+    pipe: 已按 thresholds.json 配好的检测流水线 (FabricAnomalyPipeline, 不带分类器). 训练前先用它扫一遍所有训练/val/正常图:
+      * 检测器框 (而不是只有人工框) 也作为训练样本 -> 训练分布 = 推理分布;
+      * 每张图的热力网格 / 图级分数进入特征 (热力加权的区域 token + 5 个热力统计);
+      * 正常图上检测器最热的区域作为"困难正常"样本."""
     from collections import Counter
     from .embed_classify import train_head
     log = logger or get_logger('train_judge')
@@ -463,21 +579,21 @@ def train_judge(train_images: str, train_labels: Optional[str], val_images: Opti
     tr = defect_items(train_images, train_labels)
     if val_images and os.path.isdir(val_images):
         va = defect_items(val_images, val_labels)
-    else:
-        sp_tr, sp_va = _split_samples([(p, (c,) + b, 0.0) for p, c, b in tr], 0.1, seed)
-        tr = [(p, b[0], b[1:]) for p, b, _ in sp_tr]
-        va = [(p, b[0], b[1:]) for p, b, _ in sp_va]
-        log(f'未提供 val, 从 train 划分: train={len(tr)} val={len(va)}')
+    else:                                                    # 没有 val: 按"图"划分 10% (同一张图的框不能跨集合)
+        paths = sorted({p for p, _, _ in tr})
+        rng.shuffle(paths)
+        vset = set(paths[:max(1, len(paths) // 10)])
+        va = [it for it in tr if it[0] in vset]
+        tr = [it for it in tr if it[0] not in vset]
+        log(f'未提供 val, 从 train 按图划分: train={len(tr)} 框, val={len(va)} 框')
     if not va:
         va = tr[:max(1, len(tr) // 10)]
-    cnt = Counter(c for _, c, _ in tr)
     nm = (names or []) + ['未知异常']
-    log(f'训练框 {len(tr)}, val 框 {len(va)}; 每类: ' + ', '.join(f'{nm[c] if c < len(nm) else c}:{cnt[c]}' for c in sorted(cnt)))
     geom_pool = [(b[2], b[3]) for _, _, b in tr]
 
-    # "正常"类: 正常图 + 随机框 (框大小取自缺陷框分布), 用来学"正常纹理长什么样", 第二阶段据此推翻 Dinomaly 的误报
+    # "正常"类: 正常图 (检测器最热的区域 = 困难正常, 外加一个随机框), 第二阶段据此学会"这只是正常纹理"
     NORMAL = nc
-    def normal_items(folder, cap):
+    def normal_paths(folder, cap):
         fs = list_images(folder) if folder and os.path.isdir(folder) else []
         rng.shuffle(fs)
         ok, bad = [], 0
@@ -490,17 +606,40 @@ def train_judge(train_images: str, train_labels: Optional[str], val_images: Opti
                 bad += 1
         if bad:
             log(f'警告: 跳过 {bad} 个无法解码的正常图')
-        return [(p, NORMAL, None) for p in ok]
-    nt = normal_items(normal_train, max_normal)
-    nv = normal_items(normal_val, 300)
-    if not nv and nt:
-        nv, nt = nt[:max(1, len(nt) // 10)], nt[max(1, len(nt) // 10):]
-    log(f'正常样本: train {len(nt)} 张, val {len(nv)} 张 (每张随机取一个缺陷大小的框)')
+        return ok
+    ntp = normal_paths(normal_train, max_normal)
+    nvp = normal_paths(normal_val, 300)
+    if not nvp and ntp:
+        nvp, ntp = ntp[:max(1, len(ntp) // 10)], ntp[max(1, len(ntp) // 10):]
+
+    t0 = time.perf_counter()
+    all_paths = sorted({p for p, _, _ in tr + va} | set(ntp) | set(nvp))
+    log(f'检测器扫描 {len(all_paths)} 张图 (缺陷 {len({p for p, _, _ in tr + va})}, 正常 {len(ntp) + len(nvp)}), '
+        f'图级阈值 img_thr={pipe.img_thr:.4f} ...')
+    db = scan_detector(pipe, all_paths, ctx_size, log=log, tag='judge')
+    log(f'检测器扫描完成 {time.perf_counter() - t0:.0f}s')
+    heat_db = {p: v['grid'] for p, v in db.items()}
+    tr_gt, va_gt = list(tr), list(va)
+    tr_det, rec_tr = detector_items(tr_gt, db, log, 'train')
+    va_det, rec_va = detector_items(va_gt, db, log, 'val')
+    tr, va = tr_gt + tr_det, va_gt + va_det
+    def normal_samples(ps):
+        out = []
+        for p in ps:
+            if db[p]['regions']:
+                out.append((p, NORMAL, _to_cxcywh(db[p]['regions'][0][0])))
+            out.append((p, NORMAL, None))
+        return out
+    nt, nv = normal_samples(ntp), normal_samples(nvp)
+    cnt = Counter(c for _, c, _ in tr)
+    log(f'训练框 {len(tr)} (人工 {len(tr_gt)} + 检测器 {len(tr_det)}), val 框 {len(va)}; 每类: '
+        + ', '.join(f'{nm[c] if c < len(nm) else c}:{cnt[c]}' for c in sorted(cnt)))
+    log(f'正常样本: train {len(nt)} (来自 {len(ntp)} 张图), val {len(nv)} (来自 {len(nvp)} 张图)')
 
     enc = encoder_mod.load_encoder(backbone, weights_dir=weights_dir, allow_random_init=allow_random_init, logger=log)
     ext = JudgeExtractor(enc, amp=amp).to(device).eval()
     mk = lambda items, aug, s=0: JudgeDataset(items, crop_size, ctx_size, crop_pad, augment=aug, box_jitter=box_jitter,
-                                                geom_pool=geom_pool, seed=s)
+                                                geom_pool=geom_pool, seed=s, heat_db=heat_db)
     t0 = time.perf_counter()
     f0, y0 = extract_features(ext, mk(tr + nt, False, seed), device, num_workers=num_workers)
     aug_items = []
@@ -581,7 +720,8 @@ def train_judge(train_images: str, train_labels: Optional[str], val_images: Opti
             'ctx_size': ctx_size, 'crop_pad': crop_pad, 'temperature': T, 'tau': tau, 'nov_thr': nov_thr,
             'normal_thr': normal_thr, 'unknown_thr': unknown_thr, 'val_acc': st['val_acc'],
             'val_bal_acc': st['val_bal_acc'], 'severe_q': severe_q, 'views': views, 'min_per_class': min_per_class,
-            'unknown_id': nc, 'unknown_name': '未知异常', 'normal_id': NORMAL}
+            'unknown_id': nc, 'unknown_name': '未知异常', 'normal_id': NORMAL, 'img_thr': float(pipe.img_thr),
+            'use_heat': True, 'det_recall_train': rec_tr, 'det_recall_val': rec_va}
     meta.update(meta_extra)
     if weights_dir:
         meta['weights_dir'] = weights_dir

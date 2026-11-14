@@ -43,6 +43,8 @@ def main():
     p.add_argument('--cls-ckpt', default='checkpoints/classifier/best.pt')
     p.add_argument('--no-classify', action='store_true',
                    help='纯正异常检测: 不加载分类器, 区域只定位(标未知类型/classified=false), 更快')
+    p.add_argument('--judge-override', action='store_true',
+                   help='允许二次判断把 Dinomaly2 的"异常"推翻为"正常" (默认关: 只在结果里标 suspect_normal, 先用 evaluate.py 对比再决定开不开)')
     p.add_argument('--thresholds', default=None, help='默认取检测器权重同目录的 thresholds.json')
     p.add_argument('--image', default=None)
     p.add_argument('--dir', default=None)
@@ -98,7 +100,7 @@ def main():
     pipe = build_pipeline(args.det_ckpt, cls_ckpt, args.thresholds, class_names,
                           device=args.device, half=args.half, image_size=args.image_size, logger=log,
                           top_k=args.top_k, region_score_ratio=args.region_score_ratio,
-                          heat_floor_ratio=args.heat_floor_ratio, heat_region_only=args.heat_region_only)
+                          heat_floor_ratio=args.heat_floor_ratio, heat_region_only=args.heat_region_only, judge_override=args.judge_override)
     if args.smooth_sigma and abs(args.smooth_sigma - pipe.det.smooth_sigma) > 1e-6:
         pipe.det.set_smooth_sigma(args.smooth_sigma)
         log(f'[infer] ⚠️ 手工覆盖平滑核 sigma={args.smooth_sigma} (阈值是在别的 sigma 下校准的, 须重新 calibrate)')
@@ -114,7 +116,7 @@ def main():
         d['vis'] = out_img
         log(f'{name}: is_anomaly={d["is_anomaly"]} anomaly_conf={d["anomaly_conf"]:.3f} 结论={d["verdict"] or "-"} '
             f'latency={d["latency_ms"]:.1f}ms regions={len(d["regions"])}'
-            + (' [二次判断推翻了异常结论]' if d['judge_override'] else ''))
+            + (' [二次判断推翻了异常结论]' if d['judge_override'] else (' [二次判断认为像正常纹理, 建议复核]' if d['suspect_normal'] else '')))
         for r in d['regions']:
             log(f'   - box={r["box"]} class={r["class_name"]}({r["class_id"]}) '
                 f'class_conf={r["class_conf"]:.3f} anomaly_conf={r["anomaly_conf"]:.3f}'

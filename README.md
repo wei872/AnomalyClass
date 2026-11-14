@@ -1,20 +1,20 @@
 # AnomalyClass — 布匹缺陷检测 + 分类流水线
 
-给一张原始布匹图，先判断**正常 / 异常**，异常图再由**二次判断**结合整图与异常区域给出结论：**19 类缺陷 / 未知类型（没见过的异常）**，或推翻为正常。
+给一张原始布匹图，先判断**正常 / 异常**，异常图再由**二次判断**结合整图与异常区域给出结论：**19 类缺陷 / 未知类型（没见过的异常）**；认为只是正常纹理的会被标记复核（可选推翻）。
 
 ```
 整图 448×448 ─► 检测器(Dinomaly2+kNN) ─► 正常 ──────────────────────────────────────► 直接输出「正常」
                       │
                       └► 异常: 热力图 → 连通域 → 异常区域框
                                                │
-                              二次判断 (整图 + 区域 + 几何 一起看, 学出来的结论)
-                                               ├─ 像正常纹理                 → 推翻, 输出「正常」
+                              二次判断 (整图 + 区域 + 几何 + 热力图 一起看, 学出来的结论)
+                                               ├─ 像正常纹理                 → 标 suspect_normal 供复核 (加 --judge-override 才推翻)
                                                ├─ 像某个已知缺陷             → 19 类之一
                                                └─ 不像任何已知类 且 区域大、异常重 → 「未知类型」
 ```
 
 - **检测器**：Dinomaly2 重建式异常检测，**正常图 + 带框缺陷图联合训练**（同一 batch 混合，不是两个模型）；训练末尾自动再建一个免训练的 kNN 记忆库并与之融合，权重在 val 上自动选。
-- **二次判断分类器（`--kind judge`，默认）**：Dinomaly2 说异常**不算数**，要再看一遍：每个异常区域的特征 = 区域裁剪 + **整图上下文** + **区域内 / 区域外** token 特征 + 面积/宽高比，一个余弦头学出「19 类缺陷 + 正常」的结论；「未知类型」= **新颖度**（没见过）**且严重度**（Dinomaly2 视角：图级分数和区域面积都够大）。新颖度用留一类（leave-one-class-out）学出来，不需要真实未知样本。原理见 §7。
+- **二次判断分类器（`--kind judge`，默认）**：Dinomaly2 说异常**不算数**，要再看一遍：每个异常区域的特征 = 区域裁剪 + **整图上下文** + **区域内 / 区域外** token 特征（区域内按 Dinomaly2 热力加权）+ 面积/宽高比 + 热力图统计，一个余弦头学出「19 类缺陷 + 正常」的结论；「未知类型」= **新颖度**（没见过）**且严重度**（Dinomaly2 视角：图级分数和区域面积都够大）。新颖度用留一类（leave-one-class-out）学出来，不需要真实未知样本。原理见 §7。
 - **不裁边**：训练/校准/推理统一 448，`crop_size = image_size`，四周暗角属于正常外观，边缘疵点也不会丢。
 - **YOLO 标注一鱼三吃**：缺陷侧监督信号、分类器训练样本、验证标准。
 - 目标硬件 GTX 1660 实时（448 + ViT-S，纯 Dinomaly 约 30~60 FPS，未在 1660 实测，请用 `benchmark.py` 验证）。
@@ -161,17 +161,17 @@ python scripts/train_classifier.py --data-yaml dataset/fabric19.yaml --out check
 
 | 项目 | 说明 |
 |---|---|
-| 做什么 | ① 缺陷框 + 整图 + 区域内/外特征 + 几何 → 冻结 DINOv2 抽特征（稀有类特征级过采样）；② 正常图随机框作「正常」类，让二次判断学会推翻误报；③ 余弦头 + Balanced Softmax 学「19 类 + 正常」；④ **留一类校准**：轮流把一个已知类当作「没见过的类」，学出新颖度打分（Mahalanobis++ / 原型距离 / 最大概率 / 间隔 / 能量 → 逻辑回归）和阈值 |
-| 输入 | `train` / `val` 的缺陷图与 YOLO 标注、`normaltrain` / `normalval` 正常图（没有 val 时自动从 train 划 10%） |
-| 输出 | `checkpoints/classifier/best.pt`（分类头 + 新颖度模型 + `nov_thr` / `normal_thr` 等阈值） |
-| 耗时 | 几分钟（特征只抽一次；留一类校准每类 40 轮小头，十几类约一分钟量级，未实测） |
-| 怎么看成功 | 日志 `val_bal_acc`、`推翻阈值`（val 缺陷框被推翻数应为 0）、`留一类校准 AUROC`（越高越能识别没见过的类）、「已知类误判为未知」比例 |
-| 常用选项 | `--no-loco` 跳过留一类校准（未知退回最大概率阈值）· `--max-normal` 正常样本上限 · `--kind embed` 只看区域裁剪（A/B 对照）· `--kind cnn` 旧方案 |
+| 做什么 | ⓪ **先用已训练的检测器扫一遍所有训练/val/正常图**：检测器框（按 IoU≥0.1 匹配标注取类别，无重叠的丢弃）与人工框一起作训练样本，训练分布 = 推理分布；热力图进入特征；① 缺陷框 + 整图 + 区域内/外特征 + 几何 + 热力统计 → 冻结 DINOv2 抽特征（稀有类特征级过采样）；② 正常图上检测器最热的区域（困难正常）+ 一个随机框作「正常」类；③ 余弦头 + Balanced Softmax 学「19 类 + 正常」；④ **留一类校准**：轮流把一个已知类当作「没见过的类」，学出新颖度打分（Mahalanobis++ / 原型距离 / 最大概率 / 间隔 / 能量 → 逻辑回归）和阈值 |
+| 输入 | **已训练的检测器 + `thresholds.json`**（默认 `checkpoints/detector/` 下，须先做 ①②）、`train` / `val` 的缺陷图与 YOLO 标注、`normaltrain` / `normalval` 正常图（没有 val 时按图从 train 划 10%） |
+| 输出 | `checkpoints/classifier/best.pt`（分类头 + 新颖度模型 + `nov_thr` / `normal_thr` + 训练时的 `img_thr`） |
+| 耗时 | 检测器扫描（每图一次检测器前向，约等于预测时的检测耗时×图片数）+ 几分钟抽特征/训练（留一类校准每类 40 轮小头）；均未实测 |
+| 怎么看成功 | 日志 `标注框被检测区域覆盖`（检测器框的召回，train 与 val 对比看偏差）、`val_bal_acc`、`推翻阈值`（val 缺陷框被推翻数应为 0）、`留一类校准 AUROC`（越高越能识别没见过的类）、「已知类误判为未知」比例 |
+| 常用选项 | `--no-loco` 跳过留一类校准（未知退回最大概率阈值）· `--max-normal` 正常样本上限 · `--det-ckpt` / `--thresholds` 指定检测器与阈值 · `--kind embed` 只看区域裁剪（A/B 对照）· `--kind cnn` 旧方案 |
 
-「严重度」门槛由 ② `calibrate.py` 写进 `thresholds.json`（`severe_score` / `severe_area`：val 缺陷图分数、缺陷框面积各自的 25% 分位）：**重新 calibrate 后无需重训分类器**。
+「严重度」门槛由 ② `calibrate.py` 写进 `thresholds.json`（`severe_score` / `severe_area`：val 缺陷图分数、缺陷框面积各自的 25% 分位）：热力图特征按 `img_thr` 归一化，所以**重训检测器或 `img_thr` 变化较大（>5%）时请重新训练分类器**（预测时会告警）；只补写严重度门槛则不用。
 
 验证分类器本身（GT 框直接喂分类器，得总准确率、每类准确率、混淆矩阵、混淆对、macro 平均）：
-`python scripts/evaluate.py --mode gt`
+`python scripts/evaluate.py --mode gt`（二次判断需要检测器给热力图，与 ③ 用同一个检测器）
 
 ### ④ 预测（完整预测 / 纯正异常检测）
 
@@ -195,7 +195,7 @@ python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像�
 
 | | 完整预测（默认，命令 ④） | 纯正异常检测 |
 |---|---|---|
-| 做什么 | 先判正常/异常 → 异常图框出区域 → 二次判断（整图+区域综合：19 类 / 未知类型 / 推翻为正常） | 只判正常/异常并框出异常区域，不分类 |
+| 做什么 | 先判正常/异常 → 异常图框出区域 → 二次判断（整图+区域+热力综合：19 类 / 未知类型，疑似误报会标记） | 只判正常/异常并框出异常区域，不分类 |
 | 需要的权重 | 检测器（①②）+ 分类器（③） | 只要检测器（①②），不需要 ③ |
 | 预测 | `python scripts/infer.py --input <图片/目录/视频> --out runs/infer` | `python scripts/infer.py --input <图片/目录/视频> --no-classify` |
 | 输出 | 每图 `<名>_vis.png`（热力图 + 框 + 类名/置信度）+ `results.json` | 同上，区域类别统一标「未知类型」 |
@@ -212,7 +212,7 @@ python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像�
 ```json
 {"image": "001.png", "is_anomaly": true, "anomaly_score": 0.83, "anomaly_conf": 0.67, "img_thr": 0.41,
  "latency_ms": 25.1,
- "verdict": "断纬", "final_class_id": 1, "final_conf": 0.91, "judge_override": false,
+ "verdict": "断纬", "final_class_id": 1, "final_conf": 0.91, "judge_override": false, "suspect_normal": false,
  "regions": [{"box": [x1,y1,x2,y2], "area": 900, "anomaly_score": 0.9, "anomaly_conf": 0.69,
               "class_id": 1, "class_name": "断纬", "class_conf": 0.91, "classified": true, "unknown": false, "novelty": 0.03,
               "severe": true, "probs": [...]}]}
@@ -220,7 +220,7 @@ python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像�
 
 - `anomaly_conf = score / (score + img_thr)`，恰在阈值上为 0.5；
 - `verdict` / `final_class_id` 是**整图最终结论**：`正常`（`-1`）/ 缺陷类名 / `未知类型`（`19`）；取最异常区域的结论；
-- `judge_override=true`：Dinomaly2 判异常，但二次判断认为所有区域都像正常纹理，推翻为正常（`regions` 为空）；
+- `suspect_normal=true`：二次判断认为所有区域都像正常纹理，**只标记，不改 `is_anomaly`**，建议人工复核；加 `--judge-override` 才会推翻为正常（此时 `judge_override=true`、`regions` 为空）。是否开启先用 `evaluate.py --mode pipeline --top-k 0` 与加 `--judge-override` 的结果对比 `[检测]` 行；
 - 区域的 `class_id == 19`（`unknown=true`）：**新颖（`novelty ≥ nov_thr`）且严重（`severe=true`）**——没见过的异常；
 - 二次判断会看**全部**异常区域（上限 8 个，不受 `--top-k` 限制）；`--kind embed/cnn` 的旧分类器才用 `top_k`，其余区域标 `classified=false` 的「未知类型」；
 - 热力图用**绝对阈值**渲染：低于正常图噪声上限的像素完全透明，高于它的部分颜色与透明度随强度增大，背景不会被拉伸成满屏噪点。
@@ -254,10 +254,11 @@ python scripts/infer.py --input <图片 / 图片目录 / 视频文件 / 摄像�
 重建式（对"能被重建出来的缺陷"会漏）和记忆库式（对"记忆库没覆盖的正常变化"会误报）误差模式不同，两张异常图按"正常图典型分数"归一化后加权：
 `fused = w · dino_map / ref_d + (1 − w) · knn_map / ref_k`。两者共用同一个冻结 encoder，kNN 特征直接取 Dinomaly 前向里已算好的目标层，只多一次最近邻搜索。
 
-**二次判断（`src/judge.py`）**：Dinomaly2 的「异常」只是线索，不是结论。对每个异常区域，用冻结 DINOv2 抽 7 段 L2 归一化特征再拼几何：
-区域裁剪的 `[CLS, 末层 patch 均值, 中层 patch 均值]`、**整图** CLS、整图 token 里**区域内**的均值（重点）与**区域外**的均值（其余区域也参与）、区域面积与宽高比。
+**二次判断（`src/judge.py`）**：Dinomaly2 的「异常」只是线索，不是结论。对每个异常区域，用冻结 DINOv2 抽 7 段 L2 归一化特征再拼几何与热力统计：
+区域裁剪的 `[CLS, 末层 patch 均值, 中层 patch 均值]`、**整图** CLS、整图 token 里**区域内**的均值（按 Dinomaly2 热力加权，越热权重越大，重点）与**区域外**的均值（其余区域也参与）、区域面积与宽高比、5 个热力统计（区域内峰值/均值、区域外均值、整图峰值、区域内热点占比，都是「超过 `img_thr` 的对数倍数」，下限取 1：低于阈值的纹理不携带信息，避免分类头走「热力低=正常」的捷径）。
+训练样本不只用人工标注框，还用**检测器自己出的框**（与预测时同一条分割路径），训练分布与推理分布一致；正常图上检测器最热的区域作为「困难正常」。
 余弦头（Balanced Softmax，稀有类特征级过采样）在这个拼接特征上学出 `19 类 + 正常`，所以它能同时回答「是不是异常」与「是哪一类」：
-- 全部区域 `p(正常) ≥ normal_thr` → 推翻 Dinomaly2。`normal_thr` 取 val 缺陷框 `p(正常)` 的最大值之上，宁可少推翻也不把真缺陷判成正常；
+- 全部区域 `p(正常) ≥ normal_thr` → 标 `suspect_normal`（默认**不改** Dinomaly2 的正异常结论；加 `--judge-override` 才推翻）。`normal_thr` 取 val 缺陷框 `p(正常)` 的最大值之上；微弱缺陷在特征上也像正常纹理，推翻有漏检风险，所以默认关，先对比再决定；
 - 否则取最像的缺陷类；若同时 **新颖** 且 **严重** → 「未知类型」。
 
 **未知异常 = 新颖度 AND 严重度**：
@@ -334,7 +335,7 @@ src/
   fusion.py             Dinomaly + kNN 融合, 训练后自动融合流程
   classify.py           分类器公共部分: 裁剪数据集 / 未知类型校准 / TTA 推理 / CNN 方案
   embed_classify.py     DINOv2 嵌入分类器 (只看区域裁剪, 余弦头 + Balanced Softmax; 二次判断复用其分类头训练)
-  judge.py              二次判断: 整图+区域+几何特征 / 推翻误报 / 留一类校准的未知异常判定
+  judge.py              二次判断: 整图+区域+几何+热力特征 / 检测器框训练 / 误报标记(可选推翻) / 留一类校准的未知异常判定
   pipeline.py           端到端流水线: 检测 → 区域 → 二次判断 (或旧式 top_k 分类) → 热力图可视化
   dinomaly/             Dinomaly2 模型 / 损失 / 优化器 / DINOv2 encoder
   data/                 YOLO 数据集读取 (Unicode 安全, 坏图跳过) 与配置解析
@@ -347,7 +348,7 @@ tests/                  smoke_test.py (全链路冒烟) + test_detector_fixes.py
 
 ```bash
 python tests/smoke_test.py            # CPU 可跑, tiny_test_14 随机初始化: 训练/校准/推理/分类/可视化全链路
-python tests/test_judge.py             # 二次判断: 训练(含留一类校准)/存取/推翻误报/未知异常/严重度门槛
+python tests/test_judge.py             # 二次判断: 热力特征 / 训练(检测器框+留一类校准)/存取/误报标记与可选推翻/未知异常/严重度门槛
 python tests/test_detector_fixes.py   # 回归测试 (秒级): 增强与掩码同步 / 平滑核 / 校准 / StableAdamW / 调度器 / 扫参 /
                                       #   kNN / 融合 / 分类头 / 训练后自动融合 / 命令行参数存在
 ```

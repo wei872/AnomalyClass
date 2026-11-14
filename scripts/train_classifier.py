@@ -27,6 +27,8 @@ def main():
     p.add_argument('--kind', default='judge', choices=['judge', 'embed', 'cnn'],
                    help='judge=二次判断: 整图+区域+几何 综合分类, 留一类校准未知异常 (默认); '
                         'embed=只看区域裁剪的 DINOv2 嵌入分类; cnn=端到端微调小 CNN (旧方案)')
+    p.add_argument('--det-ckpt', default=None, help='[judge] 已训练好的检测器 (默认 checkpoints/detector/model_final.pth, 没有则 model_best.pth)')
+    p.add_argument('--thresholds', default=None, help='[judge] 阈值文件 (默认取检测器同目录 thresholds.json, 须先运行 calibrate.py)')
     p.add_argument('--no-loco', action='store_true', help='[judge] 跳过留一类校准 (未知异常退回最大概率阈值)')
     p.add_argument('--loco-epochs', type=int, default=40, help='[judge] 留一类校准时每个子头的训练轮数')
     p.add_argument('--max-normal', type=int, default=1500, help='[judge] 训练用的正常图最多取多少张')
@@ -75,8 +77,17 @@ def main():
     if not cfg.train_images or not os.path.isdir(cfg.train_images):
         raise FileNotFoundError(f'训练图片目录不存在: {cfg.train_images}')
     if args.kind == 'judge':
+        from src.detect import resolve_det_ckpt
         from src.judge import train_judge
-        train_judge(train_images=cfg.train_images, train_labels=cfg.train_labels,
+        from src.pipeline import build_pipeline
+        det_ckpt = resolve_det_ckpt(args.det_ckpt)
+        thr = args.thresholds or os.path.join(os.path.dirname(os.path.abspath(det_ckpt)), 'thresholds.json')
+        if not os.path.exists(det_ckpt):
+            raise SystemExit(f'找不到检测器权重: {det_ckpt}\n二次判断要用检测器出的框和热力图训练, 请先 python scripts/train_detector.py')
+        if not os.path.exists(thr):
+            raise SystemExit(f'找不到阈值文件: {thr}\n请先 python scripts/calibrate.py')
+        pipe = build_pipeline(det_ckpt, None, thr, cfg.class_names, device=args.device, logger=log)
+        train_judge(pipe, train_images=cfg.train_images, train_labels=cfg.train_labels,
                     val_images=cfg.val_images if cfg.val_images and os.path.isdir(cfg.val_images) else None,
                     val_labels=cfg.val_labels, normal_train=cfg.normaltrain_images, normal_val=cfg.normalval_images,
                     out_dir=args.out, nc=cfg.nc, names=cfg.names, backbone=args.backbone,
